@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vulcan/intent_spec/v1",
+  "title": "IntentSpec",
+  "description": "Structured interpretation of a user's photo+annotation+text request. All lengths in millimeters.",
+  "type": "object",
+  "required": ["intent_id", "status", "category", "description", "dimensions", "questions"],
+  "properties": {
+    "intent_id": { "type": "string" },
+    "status": { "enum": ["needs_answers", "ready_for_design", "out_of_scope"] },
+    "category": {
+      "description": "Wedge category guess; template_id null if freeform/long-tail.",
+      "enum": ["bracket", "adapter", "enclosure", "knob", "hook", "clip", "other"]
+    },
+    "template_id": { "type": ["string", "null"] },
+    "description": { "type": "string", "description": "One-sentence restatement of what the user wants, in plain English." },
+    "context_notes": { "type": "string", "description": "Environment/function notes: load hints, outdoor/UV, moisture, heat." },
+    "material_suggestion": { "enum": ["PLA", "PETG", "TPU", "CF-PETG"], "default": "PETG" },
+    "out_of_scope_reason": { "type": ["string", "null"] },
+    "dimensions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "value_mm", "source", "confidence", "critical"],
+        "properties": {
+          "name": { "type": "string" },
+          "value_mm": { "type": ["number", "null"] },
+          "source": { "enum": ["user_measured", "depth_inferred", "assumed"] },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "critical": { "type": "boolean", "description": "If true, may only commit from user_measured." },
+          "cross_check": {
+            "type": ["object", "null"],
+            "properties": {
+              "depth_value_mm": { "type": ["number", "null"] },
+              "ratio": { "type": ["number", "null"] },
+              "status": { "enum": ["ok", "mismatch_reask", "unavailable"] }
+            }
+          }
+        }
+      }
+    },
+    "questions": {
+      "type": "array",
+      "description": "Measurement/clarification prompts, each renderable as an overlay on the user's photo.",
+      "items": {
+        "type": "object",
+        "required": ["question_id", "prompt", "kind"],
+        "properties": {
+          "question_id": { "type": "string" },
+          "dim_name": { "type": ["string", "null"] },
+          "prompt": { "type": "string" },
+          "kind": { "enum": ["measure_mm", "choice", "confirm", "photo_retake"] },
+          "choices": { "type": ["array", "null"], "items": { "type": "string" } },
+          "overlay": {
+            "type": ["object", "null"],
+            "description": "Where to draw the arrow/circle on the photo (normalized 0-1 coords).",
+            "properties": {
+              "photo_index": { "type": "integer" },
+              "shape": { "enum": ["arrow", "circle", "line"] },
+              "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } }
+            }
+          }
+        }
+      }
+    }
+  }
+}

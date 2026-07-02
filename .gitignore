@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+exports/
+*.stl
+*.3mf
+*.step
+!tests/fixtures/**/*.stl
+!tests/fixtures/**/*.step
+node_modules/
+.pytest_cache/

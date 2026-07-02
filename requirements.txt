@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+python-multipart
+python-dotenv
+jinja2
+cadquery>=2.4
+trimesh
+manifold3d
+numpy
+pillow
+anthropic
+jsonschema
+pytest
+httpx
+black
