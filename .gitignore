@@ -4,6 +4,7 @@ __pycache__/
 .env
 .DS_Store
 exports/
+data/
 *.stl
 *.3mf
 *.step

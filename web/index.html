@@ -9,46 +9,78 @@
 <body>
   <header>
     <h1>Vulcan</h1>
-    <p class="tagline">Describe it. Hold it. — M1 test UI: L-shaped shelf bracket</p>
+    <p class="tagline">Describe it. Hold it. — M3 test UI: photo → questions → part</p>
   </header>
 
-  <main>
-    <section class="panel">
-      <h2>Parameters</h2>
-      <form id="bracket-form">
-        <label>
-          Span (mm) — length of each arm
-          <input type="number" name="span_mm" value="120" min="40" max="300" step="1" required />
-        </label>
-        <label>
-          Depth (mm) — width along the shelf edge
-          <input type="number" name="depth_mm" value="40" min="15" max="150" step="1" required />
-        </label>
-        <label>
-          Thickness (mm) — wall thickness
-          <input type="number" name="thickness_mm" value="4" min="2.4" max="12" step="0.1" required />
-        </label>
-        <label>
-          Screw size
-          <select name="screw_size">
-            <option value="#6">#6</option>
-            <option value="#8" selected>#8</option>
-            <option value="#10">#10</option>
-          </select>
-        </label>
-        <label>
-          Screw count
-          <input type="number" name="screw_count" value="3" min="2" max="6" step="1" required />
-        </label>
-        <label>
-          Load
-          <select name="load_hint">
-            <option value="light">Light</option>
-            <option value="medium" selected>Medium</option>
-            <option value="heavy">Heavy</option>
-          </select>
-        </label>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="photo" type="button">Start with a photo</button>
+    <button class="tab-btn" data-tab="direct" type="button">Direct template params</button>
+  </nav>
 
+  <main id="tab-photo" class="tab-panel active">
+    <section class="panel">
+      <h2>1. Photo + description</h2>
+      <label>
+        Photo(s) — up to 3
+        <input type="file" id="photo-input" accept="image/*" multiple />
+      </label>
+      <p class="hint">
+        Only the first photo can be annotated in this test UI. Drag on it to circle or
+        trace the area you need a part for (optional).
+      </p>
+      <div id="annotate-wrap" hidden>
+        <img id="annotate-img" alt="First uploaded photo" />
+        <canvas id="annotate-canvas"></canvas>
+      </div>
+      <button id="clear-annotation-btn" type="button" hidden>Clear annotation</button>
+      <label>
+        What do you need?
+        <textarea id="intent-text" rows="3" placeholder="e.g. a bracket to hold a shelf under my desk"></textarea>
+      </label>
+      <button id="submit-intent-btn" type="button">Analyze photo</button>
+      <p id="intent-status"></p>
+    </section>
+
+    <section class="panel" id="questions-panel" hidden>
+      <h2>2. Questions</h2>
+      <p id="intent-description" class="template-description"></p>
+      <div id="overlay-wrap">
+        <img id="overlay-img" alt="Uploaded photo with question overlays" />
+        <svg id="overlay-svg" viewBox="0 0 1 1" preserveAspectRatio="none">
+          <defs>
+            <marker id="overlay-arrowhead" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#e0562b" />
+            </marker>
+          </defs>
+          <g id="overlay-shapes"></g>
+        </svg>
+      </div>
+      <div id="questions-list"></div>
+      <button id="submit-answers-btn" type="button">Submit answers</button>
+      <p id="answers-status"></p>
+    </section>
+
+    <section class="panel" id="result-panel" hidden>
+      <h2>3. Result</h2>
+      <p id="result-status-line"></p>
+      <pre id="intent-json"></pre>
+      <button id="generate-part-btn" disabled>Generate part</button>
+      <p id="generate-status"></p>
+    </section>
+  </main>
+
+  <main id="tab-direct" class="tab-panel">
+    <section class="panel">
+      <h2>Template</h2>
+      <label>
+        Part template
+        <select id="template-select"></select>
+      </label>
+      <p id="template-description" class="template-description"></p>
+
+      <h2>Parameters</h2>
+      <form id="design-form">
+        <div id="param-fields"></div>
         <button type="submit">Generate</button>
       </form>
       <p id="status"></p>
@@ -57,12 +89,13 @@
     <section class="panel">
       <h2>Preview</h2>
       <div id="preview-box">
-        <img id="preview-img" alt="Bracket preview will appear here after you generate a design." />
+        <img id="preview-img" alt="Part preview will appear here after you generate a design." />
       </div>
       <ul id="downloads"></ul>
     </section>
   </main>
 
   <script src="/app.js"></script>
+  <script src="/intents.js"></script>
 </body>
 </html>

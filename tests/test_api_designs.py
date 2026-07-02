@@ -1,5 +1,5 @@
 """API-level tests: POST /designs round-trip via httpx (FastAPI TestClient),
-param validation errors, unknown template handling."""
+param validation errors, unknown template handling, GET /templates."""
 
 from __future__ import annotations
 
@@ -12,8 +12,11 @@ from fastapi.testclient import TestClient
 
 from api.designs import EXPORTS_DIR
 from api.main import app
+from templates_lib.registry import all_templates
 
 client = TestClient(app)
+
+TEMPLATE_IDS = sorted(all_templates())
 
 VALID_PAYLOAD = {
     "template_id": "bracket_shelf_l",
@@ -83,3 +86,37 @@ def test_designs_geometry_conflict_returns_422(cleanup_design_dirs: list[Path]):
 def test_designs_unknown_template_returns_400():
     response = client.post("/designs", json={"template_id": "nope", "params": {}})
     assert response.status_code == 400
+
+
+def test_templates_endpoint_lists_all_registered_templates():
+    response = client.get("/templates")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert {t["template_id"] for t in body} == set(TEMPLATE_IDS)
+    for template in body:
+        assert template["fields"], f"{template['template_id']} has no fields"
+        for field in template["fields"]:
+            assert field["type"] in ("number", "integer", "boolean", "choice")
+            assert field["default"] is not None
+
+
+@pytest.mark.parametrize("template_id", TEMPLATE_IDS)
+def test_designs_round_trip_for_every_template(
+    cleanup_design_dirs: list[Path], template_id: str
+):
+    """Every template's params model has full defaults (see
+    templates_lib/registry.py), so an empty params dict is itself a valid
+    request — this exercises the full pipeline for every registered
+    template, not just bracket_shelf_l."""
+    response = client.post("/designs", json={"template_id": template_id, "params": {}})
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["template_id"] == template_id
+    cleanup_design_dirs.append(EXPORTS_DIR / body["design_id"])
+
+    for url in body["files"].values():
+        file_response = client.get(url)
+        assert file_response.status_code == 200, url
+        assert len(file_response.content) > 0

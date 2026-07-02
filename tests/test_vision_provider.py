@@ -1,0 +1,317 @@
+"""Tests for api/vision_provider.py: provider/model selection from env vars,
+the fail-fast startup check, the OpenAI strict-schema transform, and the
+two-adapter conformance test (same mocked upstream response through both
+adapters must produce identical output). No real network calls — both SDK
+clients are mocked at their constructor.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from api.vision_provider import (
+    PhotoInput,
+    VisionProviderError,
+    _is_object_schema,
+    _load_canonical_schema,
+    _to_anthropic_tool_schema,
+    _to_openai_strict_schema,
+    check_provider_configured,
+    get_model_name,
+    get_provider_name,
+    parse_intent,
+)
+
+SAMPLE_INTENT = {
+    "intent_id": "abc",
+    "status": "needs_answers",
+    "category": "bracket",
+    "template_id": "bracket_shelf_l",
+    "description": "A shelf bracket.",
+    "context_notes": "",
+    "material_suggestion": "PETG",
+    "out_of_scope_reason": None,
+    "dimensions": [],
+    "questions": [],
+}
+
+
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    for var in (
+        "VISION_PROVIDER",
+        "VISION_MODEL",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Provider/model selection
+# ---------------------------------------------------------------------------
+
+
+def test_default_provider_is_openai():
+    assert get_provider_name() == "openai"
+
+
+def test_provider_overridden_by_env(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "anthropic")
+    assert get_provider_name() == "anthropic"
+
+
+def test_provider_name_is_case_and_whitespace_insensitive(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "  Anthropic  ")
+    assert get_provider_name() == "anthropic"
+
+
+def test_default_models():
+    assert get_model_name("openai") == "gpt-5"
+    assert get_model_name("anthropic") == "claude-opus-4-8"
+
+
+def test_model_overridden_by_env(monkeypatch):
+    monkeypatch.setenv("VISION_MODEL", "custom-model")
+    assert get_model_name("openai") == "custom-model"
+
+
+def test_unknown_provider_raises():
+    with pytest.raises(VisionProviderError):
+        get_model_name("bogus")
+
+
+# ---------------------------------------------------------------------------
+# Fail-fast startup check
+# ---------------------------------------------------------------------------
+
+
+def test_check_provider_configured_raises_when_key_missing(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    with pytest.raises(VisionProviderError, match="OPENAI_API_KEY"):
+        check_provider_configured()
+
+
+def test_check_provider_configured_passes_when_key_present(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    check_provider_configured()  # must not raise
+
+
+def test_check_provider_configured_unknown_provider_raises(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "bogus")
+    with pytest.raises(VisionProviderError):
+        check_provider_configured()
+
+
+# ---------------------------------------------------------------------------
+# OpenAI strict-schema transform
+# ---------------------------------------------------------------------------
+
+
+def test_openai_strict_schema_every_object_is_fully_compliant():
+    """OpenAI's strict structured-output mode requires every object node
+    (however deeply nested, however it got there) to set
+    additionalProperties=false and list every one of its own properties in
+    `required`. Walk the whole transformed tree and check this holds
+    everywhere, not just at the top level."""
+    strict = _to_openai_strict_schema(_load_canonical_schema())
+
+    def check(node, path="root"):
+        if isinstance(node, dict):
+            if _is_object_schema(node) and "properties" in node:
+                assert (
+                    node.get("additionalProperties") is False
+                ), f"{path}: missing additionalProperties=false"
+                required = set(node.get("required", []))
+                props = set(node["properties"].keys())
+                assert (
+                    required == props
+                ), f"{path}: required {required} != properties {props}"
+            for key, value in node.items():
+                check(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                check(item, f"{path}[{i}]")
+
+    check(strict)
+
+
+def test_openai_strict_schema_is_json_serializable():
+    # Guards against stray non-serializable values (e.g. Python `None` used
+    # somewhere json.dumps can't reach) making it into the API payload.
+    json.dumps(_to_openai_strict_schema(_load_canonical_schema()))
+
+
+def test_anthropic_tool_schema_strips_document_metadata():
+    tool_schema = _to_anthropic_tool_schema(_load_canonical_schema())
+    assert "$schema" not in tool_schema
+    assert "$id" not in tool_schema
+    assert "title" not in tool_schema
+    assert tool_schema["type"] == "object"
+    assert "dimensions" in tool_schema["properties"]
+
+
+# ---------------------------------------------------------------------------
+# Adapters (mocked SDK clients — no network)
+# ---------------------------------------------------------------------------
+
+
+def _fake_openai_response(payload: dict) -> MagicMock:
+    response = MagicMock()
+    response.choices = [MagicMock(message=MagicMock(content=json.dumps(payload)))]
+    return response
+
+
+def _fake_anthropic_response(payload: dict) -> MagicMock:
+    tool_block = MagicMock()
+    tool_block.type = "tool_use"
+    tool_block.input = payload
+    response = MagicMock()
+    response.content = [tool_block]
+    return response
+
+
+def test_openai_adapter_returns_parsed_payload(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        MockOpenAI.return_value.chat.completions.create.return_value = (
+            _fake_openai_response(SAMPLE_INTENT)
+        )
+        result = parse_intent([PhotoInput(b"fake")], None, "a bracket please", [])
+
+    assert result == SAMPLE_INTENT
+    call_kwargs = MockOpenAI.return_value.chat.completions.create.call_args.kwargs
+    assert call_kwargs["model"] == "gpt-5"
+    assert call_kwargs["response_format"]["json_schema"]["strict"] is True
+
+
+def test_anthropic_adapter_returns_parsed_payload(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        MockAnthropic.return_value.messages.create.return_value = (
+            _fake_anthropic_response(SAMPLE_INTENT)
+        )
+        result = parse_intent([PhotoInput(b"fake")], None, "a bracket please", [])
+
+    assert result == SAMPLE_INTENT
+    call_kwargs = MockAnthropic.return_value.messages.create.call_args.kwargs
+    assert call_kwargs["model"] == "claude-opus-4-8"
+    assert call_kwargs["tool_choice"] == {"type": "tool", "name": "record_intent_spec"}
+
+
+def test_anthropic_adapter_raises_if_no_tool_use_block(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+
+    text_block = MagicMock()
+    text_block.type = "text"
+    response = MagicMock()
+    response.content = [text_block]
+
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        MockAnthropic.return_value.messages.create.return_value = response
+        with pytest.raises(VisionProviderError):
+            parse_intent([PhotoInput(b"fake")], None, "a bracket please", [])
+
+
+def test_parse_intent_raises_before_any_network_call_if_key_missing(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    with patch("openai.OpenAI") as MockOpenAI:
+        with pytest.raises(VisionProviderError):
+            parse_intent([PhotoInput(b"fake")], None, "text", [])
+    MockOpenAI.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Conformance: both adapters must produce IDENTICAL output for the same
+# underlying model answer, just unwrapped from each provider's own envelope.
+# ---------------------------------------------------------------------------
+
+
+def test_conformance_openai_and_anthropic_produce_identical_output(monkeypatch):
+    payload = {
+        **SAMPLE_INTENT,
+        "dimensions": [
+            {
+                "name": "span_mm",
+                "value_mm": 150.0,
+                "source": "assumed",
+                "confidence": 0.4,
+                "critical": True,
+                "cross_check": None,
+            }
+        ],
+        "questions": [
+            {
+                "question_id": "q1",
+                "dim_name": "span_mm",
+                "prompt": "How far?",
+                "kind": "measure_mm",
+                "choices": None,
+                "overlay": {
+                    "photo_index": 0,
+                    "shape": "arrow",
+                    "points": [[0.1, 0.2], [0.3, 0.4]],
+                },
+            }
+        ],
+    }
+    photos = [PhotoInput(b"fake-bytes", "image/jpeg")]
+
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    with patch("openai.OpenAI") as MockOpenAI:
+        MockOpenAI.return_value.chat.completions.create.return_value = (
+            _fake_openai_response(payload)
+        )
+        openai_result = parse_intent(photos, None, "a bracket please", [])
+
+    monkeypatch.setenv("VISION_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        MockAnthropic.return_value.messages.create.return_value = (
+            _fake_anthropic_response(payload)
+        )
+        anthropic_result = parse_intent(photos, None, "a bracket please", [])
+
+    assert openai_result == anthropic_result == payload
+    assert set(openai_result.keys()) == set(anthropic_result.keys())
+
+
+# ---------------------------------------------------------------------------
+# Provider-isolation enforcement: no other module may import a provider SDK.
+# ---------------------------------------------------------------------------
+
+
+def test_no_other_module_imports_provider_sdks():
+    import pathlib
+    import re
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    pattern = re.compile(r"^\s*(import (openai|anthropic)\b|from (openai|anthropic)\b)")
+    offenders = []
+
+    for path in repo_root.rglob("*.py"):
+        if (
+            ".venv" in path.parts
+            or path.name == "vision_provider.py"
+            or path.name == "test_vision_provider.py"
+        ):
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            if pattern.match(line):
+                offenders.append(
+                    f"{path.relative_to(repo_root)}:{lineno}: {line.strip()}"
+                )
+
+    assert (
+        not offenders
+    ), "only api/vision_provider.py may import a provider SDK:\n" + "\n".join(offenders)

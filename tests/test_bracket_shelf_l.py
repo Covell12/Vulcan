@@ -12,7 +12,9 @@ from pydantic import ValidationError
 
 from templates_lib.bracket_shelf_l import (
     MIN_WALL_MM,
+    SCREW_CLEARANCE_MM,
     BracketShelfLParams,
+    _screw_hole_y_positions,
     build_bracket,
 )
 
@@ -106,3 +108,23 @@ def test_all_three_exports_produced_and_non_empty(tmp_path: Path):
     mesh = trimesh.load(str(stl_path))
     assert len(mesh.vertices) > 0
     assert len(mesh.faces) > 0
+
+
+@pytest.mark.parametrize("screw_size", ["#6", "#8", "#10"])
+def test_screw_holes_respect_min_wall_to_edges(screw_size: str):
+    """Regression test: the margin used to leave only ~clearance/2 of material
+    between a hole's edge and the part's edge, which was below MIN_WALL_MM for
+    #8/#10 screws. Every hole must now keep >= MIN_WALL_MM on the top-edge side
+    and on the front/back-face side."""
+    params = BracketShelfLParams(**{**VALID_PARAMS, "screw_size": screw_size})
+    clearance = SCREW_CLEARANCE_MM[screw_size]
+    radius = clearance / 2
+
+    positions = _screw_hole_y_positions(
+        params.span_mm, params.thickness_mm, params.screw_count, clearance
+    )
+    top_edge_wall = params.span_mm - max(positions) - radius
+    depth_face_wall = params.depth_mm / 2 - radius
+
+    assert top_edge_wall >= MIN_WALL_MM - 1e-9
+    assert depth_face_wall >= MIN_WALL_MM - 1e-9

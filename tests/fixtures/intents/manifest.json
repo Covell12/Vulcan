@@ -1,0 +1,34 @@
+{
+  "fixtures": [
+    {
+      "id": "001_shelf_bracket_placeholder",
+      "photos": ["photos/001_shelf_bracket_placeholder.jpg"],
+      "text": "I need a bracket to hold a small wooden shelf under my desk, in the corner where the wall meets the desk.",
+      "annotation": null,
+      "ground_truth": {
+        "template_id": "bracket_shelf_l",
+        "category": "bracket",
+        "dimensions_mm": {
+          "span_mm": 150,
+          "depth_mm": 40
+        }
+      },
+      "notes": "PLACEHOLDER — synthetic flat-color image, not a real photo. Ground-truth numbers here are illustrative, not measured. Replace before scoring real accuracy."
+    },
+    {
+      "id": "002_appliance_knob_placeholder",
+      "photos": ["photos/002_appliance_knob_placeholder.jpg"],
+      "text": "The knob for my oven's temperature dial broke off. The stem underneath is round.",
+      "annotation": null,
+      "ground_truth": {
+        "template_id": "knob_appliance",
+        "category": "knob",
+        "dimensions_mm": {
+          "shaft_dia_mm": 6,
+          "shaft_depth_mm": 10
+        }
+      },
+      "notes": "PLACEHOLDER — synthetic flat-color image, not a real photo. Ground-truth numbers here are illustrative, not measured. Replace before scoring real accuracy."
+    }
+  ]
+}
