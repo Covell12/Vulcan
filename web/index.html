@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Vulcan — Test UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Vulcan</h1>
+    <p class="tagline">Describe it. Hold it. — M1 test UI: L-shaped shelf bracket</p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Parameters</h2>
+      <form id="bracket-form">
+        <label>
+          Span (mm) — length of each arm
+          <input type="number" name="span_mm" value="120" min="40" max="300" step="1" required />
+        </label>
+        <label>
+          Depth (mm) — width along the shelf edge
+          <input type="number" name="depth_mm" value="40" min="15" max="150" step="1" required />
+        </label>
+        <label>
+          Thickness (mm) — wall thickness
+          <input type="number" name="thickness_mm" value="4" min="2.4" max="12" step="0.1" required />
+        </label>
+        <label>
+          Screw size
+          <select name="screw_size">
+            <option value="#6">#6</option>
+            <option value="#8" selected>#8</option>
+            <option value="#10">#10</option>
+          </select>
+        </label>
+        <label>
+          Screw count
+          <input type="number" name="screw_count" value="3" min="2" max="6" step="1" required />
+        </label>
+        <label>
+          Load
+          <select name="load_hint">
+            <option value="light">Light</option>
+            <option value="medium" selected>Medium</option>
+            <option value="heavy">Heavy</option>
+          </select>
+        </label>
+
+        <button type="submit">Generate</button>
+      </form>
+      <p id="status"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Preview</h2>
+      <div id="preview-box">
+        <img id="preview-img" alt="Bracket preview will appear here after you generate a design." />
+      </div>
+      <ul id="downloads"></ul>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

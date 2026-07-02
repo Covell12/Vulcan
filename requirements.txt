@@ -9,6 +9,7 @@ trimesh
 manifold3d
 numpy
 pillow
+matplotlib
 anthropic
 jsonschema
 pytest
