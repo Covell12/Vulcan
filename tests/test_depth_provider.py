@@ -7,6 +7,7 @@ decode/error-wrapping (with `replicate` mocked at import). No real network.
 from __future__ import annotations
 
 import io
+import math
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +23,7 @@ from api.depth_provider import (
     _looks_like_plain_image,
     _region_confidence,
     _region_size_mm,
+    _sample_depth,
     check_provider_configured,
     estimate_scale,
     get_model_name,
@@ -125,6 +127,17 @@ def test_region_size_scales_with_depth():
     far = _region_size_mm(np.full((h, w), 2.0), fx, fx, region)
     # 4x the depth => 4x the real-world size for the same pixel span
     assert far == pytest.approx(near * 4.0, rel=1e-6)
+
+
+def test_sample_depth_out_of_frame_returns_nan():
+    """M5.5 review: a pixel outside the frame must return NaN — not wrap a
+    negative slice index around and sample an unrelated (valid) region."""
+    depth = np.full((100, 200), 3.0)
+    assert math.isfinite(_sample_depth(depth, 100.0, 50.0))  # in-frame is fine
+    assert math.isnan(_sample_depth(depth, -20.0, 50.0))  # u < 0
+    assert math.isnan(_sample_depth(depth, 500.0, 50.0))  # u >= w
+    assert math.isnan(_sample_depth(depth, 100.0, -5.0))  # v < 0
+    assert math.isnan(_sample_depth(depth, 100.0, 999.0))  # v >= h
 
 
 def test_single_point_region_is_unmeasurable():

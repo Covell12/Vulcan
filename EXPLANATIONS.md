@@ -46,7 +46,7 @@ non-expert can follow: what it does, why it exists, what talks to it).
 - **docs/ROADMAP.md** — The build sequence as a numbered list of Claude Code milestones,
   each with its exit criteria. Work top to bottom; don't skip ahead.
 
-## api/ (M1, extended M2, M3, M4, and M5)
+## api/ (M1, extended M2, M3, M4, M5, and M5.5)
 
 - **api/main.py** — Creates the FastAPI application. Defines `GET /health` (a trivial
   liveness check), wires in the `/designs`, `/templates`, and `/intents` routes, and
@@ -71,7 +71,28 @@ non-expert can follow: what it does, why it exists, what talks to it).
   solid, computes the preview's dimension callouts from the template's `callouts_fn` (labelling
   each with its value + a source marker — measured ✓ / suggested ~ / default — from the
   optional `source_map`), exports STEP/3MF/STL + the annotated PNG, and returns a design_id
-  plus URLs. Bad params or an unknown template_id come back as a clear 4xx error.
+  plus URLs. Bad params or an unknown template_id come back as a clear 4xx error. **M5.5 —
+  runtime manifold gate:** right after export it re-checks the actually-written STL with
+  `rendering.mesh_is_watertight`; a non-watertight (unprintable) mesh is refused with a 500
+  and its half-baked export directory is deleted, so no unbuildable STL/STEP can ever be
+  downloaded. The per-template pytest suite proves watertightness for DEFAULT params; this
+  guards the live path where user-resolved (and, later, generated) params run.
+- **api/composite.py** (M5.5) — The in-photo "ghost" preview: renders the ACTUAL generated
+  geometry back into the user's own photo, scale- and position-true but deliberately
+  synthetic (flat translucent blue, no lighting/shadows), so they can sanity-check size and
+  placement before paying. Pure numpy + Pillow + trimesh — NO OpenGL/GPU — so it runs in the
+  same headless API process as everything else. It loads the exported STL, poses it with a
+  textbook pinhole camera (focal length from the photo's EXIF 35mm-equivalent when present,
+  else an assumed 60° field of view), and paints the triangles back-to-front (painter's
+  algorithm) as translucent polygons. Placement anchors the part's centroid at the user's
+  annotation centroid (or the photo center); scale prefers true metric depth at that point
+  (`depth_provider.depth_mm_at`), falls back to the part's own size vs. the annotation's
+  on-screen extent, then to a fixed fraction of the frame. Orientation is a canonical 3/4
+  pose chosen only by the template's mounting category (bracket/hook/clip → wall, everything
+  else → surface) — it is NOT recovered from the photo, the honest v0 limitation stated in
+  the module docstring and the UI. The camera math (`pinhole_project`, `transform_to_camera`,
+  `canonical_rotation`, `focal_px`) is split out as pure functions and unit-tested against
+  analytic cases. `api/intents.py`'s design join calls `render_composite` best-effort.
 - **api/templates.py** (M2, refactored M3) — Defines `GET /templates`, which describes
   every registered template's parameter form (name, type, min/max, choices, default,
   description) so the web UI can build the right form for whichever template the user
@@ -123,7 +144,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   so this module defines the output *contract* it needs (per-pixel metric depth + focal
   length) and raises a clear `DepthProviderError` rather than inventing numbers if a model
   returns a plain visualization image. Every SDK/network/decode failure is wrapped as
-  `DepthProviderError`.
+  `DepthProviderError`. **M5.5:** adds `depth_mm_at(photo, x, y)`, a best-effort metric
+  depth (mm) at a single normalized image point, used by the ghost composite to place the
+  part at the true distance of the circled surface. Unlike the rest of the module it NEVER
+  raises and returns `None` whenever depth is unavailable (`DEPTH_PROVIDER=none` or any
+  model failure) — a preview must not be able to break because a depth backend hiccuped.
 - **api/intents.py** (M3) — `POST /intents` and `POST /intents/{id}/answers`: the
   photo(s)+annotation+text → IntentSpec → answered-dimensions pipeline. Builds a
   `template_catalog` from the live template registry (id, category, critical_dims,
@@ -171,6 +196,19 @@ non-expert can follow: what it does, why it exists, what talks to it).
   (`chosen_value`) > provider suggestion (`suggested_value`) > template default. It calls
   `designs.build_design` (reusing the export pipeline), persists the intent→design link,
   and returns the files plus a per-param summary (value + source) that drives the UI table.
+  **M5.5 additions:** (1) `POST /intents` now PERSISTS the uploaded photos (under
+  `data/intents/<intent_id>/photos/`) and stores the raw `annotation` on the intent, so the
+  later join can render the ghost composite into the user's own photo — see the module
+  docstring's PRIVACY note (user photos kept on disk with no expiry yet; `data/` is
+  gitignored, but a real deployment needs a retention/delete policy). (2) the design join
+  now calls `_render_ghost_composite`, a strictly best-effort step: when the intent has a
+  stored photo it renders `composite.png` into the export dir and adds `files.composite`;
+  with no stored photo it simply omits the composite, and ANY failure is logged and swallowed
+  (returns `None`) so a preview problem can never block delivering the actual part files. The
+  ghost's optional metric-depth lookup runs through `_bounded_depth_mm_at`, a hard wall-clock
+  deadline (M5.5 review): with `DEPTH_PROVIDER=replicate` that lookup is a synchronous network
+  call, and the deadline guarantees a slow/stalled depth backend can never make the design
+  join hang on a *preview* (under the default `none` it returns instantly and never waits).
 - **api/rendering.py** — Takes a finished CadQuery solid and writes it to disk in every
   format the rest of the product needs: STEP (for manufacturing/slicing), 3MF and STL
   (for 3D printing), and a PNG preview. The preview is rendered by loading the exported
@@ -179,8 +217,15 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `render_preview`/`export_design` take optional `callouts` ({p0, p1, text}) and draw each
   as a labeled 3D dimension arrow (the "honest preview" — value + measured ✓ / suggested ~
   / default marker), still fully headless. Also
-  exposes `mesh_is_watertight`, the manifold check the test suite and (later) DFM
-  validation both rely on.
+  exposes `mesh_is_watertight`, the manifold check the test suite, the **M5.5** runtime
+  manifold gate (`api/designs.build_design`), and (later) DFM validation all rely on — it
+  loads with `force="mesh"` and treats empty geometry as not-watertight, so a pathological
+  export can't load as a `Scene` (no `.is_watertight`) and throw past the gate's cleanup
+  (M5.5 review hardening); it stays fail-closed.
+  **M5.5:** `render_preview` now pads any zero-thickness bounding-box axis before setting the
+  3D limits, so a degenerate/flat mesh (e.g. a broken template producing a single planar
+  face) renders instead of crashing matplotlib's projection — the manifold gate is what then
+  rejects such a part, with a clean message rather than a traceback from the preview step.
 
 ## templates_lib/ (M1, extended M2, M3, and M5)
 
@@ -258,7 +303,7 @@ non-expert can follow: what it does, why it exists, what talks to it).
   "shaft_depth_mm")`, per this milestone's instructions. **M5:** `knob_callouts` declares
   the knob-diameter, shaft-diameter, and shaft-depth preview arrows.
 
-## web/ (M1, rebuilt M2, extended M3, M4, and M5)
+## web/ (M1, rebuilt M2, extended M3, M4, M5, and M5.5)
 
 - **web/index.html** — **M3:** now two tabs. "Start with a photo" (the new default) is
   the intent-parser flow. "Direct template params" is the M1/M2 flow — a template-picker
@@ -267,6 +312,10 @@ non-expert can follow: what it does, why it exists, what talks to it).
   result panel is now a self-contained "Your part" — a "Generate my part" button, an
   annotated-preview `<img>`, a param-summary `<table>`, download links, and the raw
   IntentSpec tucked into a `<details>` — and it loads `units.js` before `intents.js`.
+  **M5.5:** the result panel leads with two side-by-side views — the in-photo ghost
+  ("In your photo") and the dimensioned render ("The part") — in a `#design-views` grid;
+  the ghost figure is hidden when the API returns no composite (the lone render then
+  doesn't stretch, via a `:has()` rule in the CSS).
 - **web/units.js** (M5) — The ONE place lengths are converted (CLAUDE.md rule 4). Pure
   helpers: `toMm(value, unit)` (mm/cm/in → mm), `formatDual` ("8 in = 203.2 mm"), and a
   session-remembered unit (`get/setSessionUnit`). Internal units stay mm everywhere; this
@@ -310,14 +359,18 @@ non-expert can follow: what it does, why it exists, what talks to it).
   and reflects an earlier `chosen_value`. "Generate my part" now calls the join endpoint
   `POST /intents/{id}/design` and `renderDesign` shows the annotated preview, a param
   summary table (value + source badge), and the STEP/3MF/STL downloads — the user never
-  touches the raw template form.
+  touches the raw template form. **M5.5:** `renderDesign` also fills the "In your photo"
+  ghost image from `files.composite` (with a cache-buster) when present and hides that
+  figure when it's absent, so a re-generated design never shows a stale composite.
 - **web/style.css** — Styling for the test UI. **M3:** tab styling, the photo/canvas/SVG
   overlay layout, question rows, the IntentSpec JSON display. **M4:** the `.mismatch-card`
   / `.reconfirm-btn` cross-check styles. **M5:** the `.measure-field` (input + unit
   selector + dual display), the `#design-result` layout, the `#design-params-table` with
-  colored source badges, and the design download links.
+  colored source badges, and the design download links. **M5.5:** the two-up `#design-views`
+  grid (`.design-view` figures with captions), which collapses to one column when the
+  composite is hidden (`:has()`) or on narrow screens.
 
-## tests/ (M1, extended M2, M3, M4, and M5)
+## tests/ (M1, extended M2, M3, M4, M5, and M5.5)
 
 - **tests/test_bracket_shelf_l.py** — Tests the bracket template in isolation (no
   API/HTTP involved): every generated mesh is manifold for each `load_hint`, wall
@@ -334,7 +387,19 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `test_templates_endpoint_lists_all_registered_templates` (every registered template
   appears with a well-formed field list) and
   `test_designs_round_trip_for_every_template`, parametrized over the live registry so
-  every template — not just the bracket — gets exercised through the real HTTP API.
+  every template — not just the bracket — gets exercised through the real HTTP API. **M5.5:**
+  `test_manifold_gate_rejects_non_watertight_mesh_and_cleans_up` monkeypatches the bracket's
+  `build_fn` to emit a single planar (non-watertight) face and asserts `build_design` raises
+  a 500 AND leaves no export directory behind (fail closed).
+- **tests/test_composite.py** (M5.5) — Tests `api/composite.py`, the in-photo ghost. The
+  camera math is checked against ANALYTIC pinhole cases (no image diffing): a point on the
+  optical axis lands on the principal point, a known offset lands at the algebraically-
+  predicted pixel, a unit cube at a known pose projects symmetrically with the near face
+  larger than the far, `focal_px` matches both the EXIF-35mm and assumed-FOV formulas, and
+  both canonical mounting rotations are proper (orthonormal, det=1). It also covers the
+  annotation centroid/extent parsing and the depth→annotation→fallback scale precedence,
+  then renders end-to-end on a real bracket mesh (with and without an annotation) and asserts
+  the ghost actually changes the photo (isn't a no-op copy).
 - **tests/template_test_helpers.py** (M2) — Template-agnostic check functions shared by
   every template's test coverage: `assert_mesh_is_manifold`, `assert_min_wall_violation_rejected`,
   `assert_all_exports_non_empty`. Not a test module itself (the name doesn't match
@@ -404,6 +469,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   asserted against the generated params), fetchable downloads, and two regression tests for
   review findings: a critical dim that's `user_measured` but valueless must NOT open the
   gate, and the join must 409 rather than build a part from a template default in its place.
+  **M5.5 additions:** uploaded photos are persisted under `data/intents/<id>/photos/` with
+  the annotation stored on the intent (round-trip asserted), the join returns a fetchable
+  `files.composite` when a decodable photo is stored, and the join still succeeds and simply
+  omits the composite when no photo is present. The cleanup fixture now also removes each
+  intent's photo directory.
 - **tests/fixtures/intents/** (M3) — Ground-truth fixtures for `scripts/eval_intents.py`:
   `manifest.json` (fixture list: photos, text, optional annotation, ground-truth
   template_id/category/measured dimensions) + `photos/` + a `README.md` documenting the

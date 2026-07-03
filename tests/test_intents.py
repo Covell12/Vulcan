@@ -20,9 +20,11 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from api.depth_provider import DepthProviderError, ScaleEstimate
-from api.intents import INTENTS_DIR
+from api.designs import EXPORTS_DIR
+from api.intents import DATA_DIR, INTENTS_DIR
 from api.main import app
 from api.vision_provider import VisionProviderError
 
@@ -90,8 +92,19 @@ def cleanup_intents() -> Iterator[list[str]]:
     yield created
     for intent_id in created:
         (INTENTS_DIR / f"{intent_id}.json").unlink(missing_ok=True)
+        # M5.5 persists photos under data/intents/<id>/photos/ — remove the dir.
+        shutil.rmtree(INTENTS_DIR / intent_id, ignore_errors=True)
     if INTENTS_DIR.exists() and not any(INTENTS_DIR.iterdir()):
         shutil.rmtree(INTENTS_DIR.parent, ignore_errors=True)
+
+
+def _valid_photo_files() -> list[tuple]:
+    """A REAL (decodable) JPEG, so the ghost composite can actually load it.
+    The default _one_photo_files() sends junk bytes, which is fine for paths
+    that never open the image but not for the composite tests."""
+    buf = io.BytesIO()
+    Image.new("RGB", (240, 180), (200, 205, 210)).save(buf, "JPEG")
+    return [("photos", ("p.jpg", io.BytesIO(buf.getvalue()), "image/jpeg"))]
 
 
 def _create_intent(
@@ -869,6 +882,8 @@ def test_design_join_precedence_end_to_end(cleanup_intents: list[str]):
         "default",
     )
 
+    shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
+
     # The intent -> design link is persisted.
     stored = client.get(f"/intents/{iid}").json()
     assert stored["design_id"] == body["design_id"]
@@ -944,3 +959,114 @@ def test_design_refuses_valueless_critical_dim(cleanup_intents: list[str]):
     r = client.post("/intents/valueless99/design")
     assert r.status_code == 409
     assert "span_mm" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# M5.5: photo persistence + the in-photo ghost composite
+# ---------------------------------------------------------------------------
+
+
+def test_photos_and_annotation_persisted(cleanup_intents: list[str]):
+    """Uploaded photos are written under data/intents/<id>/photos/ and the raw
+    annotation is stored on the intent, so the design join can build a ghost."""
+    photo = _valid_photo_files()
+    photo_bytes = photo[0][1][1].getvalue()
+    annotation = [{"photo_index": 0, "points": [[0.3, 0.4], [0.5, 0.6]]}]
+    with patch(
+        "api.intents.parse_intent", return_value=json.loads(json.dumps(JOIN_VISION))
+    ):
+        body = client.post(
+            "/intents",
+            files=photo,
+            data={"text": "bracket", "annotation": json.dumps(annotation)},
+        ).json()
+    iid = body["intent_id"]
+    cleanup_intents.append(iid)
+
+    assert body["annotation"] == annotation
+    assert body["photos"] and body["photos"][0]["index"] == 0
+
+    on_disk = DATA_DIR / body["photos"][0]["path"]
+    assert on_disk.exists()
+    assert on_disk.read_bytes() == photo_bytes
+    # Stored under the intent's own directory.
+    assert on_disk.parent == INTENTS_DIR / iid / "photos"
+
+
+def _ready_intent_with_valid_photo(
+    cleanup_intents: list[str], annotation: list | None
+) -> str:
+    data = {"text": "bracket"}
+    if annotation is not None:
+        data["annotation"] = json.dumps(annotation)
+    with patch(
+        "api.intents.parse_intent", return_value=json.loads(json.dumps(JOIN_VISION))
+    ):
+        r = client.post("/intents", files=_valid_photo_files(), data=data)
+    iid = r.json()["intent_id"]
+    cleanup_intents.append(iid)
+    _confirm_all_critical(iid)
+    return iid
+
+
+def test_join_produces_fetchable_composite(cleanup_intents: list[str]):
+    """With a stored (decodable) photo, the join returns files.composite and it
+    downloads as a non-empty image."""
+    annotation = [{"photo_index": 0, "points": [[0.4, 0.5], [0.6, 0.62]]}]
+    iid = _ready_intent_with_valid_photo(cleanup_intents, annotation)
+    body = client.post(f"/intents/{iid}/design").json()
+    try:
+        assert "composite" in body["files"], body["files"]
+        resp = client.get(body["files"]["composite"])
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+    finally:
+        shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
+
+
+def test_join_without_photo_has_no_composite(cleanup_intents: list[str]):
+    """Absent a stored photo, the join still succeeds and simply omits the
+    composite (no error) — the part files are the real deliverable."""
+    iid = _ready_intent_with_valid_photo(cleanup_intents, annotation=None)
+
+    # Simulate an intent that has no stored photo (e.g. an older intent).
+    path = INTENTS_DIR / f"{iid}.json"
+    stored = json.loads(path.read_text())
+    stored["photos"] = []
+    path.write_text(json.dumps(stored))
+
+    body = client.post(f"/intents/{iid}/design").json()
+    try:
+        assert "composite" not in body["files"]
+        assert set(body["files"]) == {"step", "threemf", "stl", "preview_png"}
+    finally:
+        shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
+
+
+def test_bounded_depth_returns_value_when_fast():
+    from api.intents import _bounded_depth_mm_at
+    from api.photo import PhotoInput
+
+    with patch("api.intents.depth_mm_at", return_value=123.4):
+        got = _bounded_depth_mm_at(PhotoInput(content=b"x"), 0.5, 0.5, deadline_s=2.0)
+    assert got == 123.4
+
+
+def test_bounded_depth_times_out_and_returns_none():
+    """M5.5 review: a slow (replicate) depth lookup must never block the join —
+    the bounded helper returns None once the deadline passes."""
+    import time
+
+    from api.intents import _bounded_depth_mm_at
+    from api.photo import PhotoInput
+
+    def slow(*_a, **_k):
+        time.sleep(1.0)
+        return 999.0
+
+    start = time.monotonic()
+    with patch("api.intents.depth_mm_at", side_effect=slow):
+        got = _bounded_depth_mm_at(PhotoInput(content=b"x"), 0.5, 0.5, deadline_s=0.1)
+    elapsed = time.monotonic() - start
+    assert got is None
+    assert elapsed < 0.9, f"bounded depth waited too long ({elapsed:.2f}s)"

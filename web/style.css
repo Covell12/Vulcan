@@ -358,7 +358,21 @@ circle.overlay-shape {
   gap: 16px;
 }
 
-#design-preview-box {
+#design-views {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+/* One view (the in-photo ghost, or the dimensioned render). */
+.design-view {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.design-view-box {
   background: #fafbfc;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -366,9 +380,27 @@ circle.overlay-shape {
   text-align: center;
 }
 
-#design-preview-img {
+.design-view-box img {
   max-width: 100%;
   max-height: 460px;
+}
+
+.design-view figcaption {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+/* When the composite is hidden (no photo), the lone render shouldn't stretch. */
+#design-views:has(#composite-figure[hidden]) {
+  grid-template-columns: 1fr;
+  max-width: 520px;
+}
+
+@media (max-width: 640px) {
+  #design-views {
+    grid-template-columns: 1fr;
+  }
 }
 
 #design-params-table {

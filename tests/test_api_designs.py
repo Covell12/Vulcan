@@ -3,16 +3,20 @@ param validation errors, unknown template handling, GET /templates."""
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 from pathlib import Path
 from typing import Iterator
 
+import cadquery as cq
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from api.designs import EXPORTS_DIR
+import templates_lib.registry as registry
+from api.designs import EXPORTS_DIR, build_design
 from api.main import app
-from templates_lib.registry import all_templates
+from templates_lib.registry import all_templates, get_template
 
 client = TestClient(app)
 
@@ -86,6 +90,32 @@ def test_designs_geometry_conflict_returns_422(cleanup_design_dirs: list[Path]):
 def test_designs_unknown_template_returns_400():
     response = client.post("/designs", json={"template_id": "nope", "params": {}})
     assert response.status_code == 400
+
+
+def test_manifold_gate_rejects_non_watertight_mesh_and_cleans_up(monkeypatch):
+    """M5.5 runtime manifold gate: if a template builds a non-watertight solid,
+    build_design must refuse it with a 500 and leave NO export directory behind
+    (fail closed — no unprintable STL/STEP can ever be downloaded)."""
+    spec = get_template("bracket_shelf_l")
+
+    # A single planar face exports to an open, 2-triangle, NON-watertight mesh.
+    def broken_build(_params):
+        return cq.Workplane(obj=cq.Face.makePlane(10, 10))
+
+    broken_spec = dataclasses.replace(spec, build_fn=broken_build)
+    monkeypatch.setitem(registry._REGISTRY, "bracket_shelf_l", broken_spec)
+
+    def dirs() -> set[str]:
+        return (
+            {p.name for p in EXPORTS_DIR.iterdir()} if EXPORTS_DIR.exists() else set()
+        )
+
+    before = dirs()
+    with pytest.raises(HTTPException) as exc:
+        build_design("bracket_shelf_l", {"span_mm": 120, "depth_mm": 40})
+    assert exc.value.status_code == 500
+    assert "watertight" in exc.value.detail.lower()
+    assert dirs() == before, "a rejected design left its export directory behind"
 
 
 def test_templates_endpoint_lists_all_registered_templates():

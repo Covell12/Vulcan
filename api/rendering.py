@@ -74,11 +74,22 @@ def render_preview(
             linewidths=0.3,
         )
         ax.add_collection3d(poly)
-        bounds = mesh.bounds
-        ax.set_xlim(bounds[0][0], bounds[1][0])
-        ax.set_ylim(bounds[0][1], bounds[1][1])
-        ax.set_zlim(bounds[0][2], bounds[1][2])
-        ax.set_box_aspect(bounds[1] - bounds[0])
+        # Pad any zero-thickness axis: a degenerate/flat mesh (e.g. a broken
+        # template producing a single planar face) otherwise makes matplotlib's
+        # 3D projection singular and crashes. We still render it — the runtime
+        # manifold gate downstream (api/designs.build_design) is what rejects
+        # such a part, and it should get a clean rejection, not a traceback from
+        # the preview step.
+        lo, hi = mesh.bounds[0].copy(), mesh.bounds[1].copy()
+        for i in range(3):
+            if hi[i] - lo[i] <= 1e-9:
+                lo[i] -= 1.0
+                hi[i] += 1.0
+        bounds = [lo, hi]
+        ax.set_xlim(lo[0], hi[0])
+        ax.set_ylim(lo[1], hi[1])
+        ax.set_zlim(lo[2], hi[2])
+        ax.set_box_aspect(hi - lo)
         ax.view_init(elev=25, azim=-60)
         ax.axis("off")
 
@@ -120,6 +131,11 @@ def _draw_callouts(ax: Any, callouts: list[dict[str, Any]], bounds: Any) -> None
 
 
 def mesh_is_watertight(stl_path: Path) -> bool:
-    """Manifold check: a printable solid's exported mesh must be watertight."""
-    mesh = trimesh.load(str(stl_path))
-    return bool(mesh.is_watertight)
+    """Manifold check: a printable solid's exported mesh must be watertight.
+    `force="mesh"` collapses any multi-body/Scene STL to one Trimesh so a
+    degenerate export can't load as a `Scene` (which has no `.is_watertight`)
+    and raise instead of returning False; empty geometry counts as NOT
+    watertight. This keeps the runtime manifold gate (api/designs.build_design)
+    fail-closed rather than throwing past its cleanup on a pathological mesh."""
+    mesh = trimesh.load(str(stl_path), force="mesh")
+    return bool(getattr(mesh, "is_watertight", False)) and len(mesh.faces) > 0

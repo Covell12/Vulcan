@@ -67,8 +67,23 @@
       <p id="generate-status"></p>
 
       <div id="design-result" hidden>
-        <div id="design-preview-box">
-          <img id="design-preview-img" alt="Annotated preview of your part" />
+        <div id="design-views">
+          <figure id="composite-figure" class="design-view" hidden>
+            <div class="design-view-box">
+              <img id="design-composite-img" alt="Your part shown to scale in your photo" />
+            </div>
+            <figcaption>
+              <strong>In your photo</strong> — a to-scale ghost of the part where it
+              goes. Placement and size are approximate; orientation is a canonical
+              pose, not measured from your photo.
+            </figcaption>
+          </figure>
+          <figure id="preview-figure" class="design-view">
+            <div class="design-view-box">
+              <img id="design-preview-img" alt="Annotated preview of your part" />
+            </div>
+            <figcaption><strong>The part</strong> — with its dimensions.</figcaption>
+          </figure>
         </div>
         <table id="design-params-table"></table>
         <ul id="design-downloads"></ul>

@@ -138,6 +138,29 @@ def estimate_scale(
     )
 
 
+def depth_mm_at(photo: PhotoInput, x_norm: float, y_norm: float) -> float | None:
+    """Best-effort metric depth (mm) at a normalized image point [x, y] in
+    [0, 1]. Used by the ghost composite (api/composite.py) to place the part at
+    the true distance of the surface the user circled.
+
+    Returns None whenever depth is unavailable — DEPTH_PROVIDER=none, or the
+    model failed/couldn't size that pixel — so the composite falls back to a
+    non-depth scale. Unlike the rest of this module it NEVER raises: depth here
+    is a pure convenience, and a preview must not be able to break because a
+    depth backend hiccuped."""
+    if get_provider_name() != "replicate":
+        return None
+    try:
+        depth_map, _fx, _fy = _run_depth_model(photo)
+        h, w = depth_map.shape
+        d = _sample_depth(depth_map, x_norm * (w - 1), y_norm * (h - 1))
+        if not math.isfinite(d) or d <= 0:
+            return None
+        return d * 1000.0
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Pure metric geometry (no network, unit-tested against synthetic depth maps)
 # ---------------------------------------------------------------------------
@@ -150,6 +173,11 @@ def _sample_depth(depth_map: Any, u: float, v: float, window: int = 2) -> float:
 
     h, w = depth_map.shape
     ui, vi = int(round(u)), int(round(v))
+    # A point outside the frame has no depth — return NaN rather than let a
+    # negative slice-stop (min(w, ui+window+1) < 0) wrap around and sample an
+    # unrelated region. Reachable from an out-of-[0,1] annotation point.
+    if not (0 <= ui < w and 0 <= vi < h):
+        return float("nan")
     u0, u1 = max(0, ui - window), min(w, ui + window + 1)
     v0, v1 = max(0, vi - window), min(h, vi + window + 1)
     patch = depth_map[v0:v1, u0:u1]

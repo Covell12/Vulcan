@@ -30,6 +30,8 @@ const generatePartBtn = document.getElementById("generate-part-btn");
 const generateStatusEl = document.getElementById("generate-status");
 const designResult = document.getElementById("design-result");
 const designPreviewImg = document.getElementById("design-preview-img");
+const compositeFigure = document.getElementById("composite-figure");
+const designCompositeImg = document.getElementById("design-composite-img");
 const designParamsTable = document.getElementById("design-params-table");
 const designDownloads = document.getElementById("design-downloads");
 
@@ -450,6 +452,17 @@ const SOURCE_BADGE = {
 
 function renderDesign(design) {
   designResult.hidden = false;
+
+  // In-photo ghost first ("In your photo"), when the API produced one. The
+  // cache-buster keeps a re-generated design from showing a stale image.
+  const compositeUrl = design.files.composite;
+  if (compositeUrl) {
+    designCompositeImg.src = `${compositeUrl}?t=${Date.now()}`;
+    compositeFigure.hidden = false;
+  } else {
+    designCompositeImg.removeAttribute("src");
+    compositeFigure.hidden = true;
+  }
 
   designPreviewImg.src = `${design.files.preview_png}?t=${Date.now()}`;
 

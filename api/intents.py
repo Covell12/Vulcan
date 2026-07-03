@@ -2,9 +2,14 @@
 IntentSpec, then user answers to fill in the critical dimensions.
 
 Persistence is deliberately boring, per CLAUDE.md: one JSON file per intent
-under data/intents/, no database yet. Uploaded photo bytes are NOT persisted
-— they're only needed transiently to call the vision provider; the browser
-already holds them for redisplay during the same session.
+under data/intents/, no database yet. As of M5.5 the uploaded photo bytes ARE
+persisted, under data/intents/<intent_id>/photos/, alongside the intent JSON.
+The ghost composite preview (api/composite.py) renders the generated part back
+into the user's own photo, so the photo has to survive from intent creation to
+the later design join. PRIVACY: these are user-submitted photos of the user's
+home/workshop and are kept on disk indefinitely with no expiry or redaction
+yet; data/ is gitignored so they never reach the repo, but a real deployment
+needs a retention/delete policy before this leaves the founder's own machine.
 
 This module owns the one rule that's non-negotiable per CLAUDE.md: a
 fit-critical dimension may only ever commit from source="user_measured", and
@@ -17,7 +22,10 @@ opinion of it (see `_apply_critical_dim_gate`).
 from __future__ import annotations
 
 import json
+import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +34,20 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
-from api.depth_provider import DepthProviderError, ScaleRegion, estimate_scale
-from api.designs import build_design
+from api import composite
+from api.depth_provider import (
+    DepthProviderError,
+    ScaleRegion,
+    depth_mm_at,
+    estimate_scale,
+)
+from api.designs import EXPORTS_DIR, build_design
 from api.param_schema import form_fields_for
 from api.photo import PhotoInput
 from api.vision_provider import VisionProviderError, parse_intent
 from templates_lib.registry import TemplateSpec, all_templates, get_template
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -102,6 +118,45 @@ def _load_intent(intent_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"No intent '{intent_id}'.")
     with open(path) as f:
         return json.load(f)
+
+
+# Uploaded photos are persisted so the design join can render the ghost
+# composite (api/composite.py) into the user's original photo. See the module
+# docstring for the privacy implication.
+_MIME_EXT = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+}
+
+
+def _intent_dir(intent_id: str) -> Path:
+    return INTENTS_DIR / intent_id
+
+
+def _persist_photos(
+    intent_id: str, photo_inputs: list[PhotoInput]
+) -> list[dict[str, Any]]:
+    """Write each uploaded photo to data/intents/<id>/photos/ and return a list
+    of {index, path (relative to data/), mime_type} refs to store on the intent.
+    The relative path lets the join reload the exact bytes later."""
+    photos_dir = _intent_dir(intent_id) / "photos"
+    photos_dir.mkdir(parents=True, exist_ok=True)
+    refs: list[dict[str, Any]] = []
+    for i, photo in enumerate(photo_inputs):
+        ext = _MIME_EXT.get((photo.mime_type or "").lower(), ".jpg")
+        dest = photos_dir / f"photo_{i}{ext}"
+        dest.write_bytes(photo.content)
+        refs.append(
+            {
+                "index": i,
+                "path": str(dest.relative_to(DATA_DIR)),
+                "mime_type": photo.mime_type,
+            }
+        )
+    return refs
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +539,13 @@ async def create_intent(
     result = _apply_critical_dim_gate(result)
     _apply_depth_prior(result, photo_inputs)
 
+    # Persist the photos (for the later ghost composite) + the raw annotation
+    # (for placing the ghost at the user's circled spot). Both are referenced by
+    # the design join; neither is part of the canonical IntentSpec schema, which
+    # allows extra top-level fields.
+    result["photos"] = _persist_photos(result["intent_id"], photo_inputs)
+    result["annotation"] = parsed_annotation
+
     errors = _validation_errors(result)
     if errors:
         raise HTTPException(
@@ -631,6 +693,80 @@ def _resolve_design_params(
     return params, source_map, summary
 
 
+# Hard wall-clock cap on the ghost's optional depth lookup. With
+# DEPTH_PROVIDER=replicate that lookup is a synchronous network call inside the
+# design request; the ghost is only a preview, so it must never make the join
+# hang once the part files are already built. Under the default
+# DEPTH_PROVIDER=none, depth_mm_at returns None instantly and this never waits.
+_COMPOSITE_DEPTH_DEADLINE_S = 6.0
+
+
+def _bounded_depth_mm_at(
+    photo: PhotoInput,
+    x: float,
+    y: float,
+    deadline_s: float = _COMPOSITE_DEPTH_DEADLINE_S,
+) -> float | None:
+    """`depth_mm_at` with a hard deadline. On timeout returns None (fall back to
+    non-depth scale); the orphaned worker finishes in the background and its
+    result is discarded — we never block the join on it."""
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        return executor.submit(depth_mm_at, photo, x, y).result(timeout=deadline_s)
+    except FuturesTimeout:
+        return None
+    finally:
+        # Don't wait=True: a stalled depth call must not extend the request.
+        executor.shutdown(wait=False)
+
+
+def _render_ghost_composite(
+    intent: dict[str, Any], spec: TemplateSpec, design_id: str
+) -> str | None:
+    """Best-effort ghost composite (M5.5): render the just-built part into the
+    user's stored photo and return its /exports URL. Returns None — never
+    raises — when there's no stored photo or anything goes wrong; the part
+    files are the real deliverable and a preview must never block them."""
+    photos = intent.get("photos") or []
+    if not photos:
+        return None
+    photo_ref = photos[0]
+    photo_path = DATA_DIR / photo_ref.get("path", "")
+    if not photo_path.exists():
+        return None
+
+    try:
+        photo_bytes = photo_path.read_bytes()
+        annotation = intent.get("annotation")
+
+        # Optional: true metric depth at the circled point (usually unavailable
+        # with DEPTH_PROVIDER=none; render_composite then infers scale itself).
+        # Deadline-bounded so a slow replicate backend can't hang the join.
+        centroid = composite.annotation_centroid(annotation) or (0.5, 0.5)
+        depth_mm = _bounded_depth_mm_at(
+            PhotoInput(
+                content=photo_bytes,
+                mime_type=photo_ref.get("mime_type") or "image/jpeg",
+            ),
+            centroid[0],
+            centroid[1],
+        )
+
+        out_path = EXPORTS_DIR / design_id / "composite.png"
+        composite.render_composite(
+            photo_bytes,
+            EXPORTS_DIR / design_id / "part.stl",
+            out_path,
+            category=spec.category,
+            annotation=annotation,
+            depth_mm=depth_mm,
+        )
+        return f"/exports/{design_id}/{out_path.name}"
+    except Exception as e:  # noqa: BLE001 — preview is strictly best-effort
+        logger.warning("ghost composite failed for design %s: %s", design_id, e)
+        return None
+
+
 @router.post("/intents/{intent_id}/design")
 def create_design_from_intent(intent_id: str) -> dict[str, Any]:
     intent = _load_intent(intent_id)
@@ -654,6 +790,11 @@ def create_design_from_intent(intent_id: str) -> dict[str, Any]:
 
     params, source_map, summary = _resolve_design_params(intent, spec)
     design_id, files = build_design(template_id, params, source_map=source_map)
+
+    # In-photo ghost preview (only when a photo was stored at intent creation).
+    composite_url = _render_ghost_composite(intent, spec, design_id)
+    if composite_url:
+        files["composite"] = composite_url
 
     # Persist the intent -> design link.
     intent["design_id"] = design_id

@@ -11,6 +11,7 @@ exactly one place.
 
 from __future__ import annotations
 
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
-from api.rendering import export_design
+from api.rendering import export_design, mesh_is_watertight
 from templates_lib.registry import TemplateSpec, all_templates, get_template
 
 router = APIRouter()
@@ -106,6 +107,22 @@ def build_design(
     design_dir = EXPORTS_DIR / design_id
     callouts = _callout_dicts(spec, params_obj, source_map)
     files = export_design(solid, design_dir, callouts)
+
+    # Runtime manifold gate (M5.5): a part we hand to a printer must be a
+    # watertight, manifold solid. The per-template pytest suite proves this for
+    # DEFAULT params, but a live design runs USER-resolved params (and, later,
+    # generated geometry), so we re-check the actually-exported mesh here and
+    # refuse to return files for a non-printable design. Fail closed: delete the
+    # half-baked export directory so no unbuildable STL/STEP can be downloaded.
+    if not mesh_is_watertight(files["stl"]):
+        shutil.rmtree(design_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"generated mesh for template '{template_id}' is not watertight/"
+                "manifold and cannot be printed; design rejected."
+            ),
+        )
 
     urls = {
         "step": f"/exports/{design_id}/{files['step'].name}",

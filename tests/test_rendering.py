@@ -12,7 +12,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from cadquery import exporters
 
-from api.rendering import export_design, render_preview
+from api.rendering import export_design, mesh_is_watertight, render_preview
 from templates_lib.registry import get_template
 
 
@@ -42,6 +42,18 @@ def test_render_preview_closes_figure_on_success(tmp_path: Path):
     render_preview(stl, tmp_path / "out.png")
     assert (tmp_path / "out.png").exists()
     assert len(plt.get_fignums()) == before
+
+
+def test_mesh_is_watertight_true_for_real_solid(tmp_path: Path):
+    assert mesh_is_watertight(_bracket_stl(tmp_path)) is True
+
+
+def test_mesh_is_watertight_false_for_empty_stl(tmp_path: Path):
+    """M5.5 review: an empty/degenerate STL must return False, not raise — the
+    manifold gate stays fail-closed rather than throwing past its cleanup."""
+    stl = tmp_path / "empty.stl"
+    stl.write_text("solid empty\nendsolid empty\n")
+    assert mesh_is_watertight(stl) is False
 
 
 def test_export_design_with_callouts(tmp_path: Path):
