@@ -15,6 +15,19 @@ from pydantic import BaseModel
 
 
 @dataclass(frozen=True)
+class DimCallout:
+    """One labeled dimension arrow to draw on the preview (M5). `param` is the
+    template param it annotates (so the renderer can look up its value + source
+    marker); `p0`/`p1` are the two 3D endpoints in the part's own mm coordinate
+    system; `label` is the human name shown ("span", "od A", "bore")."""
+
+    param: str
+    p0: tuple[float, float, float]
+    p1: tuple[float, float, float]
+    label: str
+
+
+@dataclass(frozen=True)
 class TemplateSpec:
     """Everything the API and test suite need to treat a template generically."""
 
@@ -36,6 +49,10 @@ class TemplateSpec:
     # (M3) enforces this as the critical-dim gate before status can become
     # "ready_for_design".
     critical_dims: tuple[str, ...]
+    # (M5) Given a validated params instance, return the dimension callouts to
+    # annotate on the preview render. Each template knows where its own key
+    # dims attach on the geometry.
+    callouts_fn: Callable[[Any], list[DimCallout]]
 
 
 _REGISTRY: dict[str, TemplateSpec] = {}

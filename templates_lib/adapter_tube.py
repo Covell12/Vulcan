@@ -24,7 +24,7 @@ import cadquery as cq
 from pydantic import BaseModel, Field, model_validator
 
 from templates_lib.constants import MIN_WALL_MM
-from templates_lib.registry import TemplateSpec, register_template
+from templates_lib.registry import DimCallout, TemplateSpec, register_template
 
 TEMPLATE_ID = "adapter_tube"
 
@@ -181,6 +181,38 @@ def build_adapter(params: AdapterTubeParams) -> cq.Workplane:
     return outer.cut(inner)
 
 
+def adapter_callouts(params: AdapterTubeParams) -> list[DimCallout]:
+    """Diameter arrows across each end face: outer + bore at end A (z=0) and
+    end B (z=total length). The tube axis is global Z; diameters lie along X."""
+    total = params.total_length_mm
+    return [
+        DimCallout(
+            "od_a_mm",
+            (-params.od_a_mm / 2, 0.0, 0.0),
+            (params.od_a_mm / 2, 0.0, 0.0),
+            "od A",
+        ),
+        DimCallout(
+            "id_a_mm",
+            (-params.id_a_mm / 2, 0.0, 0.0),
+            (params.id_a_mm / 2, 0.0, 0.0),
+            "bore A",
+        ),
+        DimCallout(
+            "od_b_mm",
+            (-params.od_b_mm / 2, 0.0, total),
+            (params.od_b_mm / 2, 0.0, total),
+            "od B",
+        ),
+        DimCallout(
+            "id_b_mm",
+            (-params.id_b_mm / 2, 0.0, total),
+            (params.id_b_mm / 2, 0.0, total),
+            "bore B",
+        ),
+    ]
+
+
 register_template(
     TemplateSpec(
         template_id=TEMPLATE_ID,
@@ -193,5 +225,6 @@ register_template(
         },  # wall = 0.5mm, well below MIN_WALL_MM
         category="adapter",
         critical_dims=("od_a_mm", "id_a_mm", "od_b_mm", "id_b_mm"),
+        callouts_fn=adapter_callouts,
     )
 )

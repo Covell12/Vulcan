@@ -26,7 +26,7 @@ import cadquery as cq
 from pydantic import BaseModel, Field, model_validator
 
 from templates_lib.constants import MIN_WALL_MM
-from templates_lib.registry import TemplateSpec, register_template
+from templates_lib.registry import DimCallout, TemplateSpec, register_template
 
 TEMPLATE_ID = "knob_appliance"
 
@@ -190,6 +190,29 @@ def build_knob(params: KnobApplianceParams) -> cq.Workplane:
     return knob
 
 
+def knob_callouts(params: KnobApplianceParams) -> list[DimCallout]:
+    """Knob diameter across the top face, shaft bore diameter across the bottom,
+    and shaft depth up the side. Knob axis is global Z; diameters lie along X."""
+    kd, sd = params.knob_dia_mm, params.shaft_dia_mm
+    return [
+        DimCallout(
+            "knob_dia_mm",
+            (-kd / 2, 0.0, params.knob_height_mm),
+            (kd / 2, 0.0, params.knob_height_mm),
+            "knob dia",
+        ),
+        DimCallout(
+            "shaft_dia_mm", (-sd / 2, 0.0, 0.0), (sd / 2, 0.0, 0.0), "shaft dia"
+        ),
+        DimCallout(
+            "shaft_depth_mm",
+            (kd / 2, 0.0, 0.0),
+            (kd / 2, 0.0, params.shaft_depth_mm),
+            "shaft depth",
+        ),
+    ]
+
+
 register_template(
     TemplateSpec(
         template_id=TEMPLATE_ID,
@@ -202,5 +225,6 @@ register_template(
         },  # radial wall ~ 0.4mm
         category="knob",
         critical_dims=("shaft_dia_mm", "shaft_depth_mm"),
+        callouts_fn=knob_callouts,
     )
 )

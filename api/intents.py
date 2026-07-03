@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
 from api.depth_provider import DepthProviderError, ScaleRegion, estimate_scale
+from api.designs import build_design
 from api.param_schema import form_fields_for
 from api.photo import PhotoInput
 from api.vision_provider import VisionProviderError, parse_intent
@@ -126,6 +127,15 @@ def _template_catalog() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _is_confirmed(dim: dict[str, Any] | None) -> bool:
+    """A critical dim counts as confirmed only when it's user_measured AND
+    actually carries a value — source alone isn't enough (a provider could send
+    source="user_measured" with value_mm=null, which must NOT open the gate)."""
+    return bool(
+        dim and dim.get("source") == "user_measured" and dim.get("value_mm") is not None
+    )
+
+
 def _apply_critical_dim_gate(intent: dict[str, Any]) -> dict[str, Any]:
     template_id = intent.get("template_id")
     spec = get_template(template_id) if template_id else None
@@ -139,8 +149,7 @@ def _apply_critical_dim_gate(intent: dict[str, Any]) -> dict[str, Any]:
     elif spec is not None:
         dims_by_name = {d["name"]: d for d in intent["dimensions"]}
         all_confirmed = all(
-            dims_by_name.get(name, {}).get("source") == "user_measured"
-            for name in spec.critical_dims
+            _is_confirmed(dims_by_name.get(name)) for name in spec.critical_dims
         )
         intent["status"] = "ready_for_design" if all_confirmed else "needs_answers"
     else:
@@ -518,6 +527,148 @@ def submit_answers(intent_id: str, request: AnswersRequest) -> dict[str, Any]:
     return intent
 
 
+# ---------------------------------------------------------------------------
+# The intent -> design join (M5)
+# ---------------------------------------------------------------------------
+
+# How a dimension's source maps to the join's provenance label (which drives
+# the preview marker and the summary table).
+_DIM_SOURCE_LABEL = {
+    "user_measured": "measured",
+    "depth_inferred": "suggested",
+    "assumed": "assumed",
+}
+
+
+def _coerce_param(value: Any, field_type: str) -> Any:
+    """Coerce a resolved enum/bool value (which may arrive as a string from a
+    choice question) to the type the template's params model expects."""
+    if field_type == "boolean" and isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return value
+
+
+def _resolve_design_params(
+    intent: dict[str, Any], spec: TemplateSpec
+) -> tuple[dict[str, Any], dict[str, str], list[dict[str, Any]]]:
+    """Map the IntentSpec onto the template's FULL param set (M5 join).
+
+    Precedence:
+      - dimension params: the dimension's value_mm, tagged by its source.
+        A critical param may only come from user_measured (the gate guarantees
+        this at ready_for_design; we double-check and 409 if it's been violated).
+      - enum/boolean params: an answered choice question (chosen_value) beats the
+        provider's suggested_value beats the template default.
+      - every other (non-dimension numeric) param: the template default.
+
+    Returns (params dict for the model, source_map for the preview, summary rows).
+    """
+    fields = form_fields_for(spec.params_model)
+    dims_by_name = {d["name"]: d for d in intent.get("dimensions", [])}
+
+    chosen: dict[str, str] = {}
+    suggested: dict[str, str] = {}
+    for q in intent.get("questions", []):
+        if q.get("kind") != "choice":
+            continue
+        param = q.get("dim_name")
+        if not param:
+            continue
+        if q.get("chosen_value") is not None:
+            chosen[param] = q["chosen_value"]
+        if q.get("suggested_value") is not None:
+            suggested[param] = q["suggested_value"]
+
+    params: dict[str, Any] = {}
+    source_map: dict[str, str] = {}
+    summary: list[dict[str, Any]] = []
+
+    for field in fields:
+        name = field["name"]
+        ftype = field["type"]
+        dim = dims_by_name.get(name)
+
+        # A critical dim must be a genuine confirmed measurement — checked FIRST
+        # so a critical dim that's missing, valueless, or not user_measured can
+        # never fall through to a template default (CLAUDE.md rule 2). This is a
+        # defensive backstop; the ready_for_design gate should already guarantee
+        # it, but the join never trusts that.
+        if name in spec.critical_dims:
+            if not _is_confirmed(dim):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"critical dimension '{name}' has not been measured and "
+                        "confirmed by the user — a part cannot be made without it."
+                    ),
+                )
+            value, source = dim["value_mm"], "measured"
+        elif dim is not None and dim.get("value_mm") is not None:
+            value = dim["value_mm"]
+            source = _DIM_SOURCE_LABEL.get(dim.get("source"), "assumed")
+        elif ftype in ("choice", "boolean"):
+            if name in chosen:
+                value, source = _coerce_param(chosen[name], ftype), "chosen"
+            elif name in suggested:
+                value, source = _coerce_param(suggested[name], ftype), "suggested"
+            else:
+                value, source = field["default"], "default"
+        else:
+            value, source = field["default"], "default"
+
+        params[name] = value
+        source_map[name] = source
+        summary.append(
+            {
+                "name": name,
+                "label": field["label"],
+                "value": value,
+                "source": source,
+                "unit": "mm" if name.endswith("_mm") else "",
+            }
+        )
+
+    return params, source_map, summary
+
+
+@router.post("/intents/{intent_id}/design")
+def create_design_from_intent(intent_id: str) -> dict[str, Any]:
+    intent = _load_intent(intent_id)
+
+    if intent.get("status") != "ready_for_design":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"intent '{intent_id}' is '{intent.get('status')}', not ready_for_design "
+                "— every critical dimension must be measured and confirmed first."
+            ),
+        )
+
+    template_id = intent.get("template_id")
+    spec = get_template(template_id) if template_id else None
+    if spec is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"intent '{intent_id}' has no buildable template_id.",
+        )
+
+    params, source_map, summary = _resolve_design_params(intent, spec)
+    design_id, files = build_design(template_id, params, source_map=source_map)
+
+    # Persist the intent -> design link.
+    intent["design_id"] = design_id
+    intent["design_files"] = files
+    intent["design_params"] = summary
+    _save_intent(intent)
+
+    return {
+        "design_id": design_id,
+        "template_id": template_id,
+        "files": files,
+        "params": summary,
+    }
+
+
 def _apply_answer(
     question: dict[str, Any],
     answer: AnswerInput,
@@ -564,12 +715,19 @@ def _apply_answer(
         return
 
     if kind == "choice":
-        # v0 scope: the only non-dimension field a choice answer can update is
-        # material_suggestion. Mapping other enum template params (screw_size,
-        # load_hint, etc.) from a chosen value is M5's job ("intent -> design
-        # join"), once IntentSpec dims get joined with a template's full params.
-        if dim_name is None and answer.choice in MATERIAL_CHOICES:
-            intent["material_suggestion"] = answer.choice
+        if answer.choice is not None:
+            # Record the chosen enum value ON the question, so the design join
+            # (POST /intents/{id}/design) can resolve it — a choice question's
+            # dim_name is the enum template param it sets (e.g. "load_hint").
+            # This is the M3 deferral finished: choices now map to ANY enum
+            # param, not just material.
+            question["chosen_value"] = answer.choice
+            # material_suggestion is intent metadata (not a template param), so
+            # it's still updated directly when its question is answered.
+            if dim_name == "material_suggestion" or (
+                dim_name is None and answer.choice in MATERIAL_CHOICES
+            ):
+                intent["material_suggestion"] = answer.choice
         return
 
     # kind == "photo_retake": nothing to update server-side; the client just

@@ -33,7 +33,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   the structured interpretation of "what the user wants." Every photo+text submission
   becomes one of these. It carries the guessed part category, every dimension with its
   source (user-measured vs. inferred vs. assumed) and confidence, and the list of
-  measurement questions to ask the user. The API validates against this schema.
+  measurement questions to ask the user. The API validates against this schema. **M5:**
+  question items gained `suggested_value` (the vision provider's recommended value for a
+  choice/enum param) and `chosen_value` (filled when the user answers a choice) — both
+  nullable strings, so the OpenAI strict-schema transform stays compliant. These carry
+  enum-param decisions through to the intent→design join.
 
 ## docs/
 
@@ -42,7 +46,7 @@ non-expert can follow: what it does, why it exists, what talks to it).
 - **docs/ROADMAP.md** — The build sequence as a numbered list of Claude Code milestones,
   each with its exit criteria. Work top to bottom; don't skip ahead.
 
-## api/ (M1, extended M2, M3, and M4)
+## api/ (M1, extended M2, M3, M4, and M5)
 
 - **api/main.py** — Creates the FastAPI application. Defines `GET /health` (a trivial
   liveness check), wires in the `/designs`, `/templates`, and `/intents` routes, and
@@ -60,14 +64,14 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `api/depth_provider.py` can both accept the same type without importing each other;
   re-exported from `api/vision_provider` so existing `from api.vision_provider import
   PhotoInput` imports keep working.
-- **api/designs.py** — Defines `POST /designs`, the one endpoint that turns a
-  `template_id` + parameter JSON into a physical part. (M2) It no longer hardcodes which
-  templates exist — it looks the template up via `templates_lib.registry.get_template`,
-  which every template module populates just by being imported (see
-  `templates_lib/__init__.py`). Validates the params through that template's pydantic
-  model, builds the CadQuery solid, exports it, and returns a design_id plus download
-  URLs. Bad params or an unknown template_id come back as a clear 4xx error instead of a
-  stack trace.
+- **api/designs.py** — Defines `POST /designs` and (M5) the shared `build_design(template_id,
+  params, *, source_map=None)` internals that BOTH the direct endpoint and the intent→design
+  join (api/intents.py) call, so the export pipeline lives in exactly one place. It looks the
+  template up in `templates_lib.registry` (M2), validates the params, builds the CadQuery
+  solid, computes the preview's dimension callouts from the template's `callouts_fn` (labelling
+  each with its value + a source marker — measured ✓ / suggested ~ / default — from the
+  optional `source_map`), exports STEP/3MF/STL + the annotated PNG, and returns a design_id
+  plus URLs. Bad params or an unknown template_id come back as a clear 4xx error.
 - **api/templates.py** (M2, refactored M3) — Defines `GET /templates`, which describes
   every registered template's parameter form (name, type, min/max, choices, default,
   description) so the web UI can build the right form for whichever template the user
@@ -139,8 +143,8 @@ non-expert can follow: what it does, why it exists, what talks to it).
   JSON file per intent under `data/intents/<intent_id>.json` — no database yet, per
   CLAUDE.md. Answers can be `measure_mm` (sets `value_mm`+`source=user_measured`),
   `confirm` (accepts an already-assumed value as measured), or `choice` (v0 scope: only
-  wired up to update `material_suggestion` — mapping other enum template params from a
-  choice answer is M5's job, once IntentSpec dims get joined to a full template).
+  wired up to update `material_suggestion`; **M5** finished the deferral so a choice answer
+  now maps to ANY enum template param — it records `chosen_value` on the question).
   **M4 additions:** (1) after the vision pass, `_apply_depth_prior` asks
   `depth_provider.estimate_scale` for a metric size for each dim still on source
   "assumed" and, where it gets one, turns it into a `depth_inferred` suggestion (value +
@@ -157,16 +161,28 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `cross_check.depth_value_mm`, so a corrected re-answer is checked against the same prior.
   A `confirm` answer is routed through the SAME cross-check (and refuses to touch a dim
   currently flagged as a mismatch), so it can't become a back door that commits a
-  disputed value without the re-ask.
+  disputed value without the re-ask. **M5 addition:** `POST /intents/{id}/design` is the
+  intent→design join — the endpoint that closes the loop. It refuses with a 409 unless the
+  intent is `ready_for_design` (so the critical-dim gate holds end to end), then
+  `_resolve_design_params` maps the IntentSpec onto the template's FULL param set:
+  dimension values by source (a critical param may only come from `user_measured` — a
+  defensive 409 if that's ever violated — while `depth_inferred`/`assumed` are fine for
+  non-critical ones), and each enum/boolean param resolved as answered-choice
+  (`chosen_value`) > provider suggestion (`suggested_value`) > template default. It calls
+  `designs.build_design` (reusing the export pipeline), persists the intent→design link,
+  and returns the files plus a per-param summary (value + source) that drives the UI table.
 - **api/rendering.py** — Takes a finished CadQuery solid and writes it to disk in every
   format the rest of the product needs: STEP (for manufacturing/slicing), 3MF and STL
   (for 3D printing), and a PNG preview. The preview is rendered by loading the exported
   STL's triangle mesh with `trimesh` and drawing it with `matplotlib` — deliberately not
-  a live CAD viewport, so it renders correctly with no display or GPU on a server. Also
+  a live CAD viewport, so it renders correctly with no display or GPU on a server. **M5:**
+  `render_preview`/`export_design` take optional `callouts` ({p0, p1, text}) and draw each
+  as a labeled 3D dimension arrow (the "honest preview" — value + measured ✓ / suggested ~
+  / default marker), still fully headless. Also
   exposes `mesh_is_watertight`, the manifold check the test suite and (later) DFM
   validation both rely on.
 
-## templates_lib/ (M1, extended M2 and M3)
+## templates_lib/ (M1, extended M2, M3, and M5)
 
 - **templates_lib/__init__.py** (M2) — Importing this package registers every template.
   Each template module registers itself as a side effect of being imported; this file's
@@ -182,8 +198,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `category` (the `schemas/intent_spec.schema.json` category enum value this template
   belongs to) and `critical_dims` (the param names that are fit-critical per CLAUDE.md's
   dimension rules — `api/intents.py`'s critical-dim gate reads this, never a hardcoded
-  or provider-supplied list). `register_template` / `get_template` / `all_templates` are
-  the whole API.
+  or provider-supplied list). **M5:** added the `DimCallout` dataclass and a `callouts_fn`
+  on `TemplateSpec` — each template declares its own preview dimension arrows (which param,
+  the two 3D endpoints in part coords, a label), which `api/designs.py` resolves to
+  labeled callouts for the honest preview. `register_template` / `get_template` /
+  `all_templates` are the whole API.
 - **templates_lib/constants.py** (M2) — `MIN_WALL_MM` (2.4mm, the PETG-printable minimum
   from CLAUDE.md), factored out once a third template proved it was genuinely shared
   rather than bracket-specific. All three templates import it from here instead of each
@@ -205,7 +224,8 @@ non-expert can follow: what it does, why it exists, what talks to it).
   arguments is itself one valid example — used by the shared test suite and by
   `GET /templates` to prefill the web form. **M3:** registered with
   `category="bracket"` and `critical_dims=("span_mm", "depth_mm")`, per this
-  milestone's instructions.
+  milestone's instructions. **M5:** `bracket_callouts` declares the span + depth preview
+  arrows.
 - **templates_lib/adapter_tube.py** (M2) — A tube/hose adapter joining two circular
   ends (`od_a_mm`/`id_a_mm` at end A, `od_b_mm`/`id_b_mm` at end B), per
   docs/vulcan-product-spec.pdf Appendix A's `adapter.tube` entry — which only sketches
@@ -220,7 +240,8 @@ non-expert can follow: what it does, why it exists, what talks to it).
   a plausible multiple of its end's OD (not a tiny stub or a fragile noodle — our own
   judgment call), and that total length stays under the spec's 250mm v1 size ceiling.
   **M3:** registered with `category="adapter"` and `critical_dims=("od_a_mm", "id_a_mm",
-  "od_b_mm", "id_b_mm")` — all four diameters, per this milestone's instructions.
+  "od_b_mm", "id_b_mm")` — all four diameters, per this milestone's instructions. **M5:**
+  `adapter_callouts` declares the OD + bore diameter arrows at each end.
 - **templates_lib/knob_appliance.py** (M2) — A replacement appliance control knob, per
   Appendix A's `knob.appliance` entry (again, names only — no numbers). A cylindrical
   knob body gets a bore cut into its bottom face sized to the control shaft
@@ -234,17 +255,22 @@ non-expert can follow: what it does, why it exists, what talks to it).
   radial fin on the top face as a dial-position indicator. Validates radial wall
   (knob OD to bore) and top-cap wall (knob height to bore depth) both ≥ `MIN_WALL_MM`.
   **M3:** registered with `category="knob"` and `critical_dims=("shaft_dia_mm",
-  "shaft_depth_mm")`, per this milestone's instructions.
+  "shaft_depth_mm")`, per this milestone's instructions. **M5:** `knob_callouts` declares
+  the knob-diameter, shaft-diameter, and shaft-depth preview arrows.
 
-## web/ (M1, rebuilt M2, extended M3 and M4)
+## web/ (M1, rebuilt M2, extended M3, M4, and M5)
 
 - **web/index.html** — **M3:** now two tabs. "Start with a photo" (the new default) is
-  the intent-parser flow: photo upload, freehand-annotation canvas, description text,
-  a questions panel with photo overlays, and a result panel with the raw IntentSpec +
-  a "Generate part" button. "Direct template params" is the M1/M2 flow unchanged — a
-  template-picker dropdown, an (empty) parameter-form container `app.js` fills in, a
-  preview pane, and download links. Static HTML with no framework or build step, per
-  CLAUDE.md.
+  the intent-parser flow. "Direct template params" is the M1/M2 flow — a template-picker
+  dropdown, a parameter-form container `app.js` fills in, a preview pane, and downloads.
+  Static HTML with no framework or build step, per CLAUDE.md. **M5:** the photo tab's
+  result panel is now a self-contained "Your part" — a "Generate my part" button, an
+  annotated-preview `<img>`, a param-summary `<table>`, download links, and the raw
+  IntentSpec tucked into a `<details>` — and it loads `units.js` before `intents.js`.
+- **web/units.js** (M5) — The ONE place lengths are converted (CLAUDE.md rule 4). Pure
+  helpers: `toMm(value, unit)` (mm/cm/in → mm), `formatDual` ("8 in = 203.2 mm"), and a
+  session-remembered unit (`get/setSessionUnit`). Internal units stay mm everywhere; this
+  converts right at the input boundary. Verified in-browser (and by a node sanity check).
 - **web/app.js** — The "Direct template params" tab's logic, unchanged since M2:
   fetches `GET /templates`, renders a parameter form purely from the field list (no
   template-specific code), and POSTs to `/designs` on submit. **M3:** gained the
@@ -278,14 +304,20 @@ non-expert can follow: what it does, why it exists, what talks to it).
   as an override). Question rows are now deduped per dim (a dim can carry both its
   original and a server-added `reask-` question) so inputs/cards don't double-render, and
   the answer-submit path is extracted into a shared `submitAnswers(answers)` used by both
-  the button and the re-confirm.
-- **web/style.css** — Styling for the test UI. **M3:** added tab styling, the
-  photo/canvas/SVG-overlay layered layout (`#annotate-wrap`/`#overlay-wrap`, absolutely
-  positioned canvas and SVG over the photo), question-row styling, and the
-  `<pre>`-formatted IntentSpec JSON display. **M4:** added the `.mismatch-card` /
-  `.reconfirm-btn` styles for the cross-check warning.
+  the button and the re-confirm. **M5:** every `measure_mm` input now gets a mm/cm/in unit
+  selector + live dual display (via `appendMeasureField`), and `collectMm` converts to mm
+  before sending. Each choice `<select>` shows the provider's "use suggested: X" default
+  and reflects an earlier `chosen_value`. "Generate my part" now calls the join endpoint
+  `POST /intents/{id}/design` and `renderDesign` shows the annotated preview, a param
+  summary table (value + source badge), and the STEP/3MF/STL downloads — the user never
+  touches the raw template form.
+- **web/style.css** — Styling for the test UI. **M3:** tab styling, the photo/canvas/SVG
+  overlay layout, question rows, the IntentSpec JSON display. **M4:** the `.mismatch-card`
+  / `.reconfirm-btn` cross-check styles. **M5:** the `.measure-field` (input + unit
+  selector + dual display), the `#design-result` layout, the `#design-params-table` with
+  colored source badges, and the design download links.
 
-## tests/ (M1, extended M2, M3, and M4)
+## tests/ (M1, extended M2, M3, M4, and M5)
 
 - **tests/test_bracket_shelf_l.py** — Tests the bracket template in isolation (no
   API/HTTP involved): every generated mesh is manifold for each `load_hint`, wall
@@ -308,10 +340,16 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `assert_all_exports_non_empty`. Not a test module itself (the name doesn't match
   pytest's `test_*.py` pattern) — `tests/test_template_suite.py` wires these up as
   parametrized tests.
-- **tests/test_template_suite.py** (M2) — Runs the shared checks above against every
-  template in `templates_lib.registry.all_templates()`. Because it iterates the live
-  registry rather than a hardcoded list, a future template gets this baseline coverage
-  automatically the moment it registers itself — no test file to remember to update.
+- **tests/test_template_suite.py** (M2, extended M5) — Runs the shared checks above
+  against every template in `templates_lib.registry.all_templates()`. Because it iterates
+  the live registry rather than a hardcoded list, a future template gets this baseline
+  coverage automatically the moment it registers itself. **M5:** also asserts every
+  template declares valid preview callouts (each references a real field, has two distinct
+  3D endpoints, and a label).
+- **tests/test_rendering.py** (M5) — Tests the headless preview pipeline: `render_preview`
+  always closes its matplotlib figure — even when `savefig` fails — so figures can't
+  accumulate in matplotlib's global registry inside the long-lived server (regression for
+  a review finding), plus `export_design` with callouts writes a non-empty annotated PNG.
 - **tests/test_adapter_tube.py** (M2) — Geometry sanity checks specific to the tube
   adapter, beyond the shared suite: the bore is a genuine through-hole (checked two
   ways — mesh Euler number 0, i.e. torus-like/genus-1 topology, for both `taper=True`
@@ -350,7 +388,7 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `replicate` mocked (a visualization PNG is rejected, a metric `.npz` + focal length
   decodes to the right size, an API error is wrapped), and the grep test that only
   `depth_provider.py` imports `replicate`.
-- **tests/test_intents.py** (M3, extended M4) — Tests `api/intents.py` with
+- **tests/test_intents.py** (M3, extended M4 and M5) — Tests `api/intents.py` with
   `api.intents.parse_intent` (and, for M4, `api.intents.estimate_scale`) mocked — no
   network. Covers the create → answer → `ready_for_design` round-trip; the
   schema-validation retry path; answer `source`/`confidence` handling; the critical-dim
@@ -360,7 +398,12 @@ non-expert can follow: what it does, why it exists, what talks to it).
   failure degrades gracefully); and the full cross-check matrix — the mm/cm slip (10x),
   the inch slip (25.4x), a re-confirmed override, a corrected value, depth-unavailable
   committing with status `"unavailable"`, and an explicit "never silently overrides the
-  user" check.
+  user" check. **M5 additions:** the intent→design join — the 409 gate before
+  ready_for_design, a choice answer recording `chosen_value`, the full precedence
+  round-trip (measured dim > assumed non-critical > chosen enum > suggested enum > default,
+  asserted against the generated params), fetchable downloads, and two regression tests for
+  review findings: a critical dim that's `user_measured` but valueless must NOT open the
+  gate, and the join must 409 rather than build a part from a template default in its place.
 - **tests/fixtures/intents/** (M3) — Ground-truth fixtures for `scripts/eval_intents.py`:
   `manifest.json` (fixture list: photos, text, optional annotation, ground-truth
   template_id/category/measured dimensions) + `photos/` + a `README.md` documenting the

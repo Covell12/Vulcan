@@ -37,3 +37,22 @@ def test_min_wall_violation_is_rejected(template_id: str):
 @pytest.mark.parametrize("template_id", TEMPLATE_IDS)
 def test_exports_are_non_empty(template_id: str, tmp_path: Path):
     assert_all_exports_non_empty(all_templates()[template_id], tmp_path)
+
+
+@pytest.mark.parametrize("template_id", TEMPLATE_IDS)
+def test_callouts_declared_and_valid(template_id: str):
+    """Every template must declare preview callouts (M5), each referencing a
+    real param and giving two distinct 3D endpoints."""
+    spec = all_templates()[template_id]
+    params = spec.params_model()
+    field_names = set(spec.params_model.model_fields)
+
+    callouts = spec.callouts_fn(params)
+    assert callouts, f"{template_id} declares no callouts"
+    for c in callouts:
+        assert (
+            c.param in field_names
+        ), f"{template_id}: callout param '{c.param}' is not a field"
+        assert len(c.p0) == 3 and len(c.p1) == 3
+        assert c.p0 != c.p1, f"{template_id}: callout '{c.label}' has zero length"
+        assert c.label

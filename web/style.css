@@ -319,3 +319,112 @@ circle.overlay-shape {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+#intent-json-details {
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* --- Measurement input with unit selector + dual display (M5) --- */
+.measure-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.measure-field input[type="number"] {
+  flex: 1 1 120px;
+}
+
+.unit-select {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+}
+
+.dual-display {
+  flex: 1 1 100%;
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 1em;
+}
+
+/* --- Design result: annotated preview + param summary + downloads (M5) --- */
+#design-result {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+#design-preview-box {
+  background: #fafbfc;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  text-align: center;
+}
+
+#design-preview-img {
+  max-width: 100%;
+  max-height: 460px;
+}
+
+#design-params-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+#design-params-table th,
+#design-params-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+#design-params-table th {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+td.src-measured,
+td.src-chosen {
+  color: #1f9254;
+  font-weight: 600;
+}
+
+td.src-suggested,
+td.src-assumed {
+  color: #8a5a00;
+}
+
+td.src-default {
+  color: var(--muted);
+}
+
+#design-downloads {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+#design-downloads a {
+  display: inline-block;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 14px;
+}
+
+#design-downloads a:hover {
+  background: #eef2ff;
+}

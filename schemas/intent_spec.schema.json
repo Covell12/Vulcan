@@ -47,10 +47,12 @@
         "required": ["question_id", "prompt", "kind"],
         "properties": {
           "question_id": { "type": "string" },
-          "dim_name": { "type": ["string", "null"] },
+          "dim_name": { "type": ["string", "null"], "description": "For measure_mm: the dimension name. For choice: the enum template-param name it sets (e.g. load_hint), or null for material_suggestion." },
           "prompt": { "type": "string" },
           "kind": { "enum": ["measure_mm", "choice", "confirm", "photo_retake"] },
           "choices": { "type": ["array", "null"], "items": { "type": "string" } },
+          "suggested_value": { "type": ["string", "null"], "description": "For a choice question: the value the vision provider recommends. Used as the enum param proposal (below an answered choice, above the template default)." },
+          "chosen_value": { "type": ["string", "null"], "description": "Filled in when the user answers a choice question. Never set by the provider." },
           "overlay": {
             "type": ["object", "null"],
             "description": "Where to draw the arrow/circle on the photo (normalized 0-1 coords).",

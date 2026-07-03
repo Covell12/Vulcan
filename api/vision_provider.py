@@ -76,6 +76,13 @@ photo, y=0 is the top). Use photo_index to say which photo (0-indexed) the overl
 on. It's fine to also ask non-dimension clarifying questions (kind="choice" or \
 "confirm") if something is genuinely ambiguous, but every critical dimension MUST get \
 a question.
+3a. For each NON-numeric enum/boolean template param you can sensibly let the user pick \
+(e.g. screw_size, load_hint, grip_style, shaft_type, taper, pointer), emit a \
+kind="choice" question: set dim_name to that param's EXACT name, choices to its allowed \
+values (for a boolean use ["true","false"]), and suggested_value to the single value you \
+recommend from the photo/text. For a material question, use dim_name="material_suggestion". \
+Always leave chosen_value null — it is filled in later when the user answers. On \
+measure_mm/confirm questions leave suggested_value and chosen_value null.
 4. description is a one-sentence plain-English restatement of what the user wants — \
 write it for a non-expert, not a spec sheet.
 5. status is "needs_answers" whenever there is at least one dimension you couldn't set \

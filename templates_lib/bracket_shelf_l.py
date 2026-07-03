@@ -14,7 +14,7 @@ import cadquery as cq
 from pydantic import BaseModel, Field, model_validator
 
 from templates_lib.constants import MIN_WALL_MM
-from templates_lib.registry import TemplateSpec, register_template
+from templates_lib.registry import DimCallout, TemplateSpec, register_template
 
 TEMPLATE_ID = "bracket_shelf_l"
 
@@ -175,6 +175,16 @@ def build_bracket(params: BracketShelfLParams) -> cq.Workplane:
     return solid
 
 
+def bracket_callouts(params: BracketShelfLParams) -> list[DimCallout]:
+    """Dimension arrows for the preview: span along the shelf arm's bottom
+    front edge, depth along the extrusion at the arm tip."""
+    span, depth = params.span_mm, params.depth_mm
+    return [
+        DimCallout("span_mm", (0.0, 0.0, 0.0), (span, 0.0, 0.0), "span"),
+        DimCallout("depth_mm", (span, 0.0, 0.0), (span, 0.0, depth), "depth"),
+    ]
+
+
 register_template(
     TemplateSpec(
         template_id=TEMPLATE_ID,
@@ -184,5 +194,6 @@ register_template(
         min_wall_violation={"thickness_mm": MIN_WALL_MM - 0.1},
         category="bracket",
         critical_dims=("span_mm", "depth_mm"),
+        callouts_fn=bracket_callouts,
     )
 )

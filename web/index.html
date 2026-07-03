@@ -61,11 +61,23 @@
     </section>
 
     <section class="panel" id="result-panel" hidden>
-      <h2>3. Result</h2>
+      <h2>3. Your part</h2>
       <p id="result-status-line"></p>
-      <pre id="intent-json"></pre>
-      <button id="generate-part-btn" disabled>Generate part</button>
+      <button id="generate-part-btn" disabled>Generate my part</button>
       <p id="generate-status"></p>
+
+      <div id="design-result" hidden>
+        <div id="design-preview-box">
+          <img id="design-preview-img" alt="Annotated preview of your part" />
+        </div>
+        <table id="design-params-table"></table>
+        <ul id="design-downloads"></ul>
+      </div>
+
+      <details id="intent-json-details">
+        <summary>Raw IntentSpec (debug)</summary>
+        <pre id="intent-json"></pre>
+      </details>
     </section>
   </main>
 
@@ -96,6 +108,7 @@
   </main>
 
   <script src="/app.js"></script>
+  <script src="/units.js"></script>
   <script src="/intents.js"></script>
 </body>
 </html>

@@ -1,8 +1,10 @@
-// "Start with a photo" flow: upload photo(s) + optional freehand annotation
-// + text -> POST /intents -> render questions as overlays on the photo ->
-// POST /intents/{id}/answers -> once ready_for_design, feed the resulting
-// dimensions into the existing /designs flow (see app.js's `templates` and
-// `renderDownloads`, reused here rather than duplicated).
+// "Start with a photo" flow (the complete single loop): upload photo(s) +
+// optional freehand annotation + text -> POST /intents -> render questions as
+// overlays on the photo (with mm/cm/in unit selectors) -> POST
+// /intents/{id}/answers -> once ready_for_design, "Generate my part" calls
+// POST /intents/{id}/design (the join) and renders the annotated preview, a
+// param summary table (value + source), and the STEP/3MF/STL downloads — the
+// user never touches the raw template form.
 
 const photoInput = document.getElementById("photo-input");
 const annotateWrap = document.getElementById("annotate-wrap");
@@ -26,6 +28,10 @@ const resultStatusLine = document.getElementById("result-status-line");
 const intentJsonEl = document.getElementById("intent-json");
 const generatePartBtn = document.getElementById("generate-part-btn");
 const generateStatusEl = document.getElementById("generate-status");
+const designResult = document.getElementById("design-result");
+const designPreviewImg = document.getElementById("design-preview-img");
+const designParamsTable = document.getElementById("design-params-table");
+const designDownloads = document.getElementById("design-downloads");
 
 let selectedPhotos = [];
 let annotationPoints = []; // normalized [x, y] pairs on photo 0
@@ -224,6 +230,61 @@ function drawOverlay(overlay) {
   overlaySvg.appendChild(line);
 }
 
+// A measurement input with a mm/cm/in unit selector (default = remembered
+// session unit) and a live "8 in = 203.2 mm" dual display. Internal units stay
+// mm; the value is converted to mm at collection time (see collectMm).
+function appendMeasureField(parent, questionId, placeholder) {
+  const wrap = document.createElement("div");
+  wrap.className = "measure-field";
+
+  const input = document.createElement("input");
+  input.type = "number";
+  input.step = "any";
+  input.id = questionInputId(questionId);
+  if (placeholder) input.placeholder = placeholder;
+
+  const unit = document.createElement("select");
+  unit.className = "unit-select";
+  unit.id = `intent-unit-${questionId}`;
+  for (const u of ["mm", "cm", "in"]) {
+    const option = document.createElement("option");
+    option.value = u;
+    option.textContent = u;
+    if (u === getSessionUnit()) option.selected = true;
+    unit.appendChild(option);
+  }
+
+  const dual = document.createElement("span");
+  dual.className = "dual-display";
+  const refresh = () => (dual.textContent = formatDual(input.value, unit.value));
+
+  input.addEventListener("input", refresh);
+  unit.addEventListener("refresh-dual", refresh);
+  unit.addEventListener("change", () => {
+    setSessionUnit(unit.value);
+    // "Remembered per session": switch every unit selector to the new unit.
+    for (const sel of document.querySelectorAll(".unit-select")) {
+      sel.value = getSessionUnit();
+      sel.dispatchEvent(new Event("refresh-dual"));
+    }
+  });
+
+  wrap.appendChild(input);
+  wrap.appendChild(unit);
+  wrap.appendChild(dual);
+  parent.appendChild(wrap);
+}
+
+// Read a measure_mm question's entered value, converted to mm via its unit
+// selector. Returns null when empty/invalid.
+function collectMm(questionId) {
+  const input = document.getElementById(questionInputId(questionId));
+  if (!input || input.value === "") return null;
+  const unitSel = document.getElementById(`intent-unit-${questionId}`);
+  const mm = toMm(input.value, unitSel ? unitSel.value : "mm");
+  return Number.isFinite(mm) ? mm : null;
+}
+
 function renderQuestionRow(question, dimension) {
   const row = document.createElement("div");
   row.className = "question-row";
@@ -256,12 +317,7 @@ function renderQuestionRow(question, dimension) {
       `${crossCheck.depth_value_mm}mm. Did you use the wrong units?`;
     card.appendChild(msg);
 
-    const input = document.createElement("input");
-    input.type = "number";
-    input.step = "any";
-    input.id = questionInputId(question.question_id);
-    input.placeholder = "enter a corrected value (mm)";
-    card.appendChild(input);
+    appendMeasureField(card, question.question_id, "enter a corrected value");
 
     const btn = document.createElement("button");
     btn.type = "button";
@@ -277,17 +333,13 @@ function renderQuestionRow(question, dimension) {
   }
 
   if (question.kind === "measure_mm") {
-    const input = document.createElement("input");
-    input.type = "number";
-    input.step = "any";
-    input.id = questionInputId(question.question_id);
+    let placeholder = "";
     if (dimension && dimension.source === "depth_inferred" && dimension.value_mm != null) {
-      // Depth prior: a suggestion, not a measurement — say so.
-      input.placeholder = `looks like ~${dimension.value_mm}mm — measure to confirm`;
+      placeholder = `looks like ~${dimension.value_mm}mm — measure to confirm`;
     } else if (dimension && dimension.value_mm !== null && dimension.value_mm !== undefined) {
-      input.placeholder = `assumed: ${dimension.value_mm}mm`;
+      placeholder = `assumed: ${dimension.value_mm}mm`;
     }
-    row.appendChild(input);
+    appendMeasureField(row, question.question_id, placeholder);
   } else if (question.kind === "confirm") {
     const label = document.createElement("label");
     label.className = "checkbox-field";
@@ -301,14 +353,19 @@ function renderQuestionRow(question, dimension) {
   } else if (question.kind === "choice") {
     const select = document.createElement("select");
     select.id = questionInputId(question.question_id);
+    // Blank = accept the provider's suggestion (join uses suggested_value);
+    // picking a value overrides it (recorded as the user's choice).
     const blank = document.createElement("option");
     blank.value = "";
-    blank.textContent = "—";
+    blank.textContent = question.suggested_value
+      ? `— use suggested: ${question.suggested_value}`
+      : "—";
     select.appendChild(blank);
     for (const choice of question.choices || []) {
       const option = document.createElement("option");
       option.value = choice;
       option.textContent = choice;
+      if (choice === question.chosen_value) option.selected = true; // reflect an earlier answer
       select.appendChild(option);
     }
     row.appendChild(select);
@@ -357,8 +414,9 @@ submitAnswersBtn.addEventListener("click", () => {
     const input = document.getElementById(questionInputId(question.question_id));
     if (!input) continue; // deduped / already-confirmed questions render no input
 
-    if ((question.kind === "measure_mm") && input.value !== "") {
-      answers.push({ question_id: question.question_id, measure_mm: Number(input.value) });
+    if (question.kind === "measure_mm") {
+      const mm = collectMm(question.question_id); // converts cm/in -> mm
+      if (mm !== null) answers.push({ question_id: question.question_id, measure_mm: mm });
     } else if (question.kind === "confirm" && input.checked) {
       answers.push({ question_id: question.question_id, confirm: true });
     } else if (question.kind === "choice" && input.value !== "") {
@@ -369,54 +427,77 @@ submitAnswersBtn.addEventListener("click", () => {
   submitAnswers(answers);
 });
 
-// --- Result panel + "Generate part" -------------------------------------
+// --- Result panel: "Generate my part" -> the join endpoint --------------
 
 function renderResult() {
   resultPanel.hidden = false;
-  resultStatusLine.textContent = `status: ${currentIntent.status}`;
+  resultStatusLine.textContent =
+    currentIntent.status === "ready_for_design"
+      ? "All set — every critical dimension is confirmed."
+      : `status: ${currentIntent.status}`;
   intentJsonEl.textContent = JSON.stringify(currentIntent, null, 2);
   generatePartBtn.disabled = currentIntent.status !== "ready_for_design" || !currentIntent.template_id;
+  if (currentIntent.status !== "ready_for_design") designResult.hidden = true;
+}
+
+const SOURCE_BADGE = {
+  measured: "measured ✓",
+  chosen: "chosen ✓",
+  suggested: "suggested ~",
+  assumed: "estimate ~",
+  default: "default",
+};
+
+function renderDesign(design) {
+  designResult.hidden = false;
+
+  designPreviewImg.src = `${design.files.preview_png}?t=${Date.now()}`;
+
+  // Param summary table (value + source), built with DOM nodes.
+  designParamsTable.innerHTML = "";
+  const header = document.createElement("tr");
+  for (const h of ["Parameter", "Value", "Source"]) {
+    const th = document.createElement("th");
+    th.textContent = h;
+    header.appendChild(th);
+  }
+  designParamsTable.appendChild(header);
+  for (const p of design.params || []) {
+    const tr = document.createElement("tr");
+    const name = document.createElement("td");
+    name.textContent = p.label;
+    const value = document.createElement("td");
+    value.textContent = p.unit ? `${p.value} ${p.unit}` : `${p.value}`;
+    const source = document.createElement("td");
+    source.textContent = SOURCE_BADGE[p.source] || p.source;
+    source.className = `src-${p.source}`;
+    tr.append(name, value, source);
+    designParamsTable.appendChild(tr);
+  }
+
+  // Download links.
+  designDownloads.innerHTML = "";
+  for (const [label, key] of [["STEP", "step"], ["3MF", "threemf"], ["STL", "stl"]]) {
+    const li = document.createElement("li");
+    const a = document.createElement("a");
+    a.href = design.files[key];
+    a.download = "";
+    a.textContent = `Download ${label}`;
+    li.appendChild(a);
+    designDownloads.appendChild(li);
+  }
 }
 
 generatePartBtn.addEventListener("click", async () => {
-  if (!currentIntent || !currentIntent.template_id) return;
-
-  const template = templates.find((t) => t.template_id === currentIntent.template_id);
-  if (!template) {
-    setGenerateStatus(`Error: template '${currentIntent.template_id}' not loaded yet — try again.`, true);
-    return;
-  }
-
-  const dimsByName = Object.fromEntries((currentIntent.dimensions || []).map((d) => [d.name, d]));
-  const params = {};
-  for (const field of template.fields) {
-    const dim = dimsByName[field.name];
-    params[field.name] = dim && dim.value_mm !== null && dim.value_mm !== undefined ? dim.value_mm : field.default;
-  }
-
+  if (!currentIntent) return;
   generatePartBtn.disabled = true;
-  setGenerateStatus("Generating…", false);
-
+  setGenerateStatus("Generating your part…", false);
   try {
-    const response = await fetch("/designs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ template_id: currentIntent.template_id, params }),
-    });
+    const response = await fetch(`/intents/${currentIntent.intent_id}/design`, { method: "POST" });
     if (!response.ok) throw new Error(await describeFetchError(response));
     const design = await response.json();
-
-    // Reuse the "Direct template params" tab's preview UI (app.js globals)
-    // instead of duplicating preview/download rendering here — sync its
-    // template dropdown + fields first so it reflects what was just built.
-    document.querySelector('.tab-btn[data-tab="direct"]').click();
-    templateSelect.value = currentIntent.template_id;
-    onTemplateChange();
-    renderFields(template.fields.map((f) => ({ ...f, default: params[f.name] })));
-    previewImg.src = `${design.files.preview_png}?t=${Date.now()}`;
-    previewImg.classList.add("visible");
-    renderDownloads(design.files);
-    setGenerateStatus(`Design ${design.design_id} ready — see the Direct template params tab.`, false);
+    renderDesign(design);
+    setGenerateStatus(`Design ${design.design_id} ready — download below.`, false);
   } catch (err) {
     setGenerateStatus(`Error: ${errorText(err)}`, true);
   } finally {

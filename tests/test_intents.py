@@ -140,6 +140,100 @@ def _dim(intent: dict, name: str) -> dict:
     return next(d for d in intent["dimensions"] if d["name"] == name)
 
 
+# A vision output for the M5 join tests: assumed dims + choice questions that
+# carry a provider suggested_value (screw_size), one to be answered (load_hint).
+JOIN_VISION = {
+    "intent_id": "x",
+    "status": "needs_answers",
+    "category": "bracket",
+    "template_id": "bracket_shelf_l",
+    "description": "A shelf bracket.",
+    "context_notes": "",
+    "material_suggestion": "PETG",
+    "out_of_scope_reason": None,
+    "dimensions": [
+        {
+            "name": "span_mm",
+            "value_mm": 120.0,
+            "source": "assumed",
+            "confidence": 0.4,
+            "critical": True,
+            "cross_check": None,
+        },
+        {
+            "name": "depth_mm",
+            "value_mm": 40.0,
+            "source": "assumed",
+            "confidence": 0.4,
+            "critical": True,
+            "cross_check": None,
+        },
+        {
+            "name": "thickness_mm",
+            "value_mm": 5.0,
+            "source": "assumed",
+            "confidence": 0.4,
+            "critical": False,
+            "cross_check": None,
+        },
+    ],
+    "questions": [
+        {
+            "question_id": "q_span",
+            "dim_name": "span_mm",
+            "prompt": "span?",
+            "kind": "measure_mm",
+            "choices": None,
+            "overlay": None,
+            "suggested_value": None,
+            "chosen_value": None,
+        },
+        {
+            "question_id": "q_depth",
+            "dim_name": "depth_mm",
+            "prompt": "depth?",
+            "kind": "measure_mm",
+            "choices": None,
+            "overlay": None,
+            "suggested_value": None,
+            "chosen_value": None,
+        },
+        {
+            "question_id": "q_load",
+            "dim_name": "load_hint",
+            "prompt": "load?",
+            "kind": "choice",
+            "choices": ["light", "medium", "heavy"],
+            "overlay": None,
+            "suggested_value": "medium",
+            "chosen_value": None,
+        },
+        {
+            "question_id": "q_screw",
+            "dim_name": "screw_size",
+            "prompt": "screw?",
+            "kind": "choice",
+            "choices": ["#6", "#8", "#10"],
+            "overlay": None,
+            "suggested_value": "#10",
+            "chosen_value": None,
+        },
+    ],
+}
+
+
+def _confirm_all_critical(intent_id: str) -> None:
+    client.post(
+        f"/intents/{intent_id}/answers",
+        json={
+            "answers": [
+                {"question_id": "q_span", "measure_mm": 200.0},
+                {"question_id": "q_depth", "measure_mm": 50.0},
+            ]
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /intents
 # ---------------------------------------------------------------------------
@@ -690,3 +784,163 @@ def test_crosscheck_never_silently_overrides_user(cleanup_intents: list[str]):
     assert (
         _dim(committed, "span_mm")["value_mm"] == 25.0
     )  # committed as the user's value
+
+
+# ---------------------------------------------------------------------------
+# The intent -> design join (M5): gate, precedence, end-to-end round-trip.
+# ---------------------------------------------------------------------------
+
+
+def _join_intent(cleanup_intents: list[str]) -> str:
+    with patch(
+        "api.intents.parse_intent", return_value=json.loads(json.dumps(JOIN_VISION))
+    ):
+        r = client.post("/intents", files=_one_photo_files(), data={"text": "bracket"})
+    iid = r.json()["intent_id"]
+    cleanup_intents.append(iid)
+    return iid
+
+
+def test_design_gate_409_before_ready(cleanup_intents: list[str]):
+    """The critical-dim gate must hold end-to-end: no design until every
+    critical dim is user_measured."""
+    iid = _join_intent(cleanup_intents)
+    r = client.post(f"/intents/{iid}/design")
+    assert r.status_code == 409
+    assert "not ready_for_design" in r.json()["detail"]
+
+
+def test_choice_answer_records_chosen_value(cleanup_intents: list[str]):
+    """Finish the M3 deferral: a choice answer maps to any enum param (recorded
+    as chosen_value on its question)."""
+    iid = _join_intent(cleanup_intents)
+    updated = client.post(
+        f"/intents/{iid}/answers",
+        json={"answers": [{"question_id": "q_load", "choice": "heavy"}]},
+    ).json()
+    q_load = next(q for q in updated["questions"] if q["question_id"] == "q_load")
+    assert q_load["chosen_value"] == "heavy"
+
+
+def test_design_join_precedence_end_to_end(cleanup_intents: list[str]):
+    """Full round-trip: the generated params reflect the resolution order —
+    user_measured dims, assumed non-critical dim, chosen enum, suggested enum,
+    and a default for the rest."""
+    iid = _join_intent(cleanup_intents)
+    _confirm_all_critical(iid)  # span=200, depth=50 -> user_measured
+    client.post(
+        f"/intents/{iid}/answers",
+        json={"answers": [{"question_id": "q_load", "choice": "heavy"}]},
+    )
+
+    r = client.post(f"/intents/{iid}/design")
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert set(body["files"]) == {"step", "threemf", "stl", "preview_png"}
+    by_name = {p["name"]: p for p in body["params"]}
+
+    assert (by_name["span_mm"]["value"], by_name["span_mm"]["source"]) == (
+        200.0,
+        "measured",
+    )
+    assert (by_name["depth_mm"]["value"], by_name["depth_mm"]["source"]) == (
+        50.0,
+        "measured",
+    )
+    # non-critical dim from the provider's estimate is acceptable
+    assert (by_name["thickness_mm"]["value"], by_name["thickness_mm"]["source"]) == (
+        5.0,
+        "assumed",
+    )
+    # answered choice beats the provider's suggestion
+    assert (by_name["load_hint"]["value"], by_name["load_hint"]["source"]) == (
+        "heavy",
+        "chosen",
+    )
+    # unanswered choice falls to the provider's suggested_value
+    assert (by_name["screw_size"]["value"], by_name["screw_size"]["source"]) == (
+        "#10",
+        "suggested",
+    )
+    # a non-dimension int with no question falls to the template default
+    assert (by_name["screw_count"]["value"], by_name["screw_count"]["source"]) == (
+        3,
+        "default",
+    )
+
+    # The intent -> design link is persisted.
+    stored = client.get(f"/intents/{iid}").json()
+    assert stored["design_id"] == body["design_id"]
+    assert "design_files" in stored
+
+
+def test_design_downloads_are_fetchable(cleanup_intents: list[str]):
+    iid = _join_intent(cleanup_intents)
+    _confirm_all_critical(iid)
+    body = client.post(f"/intents/{iid}/design").json()
+    for url in body["files"].values():
+        resp = client.get(url)
+        assert resp.status_code == 200, url
+        assert len(resp.content) > 0
+    # cleanup the exported files for this design
+    shutil.rmtree(
+        INTENTS_DIR.parent.parent / "exports" / body["design_id"], ignore_errors=True
+    )
+
+
+def test_design_refuses_critical_dim_not_user_measured(cleanup_intents: list[str]):
+    """Defensive gate inside the join: even a (hand-tampered) intent marked
+    ready_for_design must not build if a critical dim isn't user_measured."""
+    tampered = json.loads(json.dumps(JOIN_VISION))
+    tampered["intent_id"] = "tampered1234"
+    tampered["status"] = "ready_for_design"  # lie
+    for d in tampered["dimensions"]:
+        if d["name"] == "span_mm":
+            d["source"] = "depth_inferred"  # a critical dim NOT user_measured
+        elif d["name"] == "depth_mm":
+            d["source"] = "user_measured"
+    INTENTS_DIR.mkdir(parents=True, exist_ok=True)
+    (INTENTS_DIR / "tampered1234.json").write_text(json.dumps(tampered))
+    cleanup_intents.append("tampered1234")
+
+    r = client.post("/intents/tampered1234/design")
+    assert r.status_code == 409
+    assert "span_mm" in r.json()["detail"]
+
+
+def test_gate_requires_a_value_not_just_source(cleanup_intents: list[str]):
+    """Regression (M5 review #1): a critical dim marked source="user_measured"
+    but with value_mm=None must NOT open the ready_for_design gate."""
+    tampered = json.loads(json.dumps(BRACKET_INTENT))
+    for d in tampered["dimensions"]:
+        if d["name"] == "span_mm":
+            d["source"], d["value_mm"] = (
+                "user_measured",
+                None,
+            )  # confirmed but valueless
+        elif d["name"] == "depth_mm":
+            d["source"], d["value_mm"] = "user_measured", 40.0
+    body = _create_intent(cleanup_intents, intent=tampered)
+    assert body["status"] == "needs_answers"
+
+
+def test_design_refuses_valueless_critical_dim(cleanup_intents: list[str]):
+    """Regression (M5 review #1): even a (tampered) ready_for_design intent whose
+    critical dim has no value must 409 in the join — never fall through to the
+    template default and build a part with a fabricated fit-critical dimension."""
+    tampered = json.loads(json.dumps(JOIN_VISION))
+    tampered["intent_id"] = "valueless99"
+    tampered["status"] = "ready_for_design"
+    for d in tampered["dimensions"]:
+        if d["name"] == "span_mm":
+            d["source"], d["value_mm"] = "user_measured", None
+        elif d["name"] == "depth_mm":
+            d["source"], d["value_mm"] = "user_measured", 50.0
+    INTENTS_DIR.mkdir(parents=True, exist_ok=True)
+    (INTENTS_DIR / "valueless99.json").write_text(json.dumps(tampered))
+    cleanup_intents.append("valueless99")
+
+    r = client.post("/intents/valueless99/design")
+    assert r.status_code == 409
+    assert "span_mm" in r.json()["detail"]
