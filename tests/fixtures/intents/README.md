@@ -1,11 +1,17 @@
 # Intent-parser evaluation fixtures
 
 Ground-truth test cases for `scripts/eval_intents.py`, which sends each fixture
-through the real `POST /intents` endpoint (real vision-provider call — no mocking)
-and scores the result against what's recorded here. This is how M3's exit
-criterion ("8/10 fixture cases produce correct template + sensible questions",
-per `docs/ROADMAP.md`) gets measured, and how the two providers get compared on
-identical inputs.
+through the real `POST /intents` endpoint (real vision- and depth-provider calls
+— no mocking) and scores the result against what's recorded here. This is how
+M3's exit criterion ("8/10 fixture cases produce correct template + sensible
+questions", per `docs/ROADMAP.md`) gets measured, and how the two providers get
+compared on identical inputs.
+
+With `--depth-provider replicate`, it also reports M4's depth metrics:
+depth-proposal MAE (error of `depth_inferred` values vs your measured ground
+truth) and the cross-check catch rate (for each critical dim with a depth prior,
+it injects a 10x-too-small answer — a cm-for-mm slip — and reports how many the
+>20% unit-mistake cross-check flagged).
 
 ## Layout
 
@@ -86,4 +92,7 @@ variance, since there's no real object to look at.
 4. Delete or keep the two placeholders as you like; `eval_intents.py` doesn't
    care how many fixtures there are.
 5. Run `python scripts/eval_intents.py --provider openai` (or `anthropic`) and
-   compare the report against `docs/ROADMAP.md`'s M3 exit bar.
+   compare the report against `docs/ROADMAP.md`'s M3 exit bar. Add
+   `--depth-provider replicate` (with a metric-depth `DEPTH_MODEL` configured —
+   see `api/depth_provider.py`) to also measure depth accuracy and the
+   cross-check catch rate.

@@ -143,16 +143,13 @@ submitIntentBtn.addEventListener("click", async () => {
 
   try {
     const response = await fetch("/intents", { method: "POST", body: formData });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail));
-    }
+    if (!response.ok) throw new Error(await describeFetchError(response));
     currentIntent = await response.json();
     renderQuestions();
     renderResult();
     setIntentStatus(`Got it — intent ${currentIntent.intent_id}.`, false);
   } catch (err) {
-    setIntentStatus(`Error: ${err.message}`, true);
+    setIntentStatus(`Error: ${errorText(err)}`, true);
   } finally {
     submitIntentBtn.disabled = false;
   }
@@ -173,10 +170,31 @@ function renderQuestions() {
   overlaySvg.innerHTML = "";
 
   const dimsByName = Object.fromEntries((currentIntent.dimensions || []).map((d) => [d.name, d]));
+  const questions = currentIntent.questions || [];
 
-  for (const question of currentIntent.questions || []) {
+  // A dim can have more than one question targeting it (e.g. its original
+  // question plus a server-added "reask-<dim>", or a stray "confirm"). Render
+  // only ONE input row per dim so cards/inputs don't duplicate — and prefer the
+  // measure_mm question, so a confirm that happens to sort first never hides the
+  // field the user needs to enter a real measurement.
+  const preferredByDim = {};
+  for (const q of questions) {
+    if (!q.dim_name) continue;
+    const cur = preferredByDim[q.dim_name];
+    if (!cur || (q.kind === "measure_mm" && cur.kind !== "measure_mm")) {
+      preferredByDim[q.dim_name] = q;
+    }
+  }
+
+  const renderedDims = new Set();
+  for (const question of questions) {
     if (question.overlay && question.overlay.photo_index === 0) {
       drawOverlay(question.overlay);
+    }
+    if (question.dim_name) {
+      if (renderedDims.has(question.dim_name)) continue;
+      if (preferredByDim[question.dim_name] !== question) continue; // wait for the preferred one
+      renderedDims.add(question.dim_name);
     }
     questionsList.appendChild(renderQuestionRow(question, dimsByName[question.dim_name]));
   }
@@ -223,12 +241,50 @@ function renderQuestionRow(question, dimension) {
     return row;
   }
 
+  // Cross-check mismatch: the typed value disagrees with the depth prior by
+  // >20%. Show both values and a one-click "my measurement is right" override,
+  // plus a field to enter a corrected value instead.
+  const crossCheck = dimension && dimension.cross_check;
+  if (crossCheck && crossCheck.status === "mismatch_reask") {
+    const card = document.createElement("div");
+    card.className = "mismatch-card";
+
+    const msg = document.createElement("p");
+    msg.className = "mismatch-msg";
+    msg.textContent =
+      `You entered ${dimension.value_mm}mm, but the photo suggests about ` +
+      `${crossCheck.depth_value_mm}mm. Did you use the wrong units?`;
+    card.appendChild(msg);
+
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "any";
+    input.id = questionInputId(question.question_id);
+    input.placeholder = "enter a corrected value (mm)";
+    card.appendChild(input);
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "reconfirm-btn";
+    btn.textContent = "Yes, my measurement is right";
+    btn.addEventListener("click", () =>
+      submitAnswers([{ question_id: question.question_id, measure_mm: dimension.value_mm }]),
+    );
+    card.appendChild(btn);
+
+    row.appendChild(card);
+    return row;
+  }
+
   if (question.kind === "measure_mm") {
     const input = document.createElement("input");
     input.type = "number";
     input.step = "any";
     input.id = questionInputId(question.question_id);
-    if (dimension && dimension.value_mm !== null && dimension.value_mm !== undefined) {
+    if (dimension && dimension.source === "depth_inferred" && dimension.value_mm != null) {
+      // Depth prior: a suggestion, not a measurement — say so.
+      input.placeholder = `looks like ~${dimension.value_mm}mm — measure to confirm`;
+    } else if (dimension && dimension.value_mm !== null && dimension.value_mm !== undefined) {
       input.placeholder = `assumed: ${dimension.value_mm}mm`;
     }
     row.appendChild(input);
@@ -266,15 +322,42 @@ function renderQuestionRow(question, dimension) {
   return row;
 }
 
-submitAnswersBtn.addEventListener("click", async () => {
+// Shared submit path for both the "Submit answers" button and the one-click
+// mismatch re-confirm button.
+async function submitAnswers(answers) {
+  if (!currentIntent || answers.length === 0) {
+    setAnswersStatus("Fill in at least one answer first.", true);
+    return;
+  }
+  submitAnswersBtn.disabled = true;
+  setAnswersStatus("Submitting…", false);
+  try {
+    const response = await fetch(`/intents/${currentIntent.intent_id}/answers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers }),
+    });
+    if (!response.ok) throw new Error(await describeFetchError(response));
+    currentIntent = await response.json();
+    renderQuestions();
+    renderResult();
+    setAnswersStatus("Saved.", false);
+  } catch (err) {
+    setAnswersStatus(`Error: ${errorText(err)}`, true);
+  } finally {
+    submitAnswersBtn.disabled = false;
+  }
+}
+
+submitAnswersBtn.addEventListener("click", () => {
   if (!currentIntent) return;
 
   const answers = [];
   for (const question of currentIntent.questions || []) {
     const input = document.getElementById(questionInputId(question.question_id));
-    if (!input) continue; // already-confirmed questions don't render an input
+    if (!input) continue; // deduped / already-confirmed questions render no input
 
-    if (question.kind === "measure_mm" && input.value !== "") {
+    if ((question.kind === "measure_mm") && input.value !== "") {
       answers.push({ question_id: question.question_id, measure_mm: Number(input.value) });
     } else if (question.kind === "confirm" && input.checked) {
       answers.push({ question_id: question.question_id, confirm: true });
@@ -283,33 +366,7 @@ submitAnswersBtn.addEventListener("click", async () => {
     }
   }
 
-  if (answers.length === 0) {
-    setAnswersStatus("Fill in at least one answer first.", true);
-    return;
-  }
-
-  submitAnswersBtn.disabled = true;
-  setAnswersStatus("Submitting…", false);
-
-  try {
-    const response = await fetch(`/intents/${currentIntent.intent_id}/answers`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ answers }),
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail));
-    }
-    currentIntent = await response.json();
-    renderQuestions();
-    renderResult();
-    setAnswersStatus("Saved.", false);
-  } catch (err) {
-    setAnswersStatus(`Error: ${err.message}`, true);
-  } finally {
-    submitAnswersBtn.disabled = false;
-  }
+  submitAnswers(answers);
 });
 
 // --- Result panel + "Generate part" -------------------------------------
@@ -346,10 +403,7 @@ generatePartBtn.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ template_id: currentIntent.template_id, params }),
     });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail));
-    }
+    if (!response.ok) throw new Error(await describeFetchError(response));
     const design = await response.json();
 
     // Reuse the "Direct template params" tab's preview UI (app.js globals)
@@ -364,7 +418,7 @@ generatePartBtn.addEventListener("click", async () => {
     renderDownloads(design.files);
     setGenerateStatus(`Design ${design.design_id} ready — see the Direct template params tab.`, false);
   } catch (err) {
-    setGenerateStatus(`Error: ${err.message}`, true);
+    setGenerateStatus(`Error: ${errorText(err)}`, true);
   } finally {
     generatePartBtn.disabled = false;
   }

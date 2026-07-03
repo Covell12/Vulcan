@@ -9,10 +9,11 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from api.depth_provider import check_provider_configured as check_depth_configured
 from api.designs import router as designs_router
 from api.intents import router as intents_router
 from api.templates import router as templates_router
-from api.vision_provider import check_provider_configured
+from api.vision_provider import check_provider_configured as check_vision_configured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 EXPORTS_DIR = BASE_DIR / "exports"
@@ -23,13 +24,15 @@ EXPORTS_DIR.mkdir(exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Fails fast, with a clear message, if VISION_PROVIDER is set to a
-    # provider whose API key isn't configured — better than a confusing
-    # error the first time someone hits POST /intents. Only runs when the
-    # ASGI server actually starts (uvicorn, or `with TestClient(app) as c`),
-    # not for a plain `TestClient(app)` — so it never gets in the way of
-    # tests that mock the provider and don't need a real key.
-    check_provider_configured()
+    # Fails fast, with a clear message, if a selected provider's credentials
+    # aren't configured — better than a confusing error the first time someone
+    # hits POST /intents. The depth check is a no-op for DEPTH_PROVIDER=none
+    # (the default), so depth stays fully optional. Only runs on a real ASGI
+    # startup (uvicorn, or `with TestClient(app) as c`), not a plain
+    # `TestClient(app)` — so it never gets in the way of tests that mock the
+    # providers and don't need real keys.
+    check_vision_configured()
+    check_depth_configured()
     yield
 
 

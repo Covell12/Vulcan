@@ -231,6 +231,99 @@ def test_parse_intent_raises_before_any_network_call_if_key_missing(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# SDK / network / parse failures must ALL become VisionProviderError with a
+# human-readable cause — never a bare exception (so api/intents.py can 502).
+# ---------------------------------------------------------------------------
+
+
+def _openai_exc(status=None, message="boom"):
+    exc = Exception(message)
+    if status is not None:
+        exc.status_code = status
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc, expect",
+    [
+        (_openai_exc(401, "Invalid API key"), "authentication failed"),
+        (_openai_exc(429, "Too many requests"), "rate limited"),
+        (_openai_exc(404, "The model does not exist"), "model not found"),
+        (_openai_exc(400, "invalid image data"), "bad request"),
+        (_openai_exc(message="You exceeded your quota (insufficient_quota)"), "quota"),
+        (_openai_exc(message="totally unexpected"), "unexpected provider error"),
+    ],
+)
+def test_openai_sdk_exception_becomes_vision_error(monkeypatch, exc, expect):
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    with patch("openai.OpenAI") as MockOpenAI:
+        MockOpenAI.return_value.chat.completions.create.side_effect = exc
+        with pytest.raises(VisionProviderError) as ei:
+            parse_intent([PhotoInput(b"x")], None, "hi", [])
+    assert expect in str(ei.value)
+
+
+def test_openai_bad_json_becomes_vision_error(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=MagicMock(content="not json{"))]
+    with patch("openai.OpenAI") as MockOpenAI:
+        MockOpenAI.return_value.chat.completions.create.return_value = resp
+        with pytest.raises(VisionProviderError, match="parse OpenAI"):
+            parse_intent([PhotoInput(b"x")], None, "hi", [])
+
+
+def test_openai_empty_content_becomes_vision_error(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=MagicMock(content=None))]
+    with patch("openai.OpenAI") as MockOpenAI:
+        MockOpenAI.return_value.chat.completions.create.return_value = resp
+        with pytest.raises(VisionProviderError, match="empty message"):
+            parse_intent([PhotoInput(b"x")], None, "hi", [])
+
+
+def test_anthropic_sdk_exception_becomes_vision_error(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    exc = Exception("service unavailable")
+    exc.status_code = 429
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        MockAnthropic.return_value.messages.create.side_effect = exc
+        with pytest.raises(VisionProviderError, match="rate limited"):
+            parse_intent([PhotoInput(b"x")], None, "hi", [])
+
+
+def test_openai_import_error_becomes_vision_error(monkeypatch):
+    """Regression (review finding #3): a missing/broken SDK install must surface
+    as VisionProviderError, not a raw ImportError."""
+    import sys
+
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    with patch.dict(sys.modules, {"openai": None}):  # `import openai` -> ImportError
+        with pytest.raises(VisionProviderError):
+            parse_intent([PhotoInput(b"x")], None, "hi", [])
+
+
+# ---------------------------------------------------------------------------
+# The startup check must not be fooled by a python-dotenv inline-comment value.
+# ---------------------------------------------------------------------------
+
+
+def test_check_ignores_inline_comment_value(monkeypatch):
+    """Regression (review finding #5): `KEY=   # comment` loads '# comment' as the
+    value; that must count as unset so the fail-fast still fires."""
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "# needed from Milestone 3")
+    with pytest.raises(VisionProviderError, match="OPENAI_API_KEY"):
+        check_provider_configured()
+
+
+# ---------------------------------------------------------------------------
 # Conformance: both adapters must produce IDENTICAL output for the same
 # underlying model answer, just unwrapped from each provider's own envelope.
 # ---------------------------------------------------------------------------

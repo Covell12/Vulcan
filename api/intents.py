@@ -26,8 +26,10 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
+from api.depth_provider import DepthProviderError, ScaleRegion, estimate_scale
 from api.param_schema import form_fields_for
-from api.vision_provider import PhotoInput, VisionProviderError, parse_intent
+from api.photo import PhotoInput
+from api.vision_provider import VisionProviderError, parse_intent
 from templates_lib.registry import TemplateSpec, all_templates, get_template
 
 router = APIRouter()
@@ -39,6 +41,11 @@ SCHEMA_PATH = BASE_DIR / "schemas" / "intent_spec.schema.json"
 
 MAX_PHOTOS = 3
 MATERIAL_CHOICES = ("PLA", "PETG", "TPU", "CF-PETG")
+
+# CLAUDE.md rule 3: a user-typed value that differs from the depth prior by more
+# than this fraction is treated as a likely unit mistake and re-asked, not
+# silently committed.
+MISMATCH_THRESHOLD = 0.20
 
 
 def _load_schema() -> dict[str, Any]:
@@ -187,6 +194,217 @@ def _ensure_critical_questions(intent: dict[str, Any], spec: TemplateSpec) -> No
 
 
 # ---------------------------------------------------------------------------
+# Depth prior (M4): fill assumed dims with metric-depth proposals
+# ---------------------------------------------------------------------------
+
+
+def _build_scale_regions(intent: dict[str, Any]) -> list[ScaleRegion]:
+    """One region per question that has a dim_name and an overlay with points —
+    the overlay is where on the photo that dimension should be measured, so it
+    doubles as where to sample the depth prior."""
+    regions: list[ScaleRegion] = []
+    for q in intent.get("questions", []):
+        dim_name = q.get("dim_name")
+        overlay = q.get("overlay")
+        if not dim_name or not overlay:
+            continue
+        points = overlay.get("points")
+        if not points:
+            continue
+        regions.append(
+            ScaleRegion(
+                dim_name=dim_name,
+                shape=overlay.get("shape") or "line",
+                points=points,
+                photo_index=overlay.get("photo_index", 0) or 0,
+            )
+        )
+    return regions
+
+
+def _apply_depth_prior(intent: dict[str, Any], photos: list[PhotoInput]) -> None:
+    """After the vision pass, propose metric values for dims still on source
+    "assumed", turning them into "depth_inferred" suggestions. Critical dims
+    stay un-committed (only "user_measured" satisfies the gate) — this only
+    prefills the number the UI shows as "looks like ~X — measure to confirm".
+
+    Depth is an OPTIONAL prior: any provider failure degrades to no proposals
+    rather than failing intent creation (CLAUDE.md: the system must work fully
+    without depth)."""
+    regions = _build_scale_regions(intent)
+    if not regions:
+        return
+
+    by_photo: dict[int, list[ScaleRegion]] = {}
+    for region in regions:
+        by_photo.setdefault(region.photo_index, []).append(region)
+
+    estimates: dict[str, Any] = {}
+    try:
+        for photo_index, photo_regions in by_photo.items():
+            if not (0 <= photo_index < len(photos)):
+                continue
+            for est in estimate_scale(photos[photo_index], photo_regions):
+                estimates.setdefault(est.dim_name, est)  # first estimate wins
+    except DepthProviderError:
+        return  # degrade gracefully — no depth proposals this time
+
+    for dim in intent.get("dimensions", []):
+        if dim.get("source") != "assumed":
+            continue
+        est = estimates.get(dim["name"])
+        if est is None:
+            continue
+        dim["value_mm"] = est.value_mm
+        dim["source"] = "depth_inferred"
+        dim["confidence"] = est.confidence
+
+
+# ---------------------------------------------------------------------------
+# Cross-check (M4): a user measurement that disagrees with the depth prior by
+# >20% is re-asked, never silently committed or overridden (CLAUDE.md rule 3).
+# ---------------------------------------------------------------------------
+
+
+def _depth_prior_for(dim: dict[str, Any]) -> float | None:
+    """The depth prior for a dim, stable across the answer lifecycle: once a
+    mismatch is flagged it lives in cross_check.depth_value_mm; before any
+    answer it's the depth_inferred value_mm."""
+    cc = dim.get("cross_check")
+    if cc and cc.get("depth_value_mm") is not None:
+        return cc["depth_value_mm"]
+    if dim.get("source") == "depth_inferred" and dim.get("value_mm") is not None:
+        return dim["value_mm"]
+    return None
+
+
+def _is_flagged(dim: dict[str, Any]) -> bool:
+    cc = dim.get("cross_check")
+    return bool(cc and cc.get("status") == "mismatch_reask")
+
+
+def _approx_equal(a: float | None, b: float | None, tol: float = 1e-6) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= tol * max(1.0, abs(b))
+
+
+def _commit_measurement(
+    dim: dict[str, Any], value: float, depth: float | None, status: str
+) -> None:
+    dim["value_mm"] = value
+    dim["source"] = "user_measured"
+    dim["confidence"] = 1.0
+    dim["cross_check"] = {
+        "depth_value_mm": depth,
+        "ratio": round(value / depth, 4) if depth else None,
+        "status": status,
+    }
+
+
+def _num(x: float) -> str:
+    return f"{x:g}"
+
+
+def _unit_mistake_hint(measured: float, depth: float) -> str:
+    """Name the most likely unit slip behind a big measured-vs-depth gap."""
+    if measured <= 0 or depth <= 0:
+        return "Please double-check the value."
+    bigger = depth / measured  # photo thinks it's this many times bigger
+    smaller = measured / depth  # ...or this many times smaller
+    if 8 <= bigger <= 12:
+        return f"Did you measure in centimeters? {_num(measured)}cm is {_num(measured * 10)}mm."
+    if 8 <= smaller <= 12:
+        return f"Did you enter millimeters but mean centimeters? {_num(measured)}mm is {_num(measured / 10)}cm."
+    if 22 <= bigger <= 28:
+        return f"Did you measure in inches? {_num(measured)}in is {_num(round(measured * 25.4, 1))}mm."
+    if 22 <= smaller <= 28:
+        return "Did you mix up inches and millimeters?"
+    return (
+        "That's a big difference — please double-check your measurement and its units."
+    )
+
+
+def _reask_question_id(dim_name: str) -> str:
+    return f"reask-{dim_name}"
+
+
+def _set_reask_question(
+    intent: dict[str, Any], dim_name: str, measured: float, depth: float
+) -> None:
+    """Add (or refresh) a re-ask question naming both values + the likely unit
+    mistake. Idempotent per dim so re-flagging doesn't pile up questions."""
+    prompt = (
+        f"You entered {_num(measured)}, but the photo suggests about {_num(depth)}mm. "
+        f"{_unit_mistake_hint(measured, depth)} "
+        f"Enter a corrected value, or re-submit {_num(measured)} to confirm your "
+        "measurement is right."
+    )
+    qid = _reask_question_id(dim_name)
+    questions = intent.setdefault("questions", [])
+    for q in questions:
+        if q.get("question_id") == qid:
+            q["prompt"] = prompt
+            return
+    questions.append(
+        {
+            "question_id": qid,
+            "dim_name": dim_name,
+            "prompt": prompt,
+            "kind": "measure_mm",
+            "choices": None,
+            "overlay": None,
+        }
+    )
+
+
+def _prune_reask_question(intent: dict[str, Any], dim_name: str) -> None:
+    qid = _reask_question_id(dim_name)
+    questions = intent.get("questions")
+    if not questions:
+        return
+    intent["questions"] = [q for q in questions if q.get("question_id") != qid]
+
+
+def _cross_check_measurement(
+    intent: dict[str, Any], dim: dict[str, Any], measured: float
+) -> None:
+    """Apply a measure_mm answer through the cross-check. Commits, flags for
+    re-ask, or accepts an override — never silently overriding the user."""
+    depth = _depth_prior_for(dim)
+
+    # No depth prior available -> nothing to cross-check against; commit.
+    if depth is None or depth <= 0:
+        _commit_measurement(dim, measured, None, status="unavailable")
+        _prune_reask_question(intent, dim["name"])
+        return
+
+    # Re-submitting the exact value that was just flagged = an explicit override.
+    if _is_flagged(dim) and _approx_equal(measured, dim.get("value_mm")):
+        _commit_measurement(dim, measured, depth, status="ok")
+        _prune_reask_question(intent, dim["name"])
+        return
+
+    relative_diff = abs(measured - depth) / depth
+    if relative_diff > MISMATCH_THRESHOLD:
+        # Do NOT commit. Record the disputed value + prior and re-ask.
+        dim["value_mm"] = measured
+        dim["source"] = "assumed"
+        dim["confidence"] = 0.2
+        dim["cross_check"] = {
+            "depth_value_mm": depth,
+            "ratio": round(measured / depth, 4),
+            "status": "mismatch_reask",
+        }
+        _set_reask_question(intent, dim["name"], measured, depth)
+        return
+
+    # Within tolerance of the prior -> commit.
+    _commit_measurement(dim, measured, depth, status="ok")
+    _prune_reask_question(intent, dim["name"])
+
+
+# ---------------------------------------------------------------------------
 # Provider call with one validation-failure retry
 # ---------------------------------------------------------------------------
 
@@ -255,6 +473,7 @@ async def create_intent(
 
     result["intent_id"] = uuid.uuid4().hex[:12]
     result = _apply_critical_dim_gate(result)
+    _apply_depth_prior(result, photo_inputs)
 
     errors = _validation_errors(result)
     if errors:
@@ -320,17 +539,28 @@ def _apply_answer(
                 status_code=422,
                 detail=f"dimension '{dim_name}' not found on this intent.",
             )
-        dim["value_mm"] = answer.measure_mm
-        dim["source"] = "user_measured"
-        dim["confidence"] = 1.0
+        # Commit / flag / accept-override is decided by the cross-check, which
+        # compares the value against the depth prior (CLAUDE.md rule 3).
+        _cross_check_measurement(intent, dim, answer.measure_mm)
         return
 
     if kind == "confirm":
+        # Confirming accepts the value already shown (an assumed/depth prior) as
+        # the user's own. It must NOT be a back door around the cross-check
+        # (CLAUDE.md rule 3): a dim currently flagged as a >20% mismatch stays
+        # flagged — the user has to resolve it through the measure_mm re-ask
+        # ("Yes, my measurement is right" re-submits the value), never a stray
+        # confirm. For a non-flagged dim, route the shown value through the same
+        # cross-check so confirming a value that disagrees with the depth prior
+        # gets re-asked rather than silently stamped "ok".
         if answer.confirm and dim_name:
             dim = dims_by_name.get(dim_name)
-            if dim is not None:
-                dim["source"] = "user_measured"
-                dim["confidence"] = 1.0
+            if (
+                dim is not None
+                and dim.get("value_mm") is not None
+                and not _is_flagged(dim)
+            ):
+                _cross_check_measurement(intent, dim, dim["value_mm"])
         return
 
     if kind == "choice":

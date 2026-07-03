@@ -21,8 +21,10 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from api.depth_provider import DepthProviderError, ScaleEstimate
 from api.intents import INTENTS_DIR
 from api.main import app
+from api.vision_provider import VisionProviderError
 
 client = TestClient(app)
 
@@ -105,6 +107,37 @@ def _create_intent(
     body = response.json()
     cleanup_intents.append(body["intent_id"])
     return body
+
+
+def _create_intent_with_depth(
+    cleanup_intents: list[str],
+    depth: dict[str, float],
+    intent: dict = BRACKET_INTENT,
+) -> dict:
+    """Create an intent with a mocked depth prior: `depth` maps dim_name ->
+    metric mm. Those dims come back source="depth_inferred"."""
+
+    def fake_estimate(photo, regions):
+        return [
+            ScaleEstimate(r.dim_name, depth[r.dim_name], 0.45)
+            for r in regions
+            if r.dim_name in depth
+        ]
+
+    with patch(
+        "api.intents.parse_intent", return_value=json.loads(json.dumps(intent))
+    ), patch("api.intents.estimate_scale", side_effect=fake_estimate):
+        response = client.post(
+            "/intents", files=_one_photo_files(), data={"text": "bracket please"}
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    cleanup_intents.append(body["intent_id"])
+    return body
+
+
+def _dim(intent: dict, name: str) -> dict:
+    return next(d for d in intent["dimensions"] if d["name"] == name)
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +424,269 @@ def test_answers_unknown_intent_id_returns_404():
 def test_get_unknown_intent_returns_404():
     response = client.get("/intents/does-not-exist")
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Provider errors -> clean 502 (never a bare 500) — the fix (a) contract.
+# ---------------------------------------------------------------------------
+
+
+def test_vision_provider_error_returns_502():
+    with patch(
+        "api.intents.parse_intent",
+        side_effect=VisionProviderError("OpenAI request failed: rate limited"),
+    ):
+        response = client.post(
+            "/intents", files=_one_photo_files(), data={"text": "bracket please"}
+        )
+    assert response.status_code == 502
+    assert "rate limited" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Depth prior (M4): assumed dims get depth_inferred proposals; failures degrade.
+# ---------------------------------------------------------------------------
+
+
+def test_depth_prior_fills_assumed_dims(cleanup_intents: list[str]):
+    body = _create_intent_with_depth(cleanup_intents, depth={"span_mm": 205.0})
+    span = _dim(body, "span_mm")
+    assert span["source"] == "depth_inferred"
+    assert span["value_mm"] == 205.0
+    assert 0 < span["confidence"] <= 0.5
+    # A critical dim with only a depth prior is still NOT satisfied.
+    assert body["status"] == "needs_answers"
+    # A dim with no depth estimate stays "assumed".
+    assert _dim(body, "depth_mm")["source"] == "assumed"
+
+
+def test_depth_provider_failure_degrades_gracefully(cleanup_intents: list[str]):
+    with patch(
+        "api.intents.parse_intent", return_value=json.loads(json.dumps(BRACKET_INTENT))
+    ), patch(
+        "api.intents.estimate_scale", side_effect=DepthProviderError("replicate down")
+    ):
+        response = client.post(
+            "/intents", files=_one_photo_files(), data={"text": "bracket please"}
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    cleanup_intents.append(body["intent_id"])
+    # Depth failure must not break intent creation — dims just stay "assumed".
+    assert _dim(body, "span_mm")["source"] == "assumed"
+
+
+# ---------------------------------------------------------------------------
+# Cross-check (M4): >20% disagreement with the depth prior is re-asked, never
+# silently committed or overridden (CLAUDE.md rule 3).
+# ---------------------------------------------------------------------------
+
+
+def _answer(intent_id: str, question_id: str, value: float) -> dict:
+    r = client.post(
+        f"/intents/{intent_id}/answers",
+        json={"answers": [{"question_id": question_id, "measure_mm": value}]},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_crosscheck_mm_cm_mistake_is_flagged(cleanup_intents: list[str]):
+    # Depth says ~250mm; user types 25 (they measured in cm). 10x off.
+    body = _create_intent_with_depth(cleanup_intents, depth={"span_mm": 250.0})
+    updated = _answer(body["intent_id"], "q_span", 25.0)
+
+    span = _dim(updated, "span_mm")
+    assert span["source"] != "user_measured", "a unit mistake must NOT commit"
+    cc = span["cross_check"]
+    assert cc["status"] == "mismatch_reask"
+    assert cc["depth_value_mm"] == 250.0
+    assert cc["ratio"] == pytest.approx(0.1, rel=1e-3)
+    assert updated["status"] == "needs_answers"
+
+    # A re-ask question naming BOTH values + the unit hint is present.
+    reask = [q for q in updated["questions"] if q.get("dim_name") == "span_mm"]
+    assert any("25" in q["prompt"] and "250" in q["prompt"] for q in reask)
+    assert any("centimet" in q["prompt"].lower() for q in reask)
+
+
+def test_crosscheck_inch_mistake_is_flagged(cleanup_intents: list[str]):
+    # Depth says ~254mm; user types 10 (they measured in inches). 25.4x off.
+    body = _create_intent_with_depth(cleanup_intents, depth={"span_mm": 254.0})
+    updated = _answer(body["intent_id"], "q_span", 10.0)
+
+    span = _dim(updated, "span_mm")
+    assert span["source"] != "user_measured"
+    assert span["cross_check"]["status"] == "mismatch_reask"
+    reask = [q for q in updated["questions"] if q.get("dim_name") == "span_mm"]
+    assert any("inch" in q["prompt"].lower() for q in reask)
+
+
+def test_crosscheck_reconfirm_same_value_commits_override(cleanup_intents: list[str]):
+    body = _create_intent_with_depth(cleanup_intents, depth={"span_mm": 250.0})
+    iid = body["intent_id"]
+
+    # First submission is flagged...
+    flagged = _answer(iid, "q_span", 25.0)
+    assert _dim(flagged, "span_mm")["source"] != "user_measured"
+
+    # ...re-submitting the SAME value is an explicit override => commit.
+    committed = _answer(iid, "q_span", 25.0)
+    span = _dim(committed, "span_mm")
+    assert span["source"] == "user_measured"
+    assert span["value_mm"] == 25.0
+    assert span["confidence"] == 1.0
+    assert span["cross_check"]["status"] == "ok"
+    # the re-ask question is pruned once resolved
+    assert not any(q["question_id"] == "reask-span_mm" for q in committed["questions"])
+
+
+def test_crosscheck_corrected_value_within_tolerance_commits(
+    cleanup_intents: list[str],
+):
+    body = _create_intent_with_depth(cleanup_intents, depth={"span_mm": 250.0})
+    iid = body["intent_id"]
+
+    _answer(iid, "q_span", 25.0)  # flagged
+    # Now the user enters a corrected value close to the prior => commits.
+    corrected = _answer(iid, "q_span", 248.0)
+    span = _dim(corrected, "span_mm")
+    assert span["source"] == "user_measured"
+    assert span["value_mm"] == 248.0
+    assert span["cross_check"]["status"] == "ok"
+
+
+def test_crosscheck_depth_unavailable_commits_normally(cleanup_intents: list[str]):
+    # No depth prior (default DEPTH_PROVIDER=none path): everything commits, and
+    # the cross_check records status "unavailable".
+    body = _create_intent(cleanup_intents)
+    updated = _answer(body["intent_id"], "q_span", 25.0)
+    span = _dim(updated, "span_mm")
+    assert span["source"] == "user_measured"
+    assert span["value_mm"] == 25.0
+    assert span["cross_check"]["status"] == "unavailable"
+
+
+def test_crosscheck_within_tolerance_first_try_commits(cleanup_intents: list[str]):
+    body = _create_intent_with_depth(cleanup_intents, depth={"span_mm": 250.0})
+    # 240 is within 20% of 250 -> commits immediately, no flag.
+    updated = _answer(body["intent_id"], "q_span", 240.0)
+    span = _dim(updated, "span_mm")
+    assert span["source"] == "user_measured"
+    assert span["cross_check"]["status"] == "ok"
+
+
+def test_confirm_does_not_bypass_a_flagged_mismatch(cleanup_intents: list[str]):
+    """Regression (review finding #1): a `confirm` answer must NOT be a back door
+    that commits a value already flagged as a >20% mismatch. The dim stays
+    flagged until resolved through the measure_mm re-ask."""
+    intent = json.loads(json.dumps(BRACKET_INTENT))
+    intent["questions"].append(
+        {
+            "question_id": "q_confirm_span",
+            "dim_name": "span_mm",
+            "prompt": "Confirm span is right?",
+            "kind": "confirm",
+            "choices": None,
+            "overlay": None,
+        }
+    )
+    body = _create_intent_with_depth(
+        cleanup_intents, depth={"span_mm": 250.0}, intent=intent
+    )
+    iid = body["intent_id"]
+
+    _answer(iid, "q_span", 25.0)  # flag the mismatch
+    # Now a stray confirm for the same dim must not commit it.
+    r = client.post(
+        f"/intents/{iid}/answers",
+        json={"answers": [{"question_id": "q_confirm_span", "confirm": True}]},
+    )
+    assert r.status_code == 200, r.text
+    span = _dim(r.json(), "span_mm")
+    assert (
+        span["source"] != "user_measured"
+    ), "confirm must not commit a flagged mismatch"
+    assert span["cross_check"]["status"] == "mismatch_reask"
+
+
+def test_confirm_disagreeing_with_depth_prior_is_flagged(cleanup_intents: list[str]):
+    """Regression (review finding #4): a `confirm` on a value that disagrees with
+    the depth prior by >20% must be re-asked, not silently stamped 'ok'. The
+    provider is distrusted, so even a provider-supplied cross_check.status='ok'
+    on a bad value gets re-checked."""
+    intent = json.loads(json.dumps(BRACKET_INTENT))
+    # Provider injects a span dim whose value disagrees with its own stated prior.
+    span = next(d for d in intent["dimensions"] if d["name"] == "span_mm")
+    span["value_mm"] = 500.0
+    span["source"] = "depth_inferred"
+    span["cross_check"] = {"depth_value_mm": 250.0, "ratio": 2.0, "status": "ok"}
+    intent["questions"].append(
+        {
+            "question_id": "q_confirm_span",
+            "dim_name": "span_mm",
+            "prompt": "Confirm span is right?",
+            "kind": "confirm",
+            "choices": None,
+            "overlay": None,
+        }
+    )
+    body = _create_intent(
+        cleanup_intents, intent=intent
+    )  # DEPTH_PROVIDER=none: dim survives as-is
+    iid = body["intent_id"]
+
+    r = client.post(
+        f"/intents/{iid}/answers",
+        json={"answers": [{"question_id": "q_confirm_span", "confirm": True}]},
+    )
+    assert r.status_code == 200, r.text
+    span = _dim(r.json(), "span_mm")
+    assert (
+        span["source"] != "user_measured"
+    ), "confirming a value 2x off the prior must not commit"
+    assert span["cross_check"]["status"] == "mismatch_reask"
+
+
+def test_confirm_agreeing_value_still_commits(cleanup_intents: list[str]):
+    """The fix must not break the normal case: confirming a depth-inferred value
+    (which equals its prior) commits it."""
+    intent = json.loads(json.dumps(BRACKET_INTENT))
+    intent["questions"].append(
+        {
+            "question_id": "q_confirm_span",
+            "dim_name": "span_mm",
+            "prompt": "Confirm span is right?",
+            "kind": "confirm",
+            "choices": None,
+            "overlay": None,
+        }
+    )
+    body = _create_intent_with_depth(
+        cleanup_intents, depth={"span_mm": 250.0}, intent=intent
+    )
+    r = client.post(
+        f"/intents/{body['intent_id']}/answers",
+        json={"answers": [{"question_id": "q_confirm_span", "confirm": True}]},
+    )
+    assert r.status_code == 200, r.text
+    span = _dim(r.json(), "span_mm")
+    assert span["source"] == "user_measured"
+    assert span["value_mm"] == 250.0
+    assert span["cross_check"]["status"] == "ok"
+
+
+def test_crosscheck_never_silently_overrides_user(cleanup_intents: list[str]):
+    """The user's number is never replaced by the depth value behind their
+    back — a mismatch keeps the user's value while flagged, and commits the
+    user's value (not the depth value) on re-confirm."""
+    body = _create_intent_with_depth(cleanup_intents, depth={"span_mm": 250.0})
+    iid = body["intent_id"]
+
+    flagged = _answer(iid, "q_span", 25.0)
+    assert _dim(flagged, "span_mm")["value_mm"] == 25.0  # NOT silently set to 250
+
+    committed = _answer(iid, "q_span", 25.0)
+    assert (
+        _dim(committed, "span_mm")["value_mm"] == 25.0
+    )  # committed as the user's value

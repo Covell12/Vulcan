@@ -13,14 +13,19 @@ non-expert can follow: what it does, why it exists, what talks to it).
   (M2: setup now says Python 3.11+, since 3.13 is confirmed working — cadquery 2.8.0 has
   native 3.13 wheels.)
 - **requirements.txt** — The Python libraries the project depends on, pinned loosely.
-  (M3: added `openai`, alongside the `anthropic` already there — both vision-provider
-  SDKs, used only by `api/vision_provider.py`.)
+  (M3: added `openai` alongside `anthropic` — both vision SDKs, used only by
+  `api/vision_provider.py`. M4: added `replicate` — the depth SDK, used only by
+  `api/depth_provider.py`.)
 - **.gitignore** — Tells git which files never to store (secrets, caches, generated
   exports). (M3: added `data/`, where intent JSON files live — generated at runtime,
   never committed, same treatment as `exports/`.)
-- **.env.example** (M3) — Documents every environment variable the app reads, including
-  the intent parser's provider switch: set `VISION_PROVIDER` to `openai` or `anthropic`
-  and fill in that provider's key. Copy to `.env` (gitignored) and fill in for real.
+- **.env.example** (M3, reworked M4) — Documents every environment variable the app
+  reads: the intent parser's provider switch (`VISION_PROVIDER` + key) and (M4) the
+  optional depth prior (`DEPTH_PROVIDER=none|replicate`, `DEPTH_MODEL`,
+  `REPLICATE_API_TOKEN`). **M4 fix:** every comment is now on its OWN line — an inline
+  `KEY=   # comment` is a python-dotenv landmine (it loads the comment text AS the
+  value, which would make an "empty" key look set and defeat the startup fail-fast
+  checks). Copy to `.env` (gitignored) and fill in for real.
 
 ## schemas/
 
@@ -37,18 +42,24 @@ non-expert can follow: what it does, why it exists, what talks to it).
 - **docs/ROADMAP.md** — The build sequence as a numbered list of Claude Code milestones,
   each with its exit criteria. Work top to bottom; don't skip ahead.
 
-## api/ (M1, extended M2 and M3)
+## api/ (M1, extended M2, M3, and M4)
 
 - **api/main.py** — Creates the FastAPI application. Defines `GET /health` (a trivial
   liveness check), wires in the `/designs`, `/templates`, and `/intents` routes, and
   serves two directories of static files: `exports/` (generated part files, at
   `/exports/...`) and `web/` (the test UI, at `/`). The web UI mount is registered last
   so it doesn't swallow the API routes. **M3:** added a `lifespan` startup hook that
-  calls `vision_provider.check_provider_configured()` — the server refuses to boot with
-  a clear error if `VISION_PROVIDER`'s API key isn't set. This only fires on a real
-  ASGI startup (uvicorn, or `with TestClient(app) as c:`), never on a plain
-  `TestClient(app)`, so it can't get in the way of tests that mock the provider and
-  don't have a real key.
+  calls `vision_provider.check_provider_configured()`. **M4:** the hook also calls
+  `depth_provider.check_provider_configured()` — a no-op for `DEPTH_PROVIDER=none` (the
+  default), so depth stays fully optional, but a fail-fast if `DEPTH_PROVIDER=replicate`
+  without a token. The hook only fires on a real ASGI startup (uvicorn, or
+  `with TestClient(app) as c:`), never a plain `TestClient(app)`, so it can't get in the
+  way of tests that mock the providers and don't have real keys.
+- **api/photo.py** (M4) — The tiny `PhotoInput` container (bytes + mime type) shared by
+  both provider seams. Lives in its own neutral module so `api/vision_provider.py` and
+  `api/depth_provider.py` can both accept the same type without importing each other;
+  re-exported from `api/vision_provider` so existing `from api.vision_provider import
+  PhotoInput` imports keep working.
 - **api/designs.py** — Defines `POST /designs`, the one endpoint that turns a
   `template_id` + parameter JSON into a physical part. (M2) It no longer hardcodes which
   templates exist — it looks the template up via `templates_lib.registry.get_template`,
@@ -86,7 +97,29 @@ non-expert can follow: what it does, why it exists, what talks to it).
   as-is as a forced tool call (`tool_choice` pins it to one tool, so the model can't
   reply with prose instead). `check_provider_configured()` is a fail-fast check — see
   `api/main.py`'s startup hook. The actual schema *validation* of what comes back is
-  NOT this module's job — see `api/intents.py`.
+  NOT this module's job — see `api/intents.py`. **M4 fix:** every SDK call AND every
+  response-parse step (empty content, unexpected shape, non-JSON body) is now wrapped so
+  the ONLY exception that can escape this module is `VisionProviderError`, carrying a
+  human-readable cause (auth / quota / rate-limit / model-not-found / bad-image /
+  network — mapped from the exception's `status_code` + message by `_humanize_provider_error`
+  without importing any SDK's error classes). That guarantees `api/intents.py` can always
+  turn a provider failure into a clean 502, never a bare 500.
+- **api/depth_provider.py** (M4) — The depth analogue of `api/vision_provider.py`, and
+  the one file allowed to import `replicate` (enforced by
+  `tests/test_depth_provider.py::test_only_depth_provider_imports_replicate`). Exposes one
+  function, `estimate_scale(photo, regions) -> list[ScaleEstimate]`, that turns
+  overlay regions (an arrow/line on the photo) into real-world sizes in mm. Backend is
+  chosen by `DEPTH_PROVIDER`: `none` (default) returns nothing — the whole product works
+  fully without depth — and `replicate` runs a metric monocular-depth model. The metric
+  geometry (`_region_size_mm`: pinhole back-projection of the two endpoints using the
+  depth map + focal length) is a pure, unit-tested function, so it's correct independent
+  of which model supplies the depth. **Key limitation, documented in the module:** no
+  public Replicate wrapper currently returns raw metric depth — the popular Depth Pro
+  wrapper discards the meters + focal length and returns only a colorized visualization —
+  so this module defines the output *contract* it needs (per-pixel metric depth + focal
+  length) and raises a clear `DepthProviderError` rather than inventing numbers if a model
+  returns a plain visualization image. Every SDK/network/decode failure is wrapped as
+  `DepthProviderError`.
 - **api/intents.py** (M3) — `POST /intents` and `POST /intents/{id}/answers`: the
   photo(s)+annotation+text → IntentSpec → answered-dimensions pipeline. Builds a
   `template_catalog` from the live template registry (id, category, critical_dims,
@@ -108,6 +141,23 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `confirm` (accepts an already-assumed value as measured), or `choice` (v0 scope: only
   wired up to update `material_suggestion` — mapping other enum template params from a
   choice answer is M5's job, once IntentSpec dims get joined to a full template).
+  **M4 additions:** (1) after the vision pass, `_apply_depth_prior` asks
+  `depth_provider.estimate_scale` for a metric size for each dim still on source
+  "assumed" and, where it gets one, turns it into a `depth_inferred` suggestion (value +
+  honest confidence) — critical dims still require a real `user_measured` answer, so this
+  only prefills the UI's "looks like ~X — measure to confirm"; a depth-provider failure
+  degrades to no proposals rather than breaking intent creation. (2) `_cross_check_measurement`
+  implements CLAUDE.md rule 3: a `measure_mm` answer that disagrees with the depth prior
+  by >20% is NOT committed — it records `cross_check {depth_value_mm, ratio,
+  status:"mismatch_reask"}` and (re-)asks a question naming both values plus the likely
+  unit slip (cm vs mm, inch vs mm); re-submitting the *same* value is an explicit override
+  that commits it (status `"ok"`); with no depth prior everything commits normally (status
+  `"unavailable"`). The user's number is never silently replaced by the depth value in
+  either direction. The depth prior is kept stable across answers via
+  `cross_check.depth_value_mm`, so a corrected re-answer is checked against the same prior.
+  A `confirm` answer is routed through the SAME cross-check (and refuses to touch a dim
+  currently flagged as a mismatch), so it can't become a back door that commits a
+  disputed value without the re-ask.
 - **api/rendering.py** — Takes a finished CadQuery solid and writes it to disk in every
   format the rest of the product needs: STEP (for manufacturing/slicing), 3MF and STL
   (for 3D printing), and a PNG preview. The preview is rendered by loading the exported
@@ -186,7 +236,7 @@ non-expert can follow: what it does, why it exists, what talks to it).
   **M3:** registered with `category="knob"` and `critical_dims=("shaft_dia_mm",
   "shaft_depth_mm")`, per this milestone's instructions.
 
-## web/ (M1, rebuilt M2, extended M3)
+## web/ (M1, rebuilt M2, extended M3 and M4)
 
 - **web/index.html** — **M3:** now two tabs. "Start with a photo" (the new default) is
   the intent-parser flow: photo upload, freehand-annotation canvas, description text,
@@ -201,7 +251,12 @@ non-expert can follow: what it does, why it exists, what talks to it).
   tab-switching click handler at the top of the file (shared across both tabs) — its
   `templateSelect`/`previewImg`/`renderDownloads`/etc. globals are also reused directly
   by `intents.js`'s "Generate part" button rather than duplicating preview/download
-  rendering there.
+  rendering there. **M4 fix (b):** added shared `describeFetchError(response)` and
+  `errorText(err)` helpers used by both `app.js` and `intents.js`. `describeFetchError`
+  turns any failed response into a useful, always-non-empty message that includes the
+  HTTP status, whether the body was JSON `{detail}`, plain text, or empty; `errorText`
+  guarantees a caught error never renders as an empty string. Together they make an empty
+  "Error:" impossible.
 - **web/intents.js** (M3) — The "Start with a photo" flow. Lets the user upload up to 3
   photos (only the first is annotatable in this test UI — a documented v0 UI
   simplification, not a backend one) and draw a freehand polyline on it via canvas
@@ -216,13 +271,21 @@ non-expert can follow: what it does, why it exists, what talks to it).
   for each of the target template's fields, the matching dimension's `value_mm` if
   present, else the template's own default — switches to the "Direct template params"
   tab, syncs its dropdown/fields to match, and reuses its existing preview/download
-  rendering.
+  rendering. **M4:** a `measure_mm` question whose dim came back `depth_inferred` shows a
+  "looks like ~X mm — measure to confirm" placeholder; a dim in `mismatch_reask` renders
+  an amber warning card naming both the entered and depth values with a one-click "Yes,
+  my measurement is right" button (which re-submits the flagged value → server commits it
+  as an override). Question rows are now deduped per dim (a dim can carry both its
+  original and a server-added `reask-` question) so inputs/cards don't double-render, and
+  the answer-submit path is extracted into a shared `submitAnswers(answers)` used by both
+  the button and the re-confirm.
 - **web/style.css** — Styling for the test UI. **M3:** added tab styling, the
   photo/canvas/SVG-overlay layered layout (`#annotate-wrap`/`#overlay-wrap`, absolutely
   positioned canvas and SVG over the photo), question-row styling, and the
-  `<pre>`-formatted IntentSpec JSON display.
+  `<pre>`-formatted IntentSpec JSON display. **M4:** added the `.mismatch-card` /
+  `.reconfirm-btn` styles for the cross-check warning.
 
-## tests/ (M1, extended M2 and M3)
+## tests/ (M1, extended M2, M3, and M4)
 
 - **tests/test_bracket_shelf_l.py** — Tests the bracket template in isolation (no
   API/HTTP involved): every generated mesh is manifold for each `load_hint`, wall
@@ -274,19 +337,30 @@ non-expert can follow: what it does, why it exists, what talks to it).
   nesting level (not just the top), and includes a repo-wide grep
   (`test_no_other_module_imports_provider_sdks`) that fails if any file other than
   `vision_provider.py` ever imports `openai` or `anthropic` — turning the "one file only"
-  rule into something enforced, not just documented.
-- **tests/test_intents.py** (M3) — Tests `api/intents.py` with `api.intents.parse_intent`
-  mocked (no network). Covers the create → answer → `ready_for_design` round-trip; the
-  schema-validation retry path (fails once, succeeds; fails twice, 502); that answers set
-  `source`/`confidence` correctly for `measure_mm` and `confirm` kinds and that `choice`
-  answers can update `material_suggestion`; and — CLAUDE.md's non-negotiable rule — the
-  critical-dim gate: answering only one of two critical dims keeps `needs_answers`,
-  answering both flips to `ready_for_design`, a critical dimension the provider forgot
-  entirely gets synthesized (with its question) rather than silently passing the gate,
-  and a dimension the provider incorrectly marked `critical=true` gets corrected back to
-  `false`. This last case caught a real bug during development: the gate originally only
-  forced *known* critical dims to `true` and never corrected a false positive on anything
-  else.
+  rule into something enforced, not just documented. **M4:** added tests that every SDK
+  exception (auth/quota/rate-limit/model-not-found/bad-image/generic) and every bad
+  response (non-JSON, empty content) becomes a `VisionProviderError` with the right
+  human-readable cause — so a provider failure can always become a clean 502.
+- **tests/test_depth_provider.py** (M4) — Tests `api/depth_provider.py` with no network.
+  Covers provider/model selection, the fail-fast check (replicate-without-token, and
+  whitespace-only token), the `none` path returning no estimates, the pure metric
+  geometry against synthetic depth maps (a known pixel span at a known depth/focal gives
+  the analytically-correct mm; size scales with depth; single-point/invalid regions
+  return `None`; confidence stays modest and capped), the Replicate decode path with
+  `replicate` mocked (a visualization PNG is rejected, a metric `.npz` + focal length
+  decodes to the right size, an API error is wrapped), and the grep test that only
+  `depth_provider.py` imports `replicate`.
+- **tests/test_intents.py** (M3, extended M4) — Tests `api/intents.py` with
+  `api.intents.parse_intent` (and, for M4, `api.intents.estimate_scale`) mocked — no
+  network. Covers the create → answer → `ready_for_design` round-trip; the
+  schema-validation retry path; answer `source`/`confidence` handling; the critical-dim
+  gate (including a real bug it once caught — the gate now also corrects a false-positive
+  `critical=true` from the provider). **M4 additions:** a provider error becomes a clean
+  502; a depth prior turns an assumed dim into `depth_inferred` (and a depth-provider
+  failure degrades gracefully); and the full cross-check matrix — the mm/cm slip (10x),
+  the inch slip (25.4x), a re-confirmed override, a corrected value, depth-unavailable
+  committing with status `"unavailable"`, and an explicit "never silently overrides the
+  user" check.
 - **tests/fixtures/intents/** (M3) — Ground-truth fixtures for `scripts/eval_intents.py`:
   `manifest.json` (fixture list: photos, text, optional annotation, ground-truth
   template_id/category/measured dimensions) + `photos/` + a `README.md` documenting the
@@ -295,17 +369,20 @@ non-expert can follow: what it does, why it exists, what talks to it).
   placeholders) so the structure and the eval script are exercisable now; real photos
   replace them later.
 
-## scripts/ (M3)
+## scripts/ (M3, extended M4)
 
 - **scripts/eval_intents.py** — `python scripts/eval_intents.py --provider {openai|anthropic}`.
-  Boots its own `uvicorn api.main:app` subprocess with `VISION_PROVIDER` set to the
-  requested provider (the standard "one env var + a restart" switch, just automated so
-  both providers can be compared with one command each and without hand-editing `.env`),
-  runs every fixture in `tests/fixtures/intents/manifest.json` through a real
+  Boots its own `uvicorn api.main:app` subprocess with `VISION_PROVIDER` (and, M4,
+  `DEPTH_PROVIDER`) set to the requested backends (the standard "one env var + a restart"
+  switch, automated so backends can be compared one command each without hand-editing
+  `.env`), runs every fixture in `tests/fixtures/intents/manifest.json` through a real
   `POST /intents` call — no mocking — and reports template match rate, dimension MAE
-  (mm) vs. ground truth, and critical-dim question coverage, both overall and per
-  fixture. This is how M3's exit bar (`docs/ROADMAP.md`: "8/10 fixture cases produce
-  correct template + sensible questions") gets measured.
+  (mm) vs. ground truth, and critical-dim question coverage. **M4:** with
+  `--depth-provider replicate` it also reports depth-proposal MAE (error of the
+  `depth_inferred` values vs ground truth) and the cross-check catch rate — for each
+  critical dim with a depth prior it injects a 10x-too-small answer (a cm-for-mm slip)
+  and counts how many the >20% cross-check flagged. This is how M3's exit bar
+  (`docs/ROADMAP.md`) and M4's cross-check behavior get measured.
 
 ## .claude/launch.json (M1)
 

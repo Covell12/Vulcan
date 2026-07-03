@@ -21,7 +21,8 @@ uvicorn api.main:app --reload    # API + test UI at http://localhost:8000
 pytest -q                        # tests
 ```
 
-The server fails fast on startup if `VISION_PROVIDER`'s API key isn't set in `.env`.
+The server fails fast on startup if a selected provider's credentials aren't set in
+`.env` (the vision provider always; the depth provider only when `DEPTH_PROVIDER=replicate`).
 
 ## Vision provider (intent parser)
 
@@ -29,6 +30,18 @@ Set `VISION_PROVIDER=openai` or `VISION_PROVIDER=anthropic` in `.env` and fill i
 provider's key (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`) — that's the only edit needed
 to switch providers; restart the server to pick it up. Override the model with
 `VISION_MODEL`. See `api/vision_provider.py` for the one place this logic lives.
+
+## Depth provider (metric-scale prior, optional)
+
+`DEPTH_PROVIDER=none` (the default) runs everything with no depth model — questions
+still get asked and every fit-critical dimension still requires a real user
+measurement. `DEPTH_PROVIDER=replicate` adds metric-size *suggestions* from the photo
+(prefilling "looks like ~210mm — measure to confirm") and enables the unit-mistake
+cross-check: a typed value that disagrees with the depth prior by more than 20% is
+re-asked, never silently committed. Set `REPLICATE_API_TOKEN` and, because no public
+Replicate model currently returns raw metric depth, point `DEPTH_MODEL` at a cog that
+returns per-pixel metric depth + focal length. See `api/depth_provider.py` — the one
+place this logic lives — for the exact output contract.
 
 ## Where things are
 

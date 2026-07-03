@@ -282,6 +282,32 @@ circle.overlay-shape {
   font-weight: 600;
 }
 
+.mismatch-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #e0a33b;
+  background: #fdf6e9;
+  border-radius: 8px;
+}
+
+.mismatch-msg {
+  margin: 0;
+  font-size: 14px;
+  color: #8a5a00;
+}
+
+.reconfirm-btn {
+  margin: 0;
+  align-self: flex-start;
+  background: #8a5a00;
+}
+
+.reconfirm-btn:hover {
+  background: #6f4800;
+}
+
 #intent-json {
   max-height: 320px;
   overflow: auto;

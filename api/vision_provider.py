@@ -21,11 +21,12 @@ import base64
 import copy
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+
+from api.photo import PhotoInput  # re-exported; shared with api/depth_provider.py
 
 load_dotenv()
 
@@ -87,13 +88,22 @@ commentary outside it."""
 
 
 class VisionProviderError(RuntimeError):
-    """Raised for provider misconfiguration or an unusable provider response."""
+    """Raised for provider misconfiguration or an unusable provider response.
+
+    This is the ONLY exception type that may escape this module. Every raw
+    SDK / network / JSON-parse failure is caught and re-raised as one of these
+    with a human-readable cause, so api/intents.py can turn it into a clean
+    502 (never a bare 500). See `_humanize_provider_error`.
+    """
 
 
-@dataclass(frozen=True)
-class PhotoInput:
-    content: bytes
-    mime_type: str = "image/jpeg"
+def _env_value_set(name: str) -> bool:
+    """True only if an env var holds a real value. Guards against the
+    python-dotenv inline-comment landmine: `KEY=   # comment` loads the comment
+    text AS the value, so a leading '#' (after stripping) counts as unset —
+    otherwise a fail-fast check would be fooled into thinking a key is present."""
+    value = os.getenv(name, "").strip()
+    return bool(value) and not value.startswith("#")
 
 
 def get_provider_name() -> str:
@@ -119,7 +129,7 @@ def check_provider_configured(provider: str | None = None) -> None:
             f"Unknown VISION_PROVIDER '{provider}'. Supported: {sorted(_REQUIRED_ENV_VAR)}"
         )
     env_var = _REQUIRED_ENV_VAR[provider]
-    if not os.getenv(env_var):
+    if not _env_value_set(env_var):
         raise VisionProviderError(
             f"VISION_PROVIDER is '{provider}' but {env_var} is not set. Add "
             f"{env_var}=... to .env (see .env.example), or set VISION_PROVIDER to a "
@@ -182,6 +192,57 @@ def _load_canonical_schema() -> dict[str, Any]:
         return json.load(f)
 
 
+def _humanize_provider_error(label: str, exc: Exception) -> str:
+    """Turn a raw provider SDK / network exception into a message a human can
+    act on, without importing any provider's error classes (so this stays
+    provider-agnostic and can't drift when SDKs reshuffle their exceptions).
+
+    We sniff the two things provider SDKs reliably expose: an HTTP-ish
+    `status_code` attribute and the string form of the exception.
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    cls = type(exc).__name__
+    # str(exc) can itself raise for a pathological exception — never let that
+    # escape (it would defeat the whole point of this wrapper).
+    try:
+        text = str(exc) or cls
+    except Exception:
+        text = cls
+    lowered = text.lower()
+
+    def msg(reason: str) -> str:
+        return f"{label} request failed: {reason} ({cls}: {text})"
+
+    if (
+        status == 401
+        or "authenticationerror" in cls.lower()
+        or "invalid api key" in lowered
+    ):
+        return msg("authentication failed — check the API key")
+    if "insufficient_quota" in lowered or "quota" in lowered or "billing" in lowered:
+        return msg("quota exceeded or billing issue on the provider account")
+    if status == 429 or "ratelimit" in cls.lower() or "rate limit" in lowered:
+        return msg("rate limited — too many requests, retry later")
+    if (
+        status == 404
+        or "notfound" in cls.lower()
+        or "model_not_found" in lowered
+        or "does not exist" in lowered
+    ):
+        return msg("model not found — check VISION_MODEL / the default model id")
+    if status == 400 or "badrequest" in cls.lower() or "invalid_request" in lowered:
+        return msg("bad request — possibly an invalid or unsupported image")
+    if (
+        "connection" in cls.lower()
+        or "timeout" in cls.lower()
+        or "timed out" in lowered
+    ):
+        return msg("could not reach the provider (network error/timeout)")
+    if status is not None:
+        return msg(f"provider returned HTTP {status}")
+    return msg("unexpected provider error")
+
+
 # ---------------------------------------------------------------------------
 # OpenAI adapter
 # ---------------------------------------------------------------------------
@@ -190,10 +251,6 @@ def _load_canonical_schema() -> dict[str, Any]:
 def _parse_intent_openai(
     photos: list[PhotoInput], user_text: str, model: str
 ) -> dict[str, Any]:
-    import openai
-
-    client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
     content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     for photo in photos:
         b64 = base64.b64encode(photo.content).decode("ascii")
@@ -204,25 +261,45 @@ def _parse_intent_openai(
             }
         )
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": content},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "intent_spec",
-                "schema": _to_openai_strict_schema(_load_canonical_schema()),
-                "strict": True,
+    # Any failure — including a missing/broken SDK install — constructing the
+    # client or making the call (auth, quota, rate limit, bad model, bad image,
+    # network) becomes a VisionProviderError. The import is inside the try so an
+    # ImportError doesn't leak raw.
+    try:
+        import openai
+
+        client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "intent_spec",
+                    "schema": _to_openai_strict_schema(_load_canonical_schema()),
+                    "strict": True,
+                },
             },
-        },
-    )
-    message = response.choices[0].message
-    if not message.content:
-        raise VisionProviderError("OpenAI response had no message content.")
-    return json.loads(message.content)
+        )
+    except Exception as e:
+        raise VisionProviderError(_humanize_provider_error("OpenAI", e)) from e
+
+    # Parsing the response is just as failure-prone (empty content, unexpected
+    # shape, non-JSON body) and must not leak a raw exception either.
+    try:
+        message = response.choices[0].message
+        if not message.content:
+            raise VisionProviderError("OpenAI returned an empty message (no content).")
+        return json.loads(message.content)
+    except VisionProviderError:
+        raise
+    except Exception as e:
+        raise VisionProviderError(
+            f"Could not parse OpenAI response ({type(e).__name__}: {e})"
+        ) from e
 
 
 def _to_openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -279,10 +356,6 @@ def _is_object_schema(node: dict[str, Any]) -> bool:
 def _parse_intent_anthropic(
     photos: list[PhotoInput], user_text: str, model: str
 ) -> dict[str, Any]:
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-
     content: list[dict[str, Any]] = []
     for photo in photos:
         b64 = base64.b64encode(photo.content).decode("ascii")
@@ -298,23 +371,38 @@ def _parse_intent_anthropic(
         )
     content.append({"type": "text", "text": user_text})
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content}],
-        tools=[
-            {
-                "name": "record_intent_spec",
-                "description": "Record the structured IntentSpec for this request.",
-                "input_schema": _to_anthropic_tool_schema(_load_canonical_schema()),
-            }
-        ],
-        tool_choice={"type": "tool", "name": "record_intent_spec"},
-    )
-    for block in response.content:
-        if block.type == "tool_use":
-            return block.input
+    # Import inside the try so a missing/broken SDK becomes VisionProviderError.
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        response = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+            tools=[
+                {
+                    "name": "record_intent_spec",
+                    "description": "Record the structured IntentSpec for this request.",
+                    "input_schema": _to_anthropic_tool_schema(_load_canonical_schema()),
+                }
+            ],
+            tool_choice={"type": "tool", "name": "record_intent_spec"},
+        )
+    except Exception as e:
+        raise VisionProviderError(_humanize_provider_error("Anthropic", e)) from e
+
+    try:
+        for block in response.content:
+            if block.type == "tool_use":
+                return block.input
+    except VisionProviderError:
+        raise
+    except Exception as e:
+        raise VisionProviderError(
+            f"Could not parse Anthropic response ({type(e).__name__}: {e})"
+        ) from e
     raise VisionProviderError("Anthropic response did not include a tool_use block.")
 
 
