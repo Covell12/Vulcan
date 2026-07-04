@@ -204,6 +204,7 @@ def _apply_critical_dim_gate(intent: dict[str, Any]) -> dict[str, Any]:
     if spec is not None:
         _ensure_critical_dimensions(intent, spec)
         _ensure_critical_questions(intent, spec)
+        _attach_param_bounds(intent, spec)
 
     if intent.get("out_of_scope_reason"):
         intent["status"] = "out_of_scope"
@@ -233,6 +234,24 @@ def _derive_dim_name(question_id: str | None) -> str:
             break
     base = base.strip("_") or "measurement"
     return base if base.endswith("_mm") else f"{base}_mm"
+
+
+def _attach_param_bounds(intent: dict[str, Any], spec: TemplateSpec) -> None:
+    """Expose each numeric param's min/max (mm) so the UI can show the allowed
+    range on the measurement field and reject an out-of-range value BEFORE the
+    join — otherwise a value outside the template's pydantic bounds (common for a
+    freeform template whose generated ranges are tighter than the real part)
+    only fails at build time with a confusing 422."""
+    bounds: dict[str, dict[str, Any]] = {}
+    for field in form_fields_for(spec.params_model):
+        if field["type"] in ("number", "integer") and (
+            field.get("minimum") is not None or field.get("maximum") is not None
+        ):
+            bounds[field["name"]] = {
+                "minimum": field.get("minimum"),
+                "maximum": field.get("maximum"),
+            }
+    intent["param_bounds"] = bounds
 
 
 def _ensure_measure_question_dimensions(intent: dict[str, Any]) -> None:
@@ -661,6 +680,27 @@ def _load_intent_photos(intent: dict[str, Any]) -> list[PhotoInput]:
     return photos
 
 
+def _freeform_questions(outcome: "freeform.GenerationResult") -> list[dict[str, Any]]:
+    """One measure_mm question per generated critical dim, carrying the overlay
+    the codegen model placed on the photo (or null if it couldn't locate it)."""
+    questions: list[dict[str, Any]] = []
+    for dim in outcome.critical_dims:
+        pretty = dim.removesuffix("_mm").replace("_", " ")
+        questions.append(
+            {
+                "question_id": f"gen-{dim}",
+                "dim_name": dim,
+                "prompt": f"What is the {pretty}, in mm?",
+                "kind": "measure_mm",
+                "choices": None,
+                "overlay": outcome.overlays.get(dim),
+                "suggested_value": None,
+                "chosen_value": None,
+            }
+        )
+    return questions
+
+
 @router.post("/intents/{intent_id}/freeform")
 def start_freeform(intent_id: str) -> dict[str, Any]:
     """Track B: author a one-off template and attach it to the intent so the
@@ -702,13 +742,15 @@ def start_freeform(intent_id: str) -> dict[str, Any]:
 
     # Success: adopt the generated template. If this is an OVERRIDE of a matched
     # template, drop that template's dimensions/questions — they measured a
-    # different part — so the gate synthesizes a clean set for the custom design.
+    # different part. Seed the questions for the generated critical dims WITH the
+    # overlays the codegen model placed on the photo, so the photo shows the
+    # dimension drawing (freeform questions used to be synthesized overlay-less).
     intent["template_id"] = outcome.template_id
     intent["freeform"] = True
     intent["freeform_assumptions"] = outcome.assumptions
     intent["freeform_dfm"] = outcome.dfm
     intent["dimensions"] = []
-    intent["questions"] = []
+    intent["questions"] = _freeform_questions(outcome)
     intent.pop("freeform_error", None)
     intent = _apply_critical_dim_gate(intent)
     _apply_freeform_routing(intent)

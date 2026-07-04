@@ -265,7 +265,14 @@ non-expert can follow: what it does, why it exists, what talks to it).
   no longer rides a bad-fit template silently. `POST /intents/{id}/freeform` is now the
   always-available user OVERRIDE too: it no longer 409s when a template already matched —
   instead the generated template REPLACES it, and the old template's dimensions/questions are
-  cleared so the gate synthesizes a clean set for the custom design.
+  cleared so the gate synthesizes a clean set for the custom design. **M7 follow-up fixes:**
+  `_attach_param_bounds` puts each numeric param's min/max (mm) on the intent as
+  `param_bounds`, so the UI shows the allowed range and rejects an out-of-range value BEFORE
+  the join (a value outside a freeform template's bounds otherwise only failed with a
+  confusing 422 at build time). And on a freeform override, `_freeform_questions` seeds the
+  critical-dim questions WITH the overlays the codegen model placed on the photo (via
+  `outcome.overlays`), so the photo shows the dimension drawing for freeform parts too — they
+  used to be synthesized overlay-less.
 - **api/rendering.py** — Takes a finished CadQuery solid and writes it to disk in every
   format the rest of the product needs: STEP (for manufacturing/slicing), 3MF and STL
   (for 3D printing), and a PNG preview. The preview is rendered by loading the exported
@@ -324,6 +331,11 @@ sandbox; every freeform design requires founder review before its files can ship
   2.4mm, 250mm ceiling, FDM constraints) and shows two exemplar templates as style references;
   the output uses a hand-authored strict JSON schema, and `param_schema` matches
   `form_fields_for()`'s shape. Does NOT execute or DFM-check code — that's freeform's job.
+  **M7 follow-up:** the prompt now insists on GENEROUS param min/max ranges (a user's real
+  measurement is rejected if it falls outside, so ranges that were too tight caused 422s at
+  the join), and the output gained an `overlays` array — a dimension overlay (dim_line/
+  dim_ellipse/dim_depth) per critical dim locating it on the photo, which `api/freeform` and
+  `api/intents` carry through so freeform questions draw dimension lines like Track A ones.
 - **api/freeform.py** (M-B) — Orchestrates generation: normalizes the model's param_schema and
   builds a pydantic params model from it (`create_model`, with ge/le bounds + Literal enums),
   verifies the code, TEST-BUILDS it in the sandbox with default params, and runs the DFM gate

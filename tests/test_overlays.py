@@ -160,6 +160,25 @@ def cleanup_intents() -> Iterator[list[str]]:
         shutil.rmtree(INTENTS_DIR / iid, ignore_errors=True)
 
 
+def test_param_bounds_attached_for_template(cleanup_intents):
+    """The intent exposes each numeric param's min/max so the UI can show the
+    allowed range and block an out-of-range value before the 422 join."""
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), (200, 200, 200)).save(buf, "JPEG")
+    with patch("api.intents.parse_intent", return_value=dict(OVERLAY_INTENT)):
+        r = client.post(
+            "/intents",
+            files=[("photos", ("p.jpg", io.BytesIO(buf.getvalue()), "image/jpeg"))],
+            data={"text": "a tube adapter"},
+        )
+    body = r.json()
+    cleanup_intents.append(body["intent_id"])
+    bounds = body["param_bounds"]
+    # adapter_tube od_a_mm is Field(ge=6, le=120)
+    assert bounds["od_a_mm"] == {"minimum": 6, "maximum": 120}
+    assert set(bounds) >= {"od_a_mm", "id_a_mm", "od_b_mm", "id_b_mm"}
+
+
 def test_api_emits_valid_new_kind_overlays(cleanup_intents):
     """A mocked provider that emits the new overlay kinds -> POST /intents 200 and
     the overlays survive to the response (post-processing doesn't drop/break them)."""

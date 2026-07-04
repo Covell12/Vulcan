@@ -375,10 +375,17 @@ function updateChipFromInput(questionId) {
   }
 }
 
+// The min/max (mm) the template accepts for a question's dimension, or null.
+function boundsFor(question) {
+  if (!question || !question.dim_name) return null;
+  return (currentIntent.param_bounds || {})[question.dim_name] || null;
+}
+
 // A measurement input with a mm/cm/in unit selector (default = remembered
-// session unit) and a live "8 in = 203.2 mm" dual display. Internal units stay
-// mm; the value is converted to mm at collection time (see collectMm).
-function appendMeasureField(parent, questionId, placeholder) {
+// session unit), a live "8 in = 203.2 mm" dual display, and — when the template
+// constrains this dimension — the allowed range plus out-of-range flagging so a
+// too-large value is caught HERE, not with a confusing 422 at the join.
+function appendMeasureField(parent, questionId, placeholder, bounds) {
   const wrap = document.createElement("div");
   wrap.className = "measure-field";
 
@@ -401,18 +408,44 @@ function appendMeasureField(parent, questionId, placeholder) {
 
   const dual = document.createElement("span");
   dual.className = "dual-display";
-  // On every keystroke / unit change: update the dual display AND the photo's
-  // dimension label chip live (two-way binding, with unit conversion).
+
+  const hint = document.createElement("span");
+  hint.className = "range-hint";
+  if (bounds) {
+    const lo = bounds.minimum != null ? trimNumber(bounds.minimum) : "…";
+    const hi = bounds.maximum != null ? trimNumber(bounds.maximum) : "…";
+    hint.textContent = `allowed range: ${lo}–${hi} mm`;
+  }
+
+  // Keep the native min/max in the CURRENT unit; flag out-of-range values.
+  const applyBounds = () => {
+    if (!bounds) return;
+    const u = unit.value;
+    if (bounds.minimum != null) input.min = trimNumber(fromMm(bounds.minimum, u));
+    else input.removeAttribute("min");
+    if (bounds.maximum != null) input.max = trimNumber(fromMm(bounds.maximum, u));
+    else input.removeAttribute("max");
+    const mm = collectMm(questionId);
+    const bad =
+      mm != null &&
+      ((bounds.minimum != null && mm < bounds.minimum - 1e-9) ||
+        (bounds.maximum != null && mm > bounds.maximum + 1e-9));
+    input.classList.toggle("out-of-range", bad);
+    hint.classList.toggle("error", bad);
+  };
+
+  // On every keystroke / unit change: dual display, the photo's dimension chip
+  // (two-way binding), and range validation.
   const refresh = () => {
     dual.textContent = formatDual(input.value, unit.value);
     updateChipFromInput(questionId);
+    applyBounds();
   };
 
   input.addEventListener("input", refresh);
   unit.addEventListener("refresh-dual", refresh);
   unit.addEventListener("change", () => {
     setSessionUnit(unit.value);
-    // "Remembered per session": switch every unit selector to the new unit.
     for (const sel of document.querySelectorAll(".unit-select")) {
       sel.value = getSessionUnit();
       sel.dispatchEvent(new Event("refresh-dual"));
@@ -422,7 +455,9 @@ function appendMeasureField(parent, questionId, placeholder) {
   wrap.appendChild(input);
   wrap.appendChild(unit);
   wrap.appendChild(dual);
+  if (bounds) wrap.appendChild(hint);
   parent.appendChild(wrap);
+  applyBounds();
 }
 
 // Read a measure_mm question's entered value, converted to mm via its unit
@@ -467,7 +502,7 @@ function renderQuestionRow(question, dimension) {
       `${crossCheck.depth_value_mm}mm. Did you use the wrong units?`;
     card.appendChild(msg);
 
-    appendMeasureField(card, question.question_id, "enter a corrected value");
+    appendMeasureField(card, question.question_id, "enter a corrected value", boundsFor(question));
 
     const btn = document.createElement("button");
     btn.type = "button";
@@ -489,7 +524,7 @@ function renderQuestionRow(question, dimension) {
     } else if (dimension && dimension.value_mm !== null && dimension.value_mm !== undefined) {
       placeholder = `assumed: ${dimension.value_mm}mm`;
     }
-    appendMeasureField(row, question.question_id, placeholder);
+    appendMeasureField(row, question.question_id, placeholder, boundsFor(question));
   } else if (question.kind === "confirm") {
     const label = document.createElement("label");
     label.className = "checkbox-field";
@@ -560,18 +595,34 @@ submitAnswersBtn.addEventListener("click", () => {
   if (!currentIntent) return;
 
   const answers = [];
+  const outOfRange = [];
   for (const question of currentIntent.questions || []) {
     const input = document.getElementById(questionInputId(question.question_id));
     if (!input) continue; // deduped / already-confirmed questions render no input
 
     if (question.kind === "measure_mm") {
       const mm = collectMm(question.question_id); // converts cm/in -> mm
-      if (mm !== null) answers.push({ question_id: question.question_id, measure_mm: mm });
+      if (mm === null) continue;
+      // Catch a value outside the template's range HERE, so the join can't 422.
+      const b = boundsFor(question);
+      if (b && ((b.minimum != null && mm < b.minimum - 1e-9) || (b.maximum != null && mm > b.maximum + 1e-9))) {
+        outOfRange.push(`${question.dim_name} (${trimNumber(mm)}mm; allowed ${b.minimum ?? "…"}–${b.maximum ?? "…"}mm)`);
+        continue;
+      }
+      answers.push({ question_id: question.question_id, measure_mm: mm });
     } else if (question.kind === "confirm" && input.checked) {
       answers.push({ question_id: question.question_id, confirm: true });
     } else if (question.kind === "choice" && input.value !== "") {
       answers.push({ question_id: question.question_id, choice: input.value });
     }
+  }
+
+  if (outOfRange.length) {
+    setAnswersStatus(
+      `These are outside this design's allowed range — adjust them (or use "Design this custom instead" for a part that fits): ${outOfRange.join("; ")}.`,
+      true,
+    );
+    return;
   }
 
   submitAnswers(answers);

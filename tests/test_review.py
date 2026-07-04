@@ -221,6 +221,47 @@ def test_freeform_override_replaces_matched_template(cleanup):
     }
 
 
+def test_freeform_questions_carry_generated_overlays(cleanup):
+    """M7-fix Part B: the codegen model's per-dim overlays reach the synthesized
+    measure questions, so the photo shows the dimension drawing for freeform too."""
+    gen = dict(
+        GOOD_GEN,
+        overlays=[
+            {
+                "dim_name": "span_mm",
+                "photo_index": 0,
+                "kind": "dim_line",
+                "points": [[0.1, 0.5], [0.9, 0.5]],
+                "center": None,
+                "rx": None,
+                "ry": None,
+                "rotation": None,
+            },
+            {
+                "dim_name": "width_mm",
+                "photo_index": 0,
+                "kind": "dim_ellipse",
+                "points": None,
+                "center": [0.5, 0.5],
+                "rx": 0.1,
+                "ry": 0.06,
+                "rotation": 5,
+            },
+        ],
+    )
+    iid = _make_other_intent(cleanup)
+    intent = _generate(cleanup, iid, gen=gen)
+    ov = {
+        q["dim_name"]: (q.get("overlay") or {}).get("kind")
+        for q in intent["questions"]
+        if q["kind"] == "measure_mm"
+    }
+    assert ov.get("span_mm") == "dim_line"
+    assert ov.get("width_mm") == "dim_ellipse"
+    # freeform template bounds are exposed for the range UI too
+    assert intent["param_bounds"]["span_mm"]["maximum"] == 249
+
+
 def test_review_404_for_unknown_design():
     assert client.get("/review/nope").status_code == 404
     assert client.post("/review/nope", json={"verdict": "approve"}).status_code == 404

@@ -449,6 +449,21 @@ textarea {
   min-height: 1em;
 }
 
+.range-hint {
+  flex: 1 1 100%;
+  font-size: 12px;
+  color: var(--muted);
+}
+.range-hint.error {
+  color: #c0392b;
+  font-weight: 600;
+}
+
+.measure-field input.out-of-range {
+  border-color: #c0392b;
+  background: #fdecef;
+}
+
 /* --- Design result: annotated preview + param summary + downloads (M5) --- */
 #design-result {
   margin-top: 16px;

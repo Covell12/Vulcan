@@ -69,6 +69,7 @@ class GenerationResult:
     param_schema: list[dict[str, Any]] = field(default_factory=list)
     critical_dims: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
+    overlays: dict[str, dict[str, Any]] = field(default_factory=dict)
     dfm: dict[str, Any] | None = None
     attempts: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
@@ -337,6 +338,22 @@ def _validate_candidate(
         )
 
 
+def _normalize_overlays(raw: Any) -> dict[str, dict[str, Any]]:
+    """Turn the model's overlays list into {dim_name: overlay}, dropping the
+    dim_name key and any null fields so each overlay matches the intent's
+    question-overlay shape (kind + only the geometry that kind uses)."""
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, list):
+        return out
+    for o in raw:
+        if not isinstance(o, dict) or not o.get("dim_name") or not o.get("kind"):
+            continue
+        overlay = {k: v for k, v in o.items() if k != "dim_name" and v is not None}
+        overlay.setdefault("photo_index", 0)
+        out[o["dim_name"]] = overlay
+    return out
+
+
 def generate_and_register(
     request_text: str,
     photos: list[PhotoInput],
@@ -360,6 +377,7 @@ def generate_and_register(
         code = gen.get("cadquery_code") or ""
         critical = list(gen.get("critical_dims") or [])
         assumptions = list(gen.get("assumptions") or [])
+        overlays = _normalize_overlays(gen.get("overlays"))
 
         try:
             param_schema = normalize_param_schema(gen.get("param_schema") or [])
@@ -399,6 +417,7 @@ def generate_and_register(
                 "request": request_text,
                 "assumptions": assumptions,
                 "critical_dims": critical,
+                "overlays": overlays,
                 "dfm": dfm,
                 "attempts": attempts,
                 "created_at": _now(),
@@ -412,6 +431,7 @@ def generate_and_register(
             param_schema=param_schema,
             critical_dims=critical,
             assumptions=assumptions,
+            overlays=overlays,
             dfm=dfm,
             attempts=attempts,
         )

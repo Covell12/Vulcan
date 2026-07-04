@@ -19,6 +19,13 @@ function toMm(value, unit) {
   return n * factor;
 }
 
+// Convert a millimeter value into `unit` (the inverse of toMm). NaN for junk.
+function fromMm(mm, unit) {
+  const factor = MM_PER_UNIT[unit];
+  if (!Number.isFinite(mm) || factor === undefined) return NaN;
+  return mm / factor;
+}
+
 // Trim trailing zeros for display: 203.2 -> "203.2", 200 -> "200".
 function trimNumber(n) {
   return Number.parseFloat(n.toFixed(2)).toString();

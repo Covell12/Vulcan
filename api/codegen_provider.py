@@ -110,7 +110,20 @@ geometry only. It runs in a locked-down sandbox that forbids all of that.
 mm-valued lengths end in _mm), type (one of "number","integer","boolean","choice"), \
 default, minimum and maximum (numbers for number/integer else null), choices (a list of \
 strings for "choice" else null), description. Every dimension the user must physically \
-measure to get a good fit MUST be a parameter.
+measure to get a good fit MUST be a parameter. SET MIN/MAX GENEROUSLY: the user's measured \
+value is REJECTED if it falls outside your [minimum, maximum] range, so err WIDE. Center \
+the range on the size hints if given, and cover at least ~0.25x to ~4x the nominal (and \
+never a range narrower than the plausible real part). Allowing a slightly-too-large value \
+is fine; blocking a real measurement is not. Only keep min/max tight where geometry truly \
+requires it (e.g. a wall can't be below MIN_WALL).
+- overlays: for EACH critical dimension, an entry telling the UI where to draw that \
+measurement on the user's photo, or null if you can't confidently locate it. Fields: \
+dim_name (the exact param name), photo_index (0), kind ("dim_line" for a straight linear \
+span — set points to the two [x,y] endpoints; "dim_ellipse" for a diameter of a round \
+feature seen in perspective — set center [x,y], rx and ry as fractions of image WIDTH, and \
+rotation in degrees; "dim_depth" for a receding measurement — set the two points). All \
+coordinates are normalized [0,1] (top-left origin). Leave the fields not used by your kind \
+as null.
 - assumptions: short plain-English notes on anything you inferred or guessed (sizes not \
 given, orientation, features you added).
 - critical_dims: the list of parameter names that are FIT-CRITICAL — dimensions where being \
@@ -176,8 +189,44 @@ _GENERATION_SCHEMA: dict[str, Any] = {
         },
         "assumptions": {"type": "array", "items": {"type": "string"}},
         "critical_dims": {"type": "array", "items": {"type": "string"}},
+        "overlays": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "dim_name": {"type": "string"},
+                    "photo_index": {"type": "integer"},
+                    "kind": {"enum": ["dim_line", "dim_ellipse", "dim_depth"]},
+                    "points": {
+                        "type": ["array", "null"],
+                        "items": {"type": "array", "items": {"type": "number"}},
+                    },
+                    "center": {"type": ["array", "null"], "items": {"type": "number"}},
+                    "rx": {"type": ["number", "null"]},
+                    "ry": {"type": ["number", "null"]},
+                    "rotation": {"type": ["number", "null"]},
+                },
+                "required": [
+                    "dim_name",
+                    "photo_index",
+                    "kind",
+                    "points",
+                    "center",
+                    "rx",
+                    "ry",
+                    "rotation",
+                ],
+            },
+        },
     },
-    "required": ["cadquery_code", "param_schema", "assumptions", "critical_dims"],
+    "required": [
+        "cadquery_code",
+        "param_schema",
+        "assumptions",
+        "critical_dims",
+        "overlays",
+    ],
 }
 
 
