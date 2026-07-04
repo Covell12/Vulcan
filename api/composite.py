@@ -350,4 +350,8 @@ def render_composite(
     result = _rasterize(photo, verts_cam, faces, fx, fy, cx, cy)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     result.save(str(out_path))
+    # Also save the plain (EXIF-corrected, downscaled) photo next to the
+    # composite, so the UI can toggle the part in/out of the picture without
+    # re-serving the private original from data/.
+    photo.save(str(out_path.with_name("photo.png")))
     return out_path

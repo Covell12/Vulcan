@@ -34,6 +34,18 @@
     <div id="review-list"></div>
   </main>
 
+  <div id="viewer-modal" hidden>
+    <div class="viewer-modal-bar">
+      <span>3D preview — drag to orbit · scroll to zoom · right-drag to pan</span>
+      <button type="button" id="viewer-modal-close">Close ✕</button>
+    </div>
+    <div id="viewer-modal-stage" class="viewer3d"></div>
+  </div>
+
+  <script src="/vendor/three.min.js"></script>
+  <script src="/vendor/STLLoader.js"></script>
+  <script src="/vendor/OrbitControls.js"></script>
+  <script src="/viewer3d.js"></script>
   <script src="/review.js"></script>
 </body>
 </html>

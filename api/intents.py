@@ -1003,6 +1003,9 @@ def create_design_from_intent(intent_id: str) -> dict[str, Any]:
     composite_url = _render_ghost_composite(intent, spec, design_id)
     if composite_url:
         files["composite"] = composite_url
+        # render_composite also wrote the plain photo next to it, so the UI can
+        # toggle the part in/out of the picture (photo with vs. without model).
+        files["photo"] = f"/exports/{design_id}/photo.png"
 
     # Freeform (Track B): every generated design lands in the founder review
     # queue, and its CAD downloads are gated until approved (see api/review).

@@ -96,6 +96,10 @@
       <div id="design-result" hidden>
         <div id="design-views">
           <figure id="composite-figure" class="design-view" hidden>
+            <div class="view-toggle">
+              <button type="button" id="composite-toggle-with" class="seg active">With part</button>
+              <button type="button" id="composite-toggle-without" class="seg">Photo only</button>
+            </div>
             <div class="design-view-box">
               <img id="design-composite-img" alt="Your part shown to scale in your photo" />
             </div>
@@ -106,10 +110,16 @@
             </figcaption>
           </figure>
           <figure id="preview-figure" class="design-view">
-            <div class="design-view-box">
-              <img id="design-preview-img" alt="Annotated preview of your part" />
+            <div class="view-toggle">
+              <button type="button" id="part-toggle-3d" class="seg active">3D</button>
+              <button type="button" id="part-toggle-dims" class="seg">Dimensions</button>
+              <button type="button" id="part-expand" class="expand-btn" title="Expand">⛶ Expand</button>
             </div>
-            <figcaption><strong>The part</strong> — with its dimensions.</figcaption>
+            <div class="design-view-box">
+              <div id="viewer3d-part" class="viewer3d"></div>
+              <img id="design-preview-img" alt="Annotated preview of your part" hidden />
+            </div>
+            <figcaption><strong>The part</strong> — drag to orbit, scroll to zoom, right-drag to pan.</figcaption>
           </figure>
         </div>
         <table id="design-params-table"></table>
@@ -149,6 +159,18 @@
     </section>
   </main>
 
+  <div id="viewer-modal" hidden>
+    <div class="viewer-modal-bar">
+      <span>3D preview — drag to orbit · scroll to zoom · right-drag to pan</span>
+      <button type="button" id="viewer-modal-close">Close ✕</button>
+    </div>
+    <div id="viewer-modal-stage" class="viewer3d"></div>
+  </div>
+
+  <script src="/vendor/three.min.js"></script>
+  <script src="/vendor/STLLoader.js"></script>
+  <script src="/vendor/OrbitControls.js"></script>
+  <script src="/viewer3d.js"></script>
   <script src="/app.js"></script>
   <script src="/units.js"></script>
   <script src="/intents.js"></script>

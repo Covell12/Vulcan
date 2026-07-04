@@ -35,6 +35,21 @@ const designCompositeImg = document.getElementById("design-composite-img");
 const designParamsTable = document.getElementById("design-params-table");
 const designDownloads = document.getElementById("design-downloads");
 
+const viewer3dPart = document.getElementById("viewer3d-part");
+const partToggle3d = document.getElementById("part-toggle-3d");
+const partToggleDims = document.getElementById("part-toggle-dims");
+const partExpandBtn = document.getElementById("part-expand");
+const compositeToggleWith = document.getElementById("composite-toggle-with");
+const compositeToggleWithout = document.getElementById("composite-toggle-without");
+const viewerModal = document.getElementById("viewer-modal");
+const viewerModalStage = document.getElementById("viewer-modal-stage");
+const viewerModalClose = document.getElementById("viewer-modal-close");
+
+let partViewer = null; // the inline 3D viewer handle (disposed on re-render)
+let modalViewer = null; // the expanded 3D viewer handle
+let currentStlUrl = null; // STL url for the current design (for the 3D viewer)
+let compositeSources = { with: null, without: null }; // composite vs plain photo
+
 const freeformPanel = document.getElementById("freeform-panel");
 const freeformBtn = document.getElementById("freeform-btn");
 const freeformStatusEl = document.getElementById("freeform-status");
@@ -762,6 +777,67 @@ const SOURCE_BADGE = {
   default: "default",
 };
 
+// --- 3D model viewer + photo/part toggles -------------------------------
+
+function setCompositeView(which) {
+  const src = compositeSources[which];
+  if (src) designCompositeImg.src = src;
+  compositeToggleWith.classList.toggle("active", which === "with");
+  compositeToggleWithout.classList.toggle("active", which === "without");
+}
+
+function mountPartViewer() {
+  if (partViewer) {
+    partViewer.dispose();
+    partViewer = null;
+  }
+  if (!currentStlUrl || !window.Vulcan3D) return;
+  Vulcan3D.create(viewer3dPart, currentStlUrl, {
+    fallbackImg: designPreviewImg.src, // pending freeform STL is gated -> show the render
+  }).then((v) => {
+    partViewer = v;
+  });
+}
+
+function showPartView(which) {
+  const is3d = which === "3d";
+  viewer3dPart.hidden = !is3d;
+  designPreviewImg.hidden = is3d;
+  partToggle3d.classList.toggle("active", is3d);
+  partToggleDims.classList.toggle("active", !is3d);
+  partExpandBtn.hidden = !is3d;
+  if (is3d) mountPartViewer();
+  else if (partViewer) {
+    partViewer.dispose();
+    partViewer = null;
+  }
+}
+
+compositeToggleWith.addEventListener("click", () => setCompositeView("with"));
+compositeToggleWithout.addEventListener("click", () => setCompositeView("without"));
+partToggle3d.addEventListener("click", () => showPartView("3d"));
+partToggleDims.addEventListener("click", () => showPartView("dims"));
+
+partExpandBtn.addEventListener("click", () => {
+  if (!currentStlUrl) return;
+  viewerModal.hidden = false;
+  if (modalViewer) modalViewer.dispose();
+  Vulcan3D.create(viewerModalStage, currentStlUrl, { fallbackImg: designPreviewImg.src }).then((v) => {
+    modalViewer = v;
+  });
+});
+function closeModalViewer() {
+  viewerModal.hidden = true;
+  if (modalViewer) {
+    modalViewer.dispose();
+    modalViewer = null;
+  }
+}
+viewerModalClose.addEventListener("click", closeModalViewer);
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !viewerModal.hidden) closeModalViewer();
+});
+
 function renderDesign(design) {
   designResult.hidden = false;
 
@@ -776,18 +852,30 @@ function renderDesign(design) {
     reviewBanner.hidden = true;
   }
 
-  // In-photo ghost first ("In your photo"), when the API produced one. The
-  // cache-buster keeps a re-generated design from showing a stale image.
+  // In-photo ghost ("In your photo"), with a with/without-part toggle when the
+  // API produced both the composite and the plain photo. Cache-buster avoids a
+  // stale image after a re-generate.
+  const t = Date.now();
   const compositeUrl = design.files.composite;
+  const photoUrl = design.files.photo;
   if (compositeUrl) {
-    designCompositeImg.src = `${compositeUrl}?t=${Date.now()}`;
+    compositeSources = {
+      with: `${compositeUrl}?t=${t}`,
+      without: photoUrl ? `${photoUrl}?t=${t}` : null,
+    };
+    setCompositeView("with");
     compositeFigure.hidden = false;
+    document.getElementById("composite-toggle-without").hidden = !photoUrl;
   } else {
+    compositeSources = { with: null, without: null };
     designCompositeImg.removeAttribute("src");
     compositeFigure.hidden = true;
   }
 
-  designPreviewImg.src = `${design.files.preview_png}?t=${Date.now()}`;
+  // "The part": interactive 3D model (orbit/zoom/pan) + a dimensioned image.
+  designPreviewImg.src = `${design.files.preview_png}?t=${t}`;
+  currentStlUrl = design.files.stl;
+  showPartView("3d");
 
   // Param summary table (value + source), built with DOM nodes.
   designParamsTable.innerHTML = "";

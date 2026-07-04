@@ -44,6 +44,79 @@ async function downloadFile(url, filename) {
   }
 }
 
+// --- Per-card view: dimensioned render, in-photo composite (with/without the
+// model), and an interactive 3D viewer (loaded WITH the founder token so a
+// pending design's STL works). At most one inline card viewer + one modal are
+// live at a time, to keep WebGL contexts bounded.
+let dashViewer = null;
+let dashModal = null;
+
+function buildCardView(record) {
+  const f = record.files;
+  const wrap = el("div", { className: "review-view" });
+  const box = el("div", { className: "review-view-box" });
+  const img = el("img", { alt: "Part view" });
+  const viewer = el("div", { className: "viewer3d" });
+  viewer.style.display = "none";
+  box.append(img, viewer);
+  const bar = el("div", { className: "view-toggle" });
+
+  const sources = [];
+  if (f.composite) sources.push(["With part", `${f.composite}?t=${Date.now()}`]);
+  if (f.photo) sources.push(["Photo only", `${f.photo}?t=${Date.now()}`]);
+  if (f.preview_png) sources.push(["Dimensions", `${f.preview_png}?t=${Date.now()}`]);
+  img.src = (sources[0] || [null, ""])[1];
+
+  const clearActive = () => [...bar.querySelectorAll(".seg")].forEach((b) => b.classList.remove("active"));
+  const flatBtns = sources.map(([label, src], i) => {
+    const b = el("button", { type: "button", className: "seg", textContent: label });
+    b.addEventListener("click", () => {
+      if (dashViewer) { dashViewer.dispose(); dashViewer = null; }
+      viewer.style.display = "none";
+      img.style.display = "";
+      img.src = src;
+      clearActive();
+      b.classList.add("active");
+    });
+    if (i === 0) b.classList.add("active");
+    bar.append(b);
+    return b;
+  });
+
+  if (f.stl) {
+    const b3d = el("button", { type: "button", className: "seg", textContent: "3D" });
+    b3d.addEventListener("click", () => {
+      if (dashViewer) dashViewer.dispose();
+      img.style.display = "none";
+      viewer.style.display = "";
+      clearActive();
+      b3d.classList.add("active");
+      Vulcan3D.create(viewer, f.stl, { token: founderToken(), fallbackImg: f.preview_png }).then((v) => (dashViewer = v));
+    });
+    bar.append(b3d);
+    const exp = el("button", { type: "button", className: "expand-btn", textContent: "⛶ Expand" });
+    exp.addEventListener("click", () => openCardModal(f.stl));
+    bar.append(exp);
+  }
+
+  wrap.append(bar, box);
+  return wrap;
+}
+
+function openCardModal(stlUrl) {
+  const modal = document.getElementById("viewer-modal");
+  modal.hidden = false;
+  if (dashModal) dashModal.dispose();
+  Vulcan3D.create(document.getElementById("viewer-modal-stage"), stlUrl, {
+    token: founderToken(),
+  }).then((v) => (dashModal = v));
+}
+
+document.getElementById("viewer-modal-close").addEventListener("click", () => {
+  document.getElementById("viewer-modal").hidden = true;
+  if (dashModal) { dashModal.dispose(); dashModal = null; }
+});
+
 // Escape only the tag-injection characters, then color a few token classes. Not
 // escaping quotes keeps the string regex simple; <>& are escaped so untrusted
 // code can never inject markup into the founder's browser.
@@ -115,14 +188,9 @@ function renderCard(record) {
 
   card.append(el("p", { className: "review-dfm" }, [el("strong", {}, "DFM: "), dfmLine(record.dfm)]));
 
-  // Render (preview is always viewable, even while pending).
-  if (record.files && record.files.preview_png) {
-    card.append(
-      el("div", { className: "review-render" }, [
-        el("img", { src: `${record.files.preview_png}?t=${Date.now()}`, alt: "Generated part render" }),
-      ])
-    );
-  }
+  // The part: dimensioned render, the in-photo composite (with/without model),
+  // and an interactive 3D viewer — the founder can fly around the model.
+  if (record.files) card.append(buildCardView(record));
 
   // Params.
   if (record.params && record.params.length) {
@@ -203,6 +271,7 @@ async function load() {
     const resp = await fetch(`/review?status=${filterEl.value}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const records = await resp.json();
+    if (dashViewer) { dashViewer.dispose(); dashViewer = null; } // cards are about to be replaced
     listEl.innerHTML = "";
     countEl.textContent = `${records.length} item(s)`;
     if (!records.length) {

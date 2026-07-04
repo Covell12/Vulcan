@@ -106,6 +106,10 @@ non-expert can follow: what it does, why it exists, what talks to it).
   the module docstring and the UI. The camera math (`pinhole_project`, `transform_to_camera`,
   `canonical_rotation`, `focal_px`) is split out as pure functions and unit-tested against
   analytic cases. `api/intents.py`'s design join calls `render_composite` best-effort.
+  **3D-viewer follow-up:** `render_composite` now also saves the plain (EXIF-corrected,
+  downscaled) photo as `photo.png` next to the composite, and the design join returns it as
+  `files.photo`, so the UI can toggle the part in/out of the picture (photo with vs. without
+  the model) — most useful on the founder review dashboard.
 - **api/templates.py** (M2, refactored M3) — Defines `GET /templates`, which describes
   every registered template's parameter form (name, type, min/max, choices, default,
   description) so the web UI can build the right form for whichever template the user
@@ -486,6 +490,14 @@ sandbox; every freeform design requires founder review before its files can ship
   two-way live binding: typing in a measurement input updates its chip immediately (with unit
   conversion, as a no-✓ pending value); clicking a chip focuses its input; a submitted answer
   re-renders every chip from the server response.
+  **3D-viewer follow-up (dashboard):** each review card now has a `buildCardView` view-box with
+  a segmented toggle — "With part" (the composite), "Photo only" (the plain `photo.png`),
+  "Dimensions" (the render), a "3D" button that mounts the interactive model, and "⛶ Expand"
+  for a fullscreen modal. The 3D and modal viewers fetch the STL WITH the founder token
+  (`Vulcan3D.create(..., { token: founderToken() })`), so a pending design's mesh loads even
+  though its downloads are gated; at most one inline viewer + one modal viewer exist at a time
+  (each mount disposes the previous, and a list reload disposes the inline one) to stay well
+  under the browser's WebGL-context limit.
 
 
 - **web/index.html** — **M3:** now two tabs. "Start with a photo" (the new default) is
@@ -498,7 +510,22 @@ sandbox; every freeform design requires founder review before its files can ship
   **M5.5:** the result panel leads with two side-by-side views — the in-photo ghost
   ("In your photo") and the dimensioned render ("The part") — in a `#design-views` grid;
   the ghost figure is hidden when the API returns no composite (the lone render then
-  doesn't stretch, via a `:has()` rule in the CSS).
+  doesn't stretch, via a `:has()` rule in the CSS). **3D-viewer follow-up:** the "In your
+  photo" figure gains a "With part / Photo only" toggle, and "The part" figure swaps its
+  static render for a live `#viewer3d-part` (drag-orbit / scroll-zoom / right-drag-pan) with
+  a "3D / Dimensions" toggle and an "⛶ Expand" button; a shared `#viewer-modal` provides the
+  fullscreen viewer. It loads the vendored Three.js stack + `viewer3d.js` before the app JS.
+- **web/viewer3d.js + web/vendor/{three.min.js,STLLoader.js,OrbitControls.js}** — The
+  interactive 3D model viewer and its vendored dependencies (Three.js r128 UMD + the matching
+  STLLoader/OrbitControls, which attach to the global `THREE`). Vendored, not CDN-loaded, so
+  the test UI keeps working offline with no build step (CLAUDE.md). `Vulcan3D.create(container,
+  stlUrl, { token, fallbackImg })` fetches the STL (optionally with the founder `X-Review-Token`
+  so a gated pending design still renders on the dashboard), parses it, stands the CAD Z-up part
+  up, and drives a damped-orbit WebGL scene with framing to the bounding box; it returns a handle
+  with `dispose()` (cancels the RAF, disconnects the ResizeObserver, frees the GL context and
+  removes the canvas) and `resetView()`. If the library or the fetch fails (e.g. a 403 on a gated
+  STL with no token), it shows `fallbackImg` (the render) instead — so the customer panel, which
+  has no token, degrades gracefully for pending freeform parts.
 - **web/units.js** (M5) — The ONE place lengths are converted (CLAUDE.md rule 4). Pure
   helpers: `toMm(value, unit)` (mm/cm/in → mm), `formatDual` ("8 in = 203.2 mm"), and a
   session-remembered unit (`get/setSessionUnit`). Internal units stay mm everywhere; this
@@ -545,13 +572,21 @@ sandbox; every freeform design requires founder review before its files can ship
   touches the raw template form. **M5.5:** `renderDesign` also fills the "In your photo"
   ghost image from `files.composite` (with a cache-buster) when present and hides that
   figure when it's absent, so a re-generated design never shows a stale composite.
+  **3D-viewer follow-up:** `renderDesign` records `compositeSources = {with: composite,
+  without: photo}` and wires the "With part / Photo only" toggle (`setCompositeView`), and it
+  mounts the interactive model via `showPartView`/`mountPartViewer` (`Vulcan3D.create`), with
+  the "3D / Dimensions" toggle, the "⛶ Expand" modal, and Escape-to-close; switching away from
+  3D or re-rendering disposes the prior viewer so only one WebGL context is live at a time.
 - **web/style.css** — Styling for the test UI. **M3:** tab styling, the photo/canvas/SVG
   overlay layout, question rows, the IntentSpec JSON display. **M4:** the `.mismatch-card`
   / `.reconfirm-btn` cross-check styles. **M5:** the `.measure-field` (input + unit
   selector + dual display), the `#design-result` layout, the `#design-params-table` with
   colored source badges, and the design download links. **M5.5:** the two-up `#design-views`
   grid (`.design-view` figures with captions), which collapses to one column when the
-  composite is hidden (`:has()`) or on narrow screens.
+  composite is hidden (`:has()`) or on narrow screens. **3D-viewer follow-up:** the `.viewer3d`
+  canvas box (gradient bg, grab cursor), the `.view-toggle` segmented control (`.seg`/`.seg.active`,
+  `.expand-btn`), the fullscreen `#viewer-modal` + `.viewer-modal-bar`, the `.viewer-fallback`
+  image/message, and the dashboard `.review-view` / `.review-view-box`.
 
 ## tests/ (M1, extended M2, M3, M4, M5, M5.5, and M-B)
 

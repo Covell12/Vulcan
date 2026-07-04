@@ -521,6 +521,102 @@ textarea {
   max-height: 460px;
 }
 
+/* --- Interactive 3D model viewer + view toggles (M7 follow-up) --- */
+.viewer3d {
+  width: 100%;
+  height: 360px;
+  cursor: grab;
+  border-radius: 6px;
+  background: linear-gradient(180deg, #f3f5f9 0%, #e7eaf1 100%);
+}
+.viewer3d:active {
+  cursor: grabbing;
+}
+.viewer3d canvas {
+  display: block;
+  border-radius: 6px;
+  touch-action: none;
+}
+.viewer-fallback,
+.viewer-fallback-img {
+  width: 100%;
+}
+.viewer-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  font-size: 14px;
+}
+.viewer-fallback-img {
+  max-height: 360px;
+  object-fit: contain;
+}
+
+.view-toggle {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.seg {
+  margin: 0;
+  padding: 5px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  background: #eef0f4;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.seg.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.expand-btn {
+  margin: 0 0 0 auto;
+  padding: 5px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.expand-btn:hover {
+  background: #eef2ff;
+}
+
+/* Fullscreen expanded viewer. */
+#viewer-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: #0e1220;
+  display: flex;
+  flex-direction: column;
+}
+.viewer-modal-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 18px;
+  color: #cbd2e0;
+  font-size: 14px;
+}
+#viewer-modal-close {
+  margin: 0;
+  background: #2a3350;
+}
+#viewer-modal-stage {
+  flex: 1;
+  height: auto;
+  border-radius: 0;
+  background: transparent;
+}
+
 .design-view figcaption {
   font-size: 13px;
   color: var(--muted);
@@ -733,6 +829,26 @@ td.src-default {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #fafbfc;
+}
+
+.review-view {
+  margin: 10px 0;
+}
+.review-view-box {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fafbfc;
+  padding: 6px;
+  max-width: 520px;
+}
+.review-view-box img {
+  max-width: 100%;
+  max-height: 340px;
+  display: block;
+  margin: 0 auto;
+}
+.review-view-box .viewer3d {
+  height: 320px;
 }
 .review-params {
   width: 100%;

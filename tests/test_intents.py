@@ -1119,6 +1119,13 @@ def test_join_produces_fetchable_composite(cleanup_intents: list[str]):
         resp = client.get(body["files"]["composite"])
         assert resp.status_code == 200
         assert len(resp.content) > 0
+
+        # The composite step also writes the plain photo next to it, so the UI
+        # can toggle the part in/out of the picture (with vs. without model).
+        assert "photo" in body["files"], body["files"]
+        photo_resp = client.get(body["files"]["photo"])
+        assert photo_resp.status_code == 200
+        assert len(photo_resp.content) > 0
     finally:
         shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
 
