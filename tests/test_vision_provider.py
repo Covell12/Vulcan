@@ -390,14 +390,13 @@ def test_no_other_module_imports_provider_sdks():
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     pattern = re.compile(r"^\s*(import (openai|anthropic)\b|from (openai|anthropic)\b)")
+    # Both LLM-provider seams legitimately import these SDKs: the vision parser
+    # and (Track B) the freeform code generator. Nothing else may.
+    allowed = {"vision_provider.py", "codegen_provider.py", "test_vision_provider.py"}
     offenders = []
 
     for path in repo_root.rglob("*.py"):
-        if (
-            ".venv" in path.parts
-            or path.name == "vision_provider.py"
-            or path.name == "test_vision_provider.py"
-        ):
+        if ".venv" in path.parts or path.name in allowed:
             continue
         for lineno, line in enumerate(path.read_text().splitlines(), start=1):
             if pattern.match(line):
@@ -405,6 +404,7 @@ def test_no_other_module_imports_provider_sdks():
                     f"{path.relative_to(repo_root)}:{lineno}: {line.strip()}"
                 )
 
-    assert (
-        not offenders
-    ), "only api/vision_provider.py may import a provider SDK:\n" + "\n".join(offenders)
+    assert not offenders, (
+        "only api/vision_provider.py and api/codegen_provider.py may import a "
+        "provider SDK:\n" + "\n".join(offenders)
+    )

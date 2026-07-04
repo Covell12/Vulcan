@@ -57,6 +57,18 @@ template_id=null. If the request is clearly out of scope (larger than roughly \
 250x250x250mm, structural/load-bearing beyond a shelf bracket, automotive, medical, \
 electrical, or otherwise unsafe to 3D print), set status="out_of_scope", \
 category="other", template_id=null, and explain briefly in out_of_scope_reason.
+1a. BE HONEST ABOUT FIT — shoehorning a request into a template that can't really make \
+it is WORSE than admitting "other" (a freeform designer will handle the long tail). \
+Set template_fit (0-1): how well the chosen template can ACTUALLY express this exact \
+part, not just the rough category. A shelf bracket template makes a plain L-bracket; it \
+CANNOT make a hole grid/pattern, a curved/organic profile, embossed text, multiple \
+separate bodies, or a hinge/clamp/joint. List every such needed-but-unsupported feature \
+in unsupported_features[] (short phrases like "hole grid", "curved profile", \
+"two mating pieces", "hinge"). If the template can't really do it, prefer \
+template_id=null + category="other" with template_fit=null. Even when you DO pick a \
+template, if its fit is poor (below ~0.65) or unsupported_features is non-empty, say so \
+honestly — the system will offer the user a custom design instead. When template_id is \
+null, set template_fit=null.
 2. If you picked a template, propose one dimensions[] entry for EVERY numeric \
 millimeter parameter that template's "params" list describes (use the exact param \
 name, e.g. "span_mm", as the dimension's "name"). Estimate each value_mm as best you \
@@ -69,13 +81,34 @@ if it looks obvious. Set critical=true exactly for the param names listed as \
 3. For EVERY dimension you marked critical=true, add one entry to questions[] asking \
 the user to actually measure it (kind="measure_mm", dim_name set to that dimension's \
 name, a clear one-sentence prompt e.g. "How far does the shelf need to stick out from \
-the wall, in mm?"). Include an overlay on the most relevant photo: shape "arrow" or \
-"circle", pointing at (or circling) roughly where on the photo that measurement should \
-be taken, using normalized [x, y] coordinates in [0, 1] (x=0 is the left edge of the \
-photo, y=0 is the top). Use photo_index to say which photo (0-indexed) the overlay is \
-on. It's fine to also ask non-dimension clarifying questions (kind="choice" or \
-"confirm") if something is genuinely ambiguous, but every critical dimension MUST get \
-a question.
+the wall, in mm?"). \
+OVERLAY — draw a DIMENSION LINE on the photo for this measurement (be careful; a marker \
+in the wrong place is worse than none): add an overlay ONLY when you can actually SEE and \
+confidently locate that feature; if you would just be guessing where it is, set overlay \
+to null. Choose the "kind" that matches the measurement: \
+(a) kind="dim_line" for a straight linear measurement in the plane of the photo (a span, \
+width, length, height) — set "points" to exactly the TWO [x,y] endpoints of the distance \
+being measured. \
+(b) kind="dim_ellipse" for a DIAMETER of a round feature (a hole, a knob, a pipe end). A \
+circle viewed from an angle looks like an ellipse, so set "center" ([x,y] of the round \
+feature), "rx" (horizontal radius as a fraction of image WIDTH), "ry" (vertical radius, \
+also a fraction of image WIDTH — equal to rx if seen head-on, smaller than rx when seen \
+in perspective), and "rotation" in degrees. Every diameter question on a round thing MUST \
+use dim_ellipse, NOT dim_line. \
+(c) kind="dim_depth" for a measurement that RECEDES away from the camera (into the scene) \
+— set the two "points" endpoints; it is drawn dashed and foreshortened. \
+Do NOT set a text/value on the overlay — the UI fills the label from the dimension's own \
+state (?, ~estimate, or measured). If the user circled/traced a region (their \
+annotation), place the overlay on it. Coordinates are normalized [x, y] in [0, 1]: [0,0] \
+is TOP-LEFT, [1,1] bottom-right; keep every point inside [0, 1] and sanity-check it lands \
+on the object you mean. Use photo_index for which photo (0-indexed) the overlay is on. \
+Every measure_mm question MUST set dim_name to the exact name of \
+the template param it measures — and when a template is chosen, ONLY ask measure_mm \
+questions for that template's own numeric mm params. Do NOT invent extra measurements \
+that aren't template params (e.g. "distance from the wall to the faucet" on a knob) — \
+they don't map to anything and just add noise. It's fine to also ask non-dimension \
+clarifying questions (kind="choice" or "confirm") if something is genuinely ambiguous, \
+but every critical dimension MUST get a question.
 3a. For each NON-numeric enum/boolean template param you can sensibly let the user pick \
 (e.g. screw_size, load_hint, grip_style, shaft_type, taper, pointer), emit a \
 kind="choice" question: set dim_name to that param's EXACT name, choices to its allowed \

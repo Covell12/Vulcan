@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Vulcan — Founder review</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Vulcan — Founder review</h1>
+    <p class="tagline">
+      Every custom (freeform) design lands here. Downloads stay locked until you approve.
+    </p>
+  </header>
+
+  <main class="review-main">
+    <div class="review-toolbar">
+      <label>
+        Show
+        <select id="review-filter">
+          <option value="pending" selected>Pending only</option>
+          <option value="all">All</option>
+        </select>
+      </label>
+      <button id="review-refresh" type="button">Refresh</button>
+      <span id="review-count"></span>
+    </div>
+    <p id="review-status"></p>
+    <div id="review-list"></div>
+  </main>
+
+  <script src="/review.js"></script>
+</body>
+</html>

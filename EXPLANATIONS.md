@@ -37,7 +37,12 @@ non-expert can follow: what it does, why it exists, what talks to it).
   question items gained `suggested_value` (the vision provider's recommended value for a
   choice/enum param) and `chosen_value` (filled when the user answers a choice) — both
   nullable strings, so the OpenAI strict-schema transform stays compliant. These carry
-  enum-param decisions through to the intent→design join.
+  enum-param decisions through to the intent→design join. **M7:** added top-level
+  `template_fit` (0-1, how well the matched template can actually make the part) and
+  `unsupported_features[]` (things the request needs the template can't express) to drive
+  freeform routing; and the question `overlay` gained the dimension-line `kind`s
+  (`dim_line`, `dim_ellipse` with center/rx/ry/rotation for diameters seen in perspective,
+  `dim_depth`) — the legacy `shape` (arrow/circle/line) is kept for backward compatibility.
 
 ## docs/
 
@@ -58,7 +63,10 @@ non-expert can follow: what it does, why it exists, what talks to it).
   default), so depth stays fully optional, but a fail-fast if `DEPTH_PROVIDER=replicate`
   without a token. The hook only fires on a real ASGI startup (uvicorn, or
   `with TestClient(app) as c:`), never a plain `TestClient(app)`, so it can't get in the
-  way of tests that mock the providers and don't have real keys.
+  way of tests that mock the providers and don't have real keys. **M-B:** includes the
+  `review` router BEFORE the `/exports` mount (so its gated download route takes precedence
+  over the static files), and imports `api.freeform` for its side effect (registering the
+  ephemeral-template rehydration loader on `templates_lib.registry`).
 - **api/photo.py** (M4) — The tiny `PhotoInput` container (bytes + mime type) shared by
   both provider seams. Lives in its own neutral module so `api/vision_provider.py` and
   `api/depth_provider.py` can both accept the same type without importing each other;
@@ -71,7 +79,12 @@ non-expert can follow: what it does, why it exists, what talks to it).
   solid, computes the preview's dimension callouts from the template's `callouts_fn` (labelling
   each with its value + a source marker — measured ✓ / suggested ~ / default — from the
   optional `source_map`), exports STEP/3MF/STL + the annotated PNG, and returns a design_id
-  plus URLs. Bad params or an unknown template_id come back as a clear 4xx error. **M5.5 —
+  plus URLs. Bad params or an unknown template_id come back as a clear 4xx error. **M-B:**
+  `_produce_files` dispatches by spec type — Track A templates build a solid in-process and
+  export it; freeform (`EphemeralTemplateSpec`) templates build in the sandbox subprocess
+  (their code never runs in-process) and the preview is rendered here from the sandbox's STL.
+  Both return the same file dict, so the runtime manifold gate and URL construction are
+  identical for both. **M5.5 —
   runtime manifold gate:** right after export it re-checks the actually-written STL with
   `rendering.mesh_is_watertight`; a non-watertight (unprintable) mesh is refused with a 500
   and its half-baked export directory is deleted, so no unbuildable STL/STEP can ever be
@@ -125,6 +138,24 @@ non-expert can follow: what it does, why it exists, what talks to it).
   NOT this module's job — see `api/intents.py`. **M4 fix:** every SDK call AND every
   response-parse step (empty content, unexpected shape, non-JSON body) is now wrapped so
   the ONLY exception that can escape this module is `VisionProviderError`, carrying a
+  human-readable cause. **Overlay guidance (tightened):** the SYSTEM_PROMPT tells the
+  model to add a question's photo overlay ONLY when it can actually locate the feature —
+  set `overlay` to null rather than emit a misplaced marker (LLMs localize in 2D poorly,
+  and a wrong arrow misleads more than none) — to prefer a `circle` at the feature's
+  center (the UI draws a generous ring, so pixel precision isn't needed), to make
+  arrow/line endpoints the real points whose distance IS the measurement, and to anchor
+  overlays on the user's own annotated region when one was provided. This keeps the
+  red-circle/arrow guides but reduces the "confidently wrong" placements. The prompt also
+  now requires every `measure_mm` question to set `dim_name` to a template param and to
+  ONLY ask about the chosen template's own numeric params (no invented extra measurements)
+  — `api/intents.py` still handles the stragglers, but this reduces them at the source.
+  **M7:** the prompt now demands routing honesty — it sets `template_fit` (0-1) and lists
+  `unsupported_features` the template can't express, and is told that shoehorning a bad fit
+  is worse than admitting "other" (fixing the greedy router). The overlay instructions were
+  replaced: each critical measurement emits a DIMENSION-LINE overlay of the right `kind`
+  (`dim_line` for a linear span, `dim_ellipse` — center/rx/ry/rotation — for a diameter of a
+  round thing seen in perspective, `dim_depth` for a receding measurement), with no value on
+  the overlay (the UI fills the label from the dimension's own honest state).
   human-readable cause (auth / quota / rate-limit / model-not-found / bad-image /
   network — mapped from the exception's `status_code` + message by `_humanize_provider_error`
   without importing any SDK's error classes). That guarantees `api/intents.py` can always
@@ -164,7 +195,18 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `source="user_measured"`⁠) from scratch every time the IntentSpec changes, rather than
   ever trusting the provider's own opinion of either. If a critical dimension or its
   question is missing from the provider's output entirely, this function synthesizes
-  them rather than silently allowing the gate to be skipped. Persists intents as one
+  them rather than silently allowing the gate to be skipped. Relatedly,
+  `_ensure_measure_question_dimensions` gives EVERY `measure_mm` question a usable
+  `dim_name` + a matching (non-critical) dimension: vision models sometimes ask the user
+  to measure something with a `dim_name` that's absent from `dimensions[]` (e.g.
+  `gap_wall_to_tap_mm`) or with no `dim_name` at all (an invented extra measurement like
+  `q_wall_to_faucet_center`) — both used to 422 when answered. Missing names are derived
+  from the question id via `_derive_dim_name` (`q_wall_to_faucet_center` →
+  `wall_to_faucet_center_mm`) and the dimension is synthesized; `_apply_answer` does the
+  same derivation/creation on demand as a backstop for older stored intents. (The vision
+  prompt was also tightened to only ask measure_mm questions for the template's own
+  numeric params, so these invented measurements are rarer at the source.) Persists
+  intents as one
   JSON file per intent under `data/intents/<intent_id>.json` — no database yet, per
   CLAUDE.md. Answers can be `measure_mm` (sets `value_mm`+`source=user_measured`),
   `confirm` (accepts an already-assumed value as measured), or `choice` (v0 scope: only
@@ -209,6 +251,21 @@ non-expert can follow: what it does, why it exists, what talks to it).
   deadline (M5.5 review): with `DEPTH_PROVIDER=replicate` that lookup is a synchronous network
   call, and the deadline guarantees a slow/stalled depth backend can never make the design
   join hang on a *preview* (under the default `none` it returns instantly and never waits).
+  **M-B (Track B):** `POST /intents` now stores the raw `request_text` and flags
+  `freeform_available` when no template fits (in scope, no template_id). `POST
+  /intents/{id}/freeform` runs `freeform.generate_and_register` on the stored photos + request
+  (clean 502 if the codegen provider isn't configured), and on success adopts the generated
+  ephemeral template so the SAME critical-dim gate synthesizes its measure questions; on
+  failure it returns the intent with an honest `freeform_error` (the request is already logged
+  to the demand log). The join, for a freeform intent, writes a `pending_review` design record
+  (api/design_store) so it lands in the founder queue with downloads gated (api/review).
+  **M7 (Part A routing fix):** `_apply_freeform_routing` sets `freeform_available` (true for
+  any in-scope request — the always-on override) and `freeform_recommended` (true when no
+  template matched, `template_fit` < 0.65, or any `unsupported_features`) so the greedy router
+  no longer rides a bad-fit template silently. `POST /intents/{id}/freeform` is now the
+  always-available user OVERRIDE too: it no longer 409s when a template already matched —
+  instead the generated template REPLACES it, and the old template's dimensions/questions are
+  cleared so the gate synthesizes a clean set for the custom design.
 - **api/rendering.py** — Takes a finished CadQuery solid and writes it to disk in every
   format the rest of the product needs: STEP (for manufacturing/slicing), 3MF and STL
   (for 3D printing), and a PNG preview. The preview is rendered by loading the exported
@@ -227,7 +284,75 @@ non-expert can follow: what it does, why it exists, what talks to it).
   face) renders instead of crashing matplotlib's projection — the manifold gate is what then
   rejects such a part, with a clean message rather than a traceback from the preview step.
 
-## templates_lib/ (M1, extended M2, M3, and M5)
+### Track B — freeform generation (M-B)
+
+Track B lets the LLM AUTHOR a one-off parametric template when no registry template fits.
+Everything flows through the EXISTING machinery: the generated artifact becomes a
+dynamically-registered template, so the same intent flow (questions → user_measured gate →
+join → runtime manifold gate) builds it. Generated code is untrusted and executed ONLY in a
+sandbox; every freeform design requires founder review before its files can ship.
+
+- **api/code_verifier.py** (M-B) — The first, most important safety layer: a static AST check
+  on model-authored code. Leaf module (imports only `ast`) so the API and the sandbox
+  subprocess can both use it. Allows imports of ONLY `cadquery`/`math`/`numpy` and a
+  `build(params)` entrypoint; rejects (collecting EVERY violation, for good feedback) any
+  other import, `exec`/`eval`/`compile`/`open`/`__import__`/`getattr`-style names, and any
+  dunder-attribute/name access (`__globals__`, `__subclasses__`, `__builtins__`, …) — the
+  classic escape vectors. Fails closed. It is static analysis, not a full sandbox — layered
+  with runtime guards + OS isolation below.
+- **api/sandbox.py** (M-B) — The containment boundary. `run_generated_build(code, params,
+  out_dir)` verifies the code, then runs it in a SEPARATE `python -I` subprocess (isolated
+  mode) with a hard wall-clock timeout, OS resource limits (CPU/file-size/#files/#procs via
+  setrlimit), stdin/stdout/stderr on /dev/null, and an environment scrubbed of secrets. The
+  subprocess exports STEP/STL/3MF into its own temp dir; only those geometry files are copied
+  back — no generated Python re-enters the API process. Build failures (bad geometry, timeout)
+  come back as `SandboxResult(ok=False, stage=...)` (never an exception) so the self-repair
+  loop can learn from them. Honest limitation, documented in the module + security notes: this
+  is static-analysis + process-isolation + rlimits, NOT a syscall jail (no container/seccomp);
+  on macOS some rlimits aren't enforced (the timeout is the primary bound there).
+- **api/_sandbox_runner.py** (M-B) — The tiny script that runs INSIDE that subprocess (never
+  imported into the API process). Re-verifies the code (defense in depth), then `exec`s it in
+  a locked-down namespace — a guarded `__import__` admitting only cadquery/math/numpy and
+  builtins with `open`/`eval`/`exec`/`compile` removed — calls `build(params)`, exports the
+  three formats, and writes `result.json`. The untrusted code's stdout/stderr are silenced.
+- **api/codegen_provider.py** (M-B) — The code-generation seam (same shape as
+  `vision_provider`/`depth_provider`): `generate_template(request, photos, dims_hints,
+  retry_feedback=None)` returns `{cadquery_code, param_schema, assumptions, critical_dims}`.
+  Backend chosen by `CODEGEN_PROVIDER` (openai|anthropic, default openai), `CODEGEN_MODEL`
+  override. THE ONLY module besides `vision_provider` allowed to import openai/anthropic (the
+  isolation grep test now permits both). The system prompt states the DFM rules (min wall
+  2.4mm, 250mm ceiling, FDM constraints) and shows two exemplar templates as style references;
+  the output uses a hand-authored strict JSON schema, and `param_schema` matches
+  `form_fields_for()`'s shape. Does NOT execute or DFM-check code — that's freeform's job.
+- **api/freeform.py** (M-B) — Orchestrates generation: normalizes the model's param_schema and
+  builds a pydantic params model from it (`create_model`, with ge/le bounds + Literal enums),
+  verifies the code, TEST-BUILDS it in the sandbox with default params, and runs the DFM gate
+  (`dfm_check`: manifold + size ceiling; min-wall is prompt-guided + founder-reviewed, not
+  auto-verified — stated in the security notes). SELF-REPAIR loop: any failure (unsafe code,
+  sandbox error, timeout, DFM) retries generation up to 2 more times with the error appended;
+  all failing → append to the demand log and return failure. On success it persists
+  code+schema+provenance under `data/generated_templates/<id>/` and registers an
+  `EphemeralTemplateSpec`. Also rehydrates a stored template on a registry miss after a
+  restart (wired via `registry.set_ephemeral_loader`), and owns `log_demand`.
+- **api/design_store.py** (M-B) — One JSON record per freeform design under `data/designs/`
+  (request, generated code, resolved params, DFM results, files, and the founder's verdict +
+  note). Only freeform designs get a record; Track A designs don't (so they're never gated).
+  This record set is also the templatization-mining corpus.
+- **api/review.py** (M-B) — The founder review queue + the download gate. `GET /review`
+  lists records (pending by default), `POST /review/{id}` records an approve/reject verdict +
+  note. `GET /exports/{id}/{file}` is the gated download route — registered BEFORE the static
+  `/exports` mount so it takes precedence — that returns 403 for a freeform design's CAD files
+  (STEP/STL/3MF) until its record is `approved`; the preview PNG is always served, and Track A
+  files (no record) pass straight through. **Security-review hardening:** there is NO static
+  `/exports` mount (it let gated files leak under non-canonical spellings); this is the ONLY
+  export route, it case-folds the gated-file check and rejects non-canonical paths (so
+  `PART.STL`/trailing-slash/`//`/`.` can't slip a gated file out), and `POST /review/{id}`
+  requires the `X-Review-Token` header when `VULCAN_REVIEW_TOKEN` is set (so downloads can't be
+  self-approved). The AST verifier was also hardened (see api/code_verifier.py) after a
+  red-team pass found a submodule-attribute escape, and the sandbox now SIGKILLs the child's
+  whole process group on timeout.
+
+## templates_lib/ (M1, extended M2, M3, M5, and M-B)
 
 - **templates_lib/__init__.py** (M2) — Importing this package registers every template.
   Each template module registers itself as a side effect of being imported; this file's
@@ -247,7 +372,13 @@ non-expert can follow: what it does, why it exists, what talks to it).
   on `TemplateSpec` — each template declares its own preview dimension arrows (which param,
   the two 3D endpoints in part coords, a label), which `api/designs.py` resolves to
   labeled callouts for the honest preview. `register_template` / `get_template` /
-  `all_templates` are the whole API.
+  `all_templates` are the whole API. **M-B (Track B):** added `EphemeralTemplateSpec` (a
+  TemplateSpec subclass carrying the generated `code`) and a SEPARATE ephemeral registry
+  (`register_ephemeral_template` / `_EPHEMERAL`) so freeform templates never pollute the
+  Track A catalog — `all_templates()` stays Track-A-only (GET /templates, the generic test
+  suite) while `get_template` resolves both, and on a miss calls an optional
+  `set_ephemeral_loader` hook so a stored freeform template rehydrates from disk after a
+  restart (keeps this leaf module free of any api-layer import).
 - **templates_lib/constants.py** (M2) — `MIN_WALL_MM` (2.4mm, the PETG-printable minimum
   from CLAUDE.md), factored out once a third template proved it was genuinely shared
   rather than bracket-specific. All three templates import it from here instead of each
@@ -303,7 +434,35 @@ non-expert can follow: what it does, why it exists, what talks to it).
   "shaft_depth_mm")`, per this milestone's instructions. **M5:** `knob_callouts` declares
   the knob-diameter, shaft-diameter, and shaft-depth preview arrows.
 
-## web/ (M1, rebuilt M2, extended M3, M4, M5, and M5.5)
+## web/ (M1, rebuilt M2, extended M3, M4, M5, M5.5, and M-B)
+
+- **web/review.html + web/review.js** (M-B) — The founder review page (served at
+  `/review.html`, distinct from the `GET /review` API). Lists freeform design records with a
+  pending/all filter; each card shows the request, the model's assumptions, the DFM/manifold
+  results, the render, the resolved params, and the generated code (lightly, XSS-safely
+  highlighted — only `<>&` are escaped, then token spans are added), with Approve/Reject
+  buttons + a note field. Verdicts `POST /review/{id}` and drive the download gate. **M-B
+  additions to the photo tab** (`web/index.html` + `web/intents.js` + `web/style.css`): when
+  `POST /intents` returns `freeform_available` with no template, a "Custom design" panel
+  offers "Design it for me" (calls `POST /intents/{id}/freeform`, shows generation progress,
+  then the standard questions/preview flow), honestly labelled "needs a human check before it
+  ships"; a freeform design's result shows a pending-review banner + the model's assumptions
+  and renders its CAD downloads as "🔒 locked until approved" (matching the server-side 403).
+  **M7 additions to the photo tab** (`web/index.html` + `web/intents.js` + `web/style.css`):
+  (Part A) an always-on "Design this custom instead" OVERRIDE inside the questions panel
+  (shown whenever freeform is available), with a recommend note listing the template's
+  `unsupported_features` when the router flagged a poor fit; the shared `runFreeform()` drives
+  both it and the no-template panel. (Part B) the question overlays are now proper DIMENSION
+  drawings on the photo: `drawDimOverlay` renders extension ticks + a line (or a perspective
+  ellipse for diameters, or a dashed foreshortened line for depth) into an SVG whose viewBox
+  is set to the image's rendered pixel size (so lines/ellipses/chips are 1:1 and undistorted),
+  with a label chip ON the line. The chip's state is HONEST and matches the source rules
+  everywhere else — "?" (unanswered, red), "~210mm" (a vision/depth estimate, amber, never
+  without the ~), "203.2mm ✓" (green, ONLY user_measured), or a mismatch showing both. It's a
+  two-way live binding: typing in a measurement input updates its chip immediately (with unit
+  conversion, as a no-✓ pending value); clicking a chip focuses its input; a submitted answer
+  re-renders every chip from the server response.
+
 
 - **web/index.html** — **M3:** now two tabs. "Start with a photo" (the new default) is
   the intent-parser flow. "Direct template params" is the M1/M2 flow — a template-picker
@@ -370,7 +529,46 @@ non-expert can follow: what it does, why it exists, what talks to it).
   grid (`.design-view` figures with captions), which collapses to one column when the
   composite is hidden (`:has()`) or on narrow screens.
 
-## tests/ (M1, extended M2, M3, M4, M5, and M5.5)
+## tests/ (M1, extended M2, M3, M4, M5, M5.5, and M-B)
+
+- **tests/test_code_verifier.py** (M-B) — Security tests for the AST safety gate: legitimate
+  CadQuery code passes; every escape shape is rejected — disallowed imports (os/sys/subprocess/
+  socket/relative), banned names (open/eval/exec/`__import__`/getattr/…), dunder-attribute
+  smuggling (`().__class__.__bases__[0].__subclasses__()`), dunder-name references, global/
+  nonlocal, a missing `build`, and syntax errors — and ALL violations are collected, not just
+  the first.
+- **tests/test_sandbox.py** (M-B) — Security + behavior tests for the containment boundary: a
+  valid build exports all three formats; the malicious cases (os import, file open, network
+  import, dunder smuggling) are rejected at the `verify` stage WITHOUT spawning the subprocess
+  and leave no side effects (e.g. no `touch`ed marker file); an infinite loop is killed by the
+  timeout; a runtime build error comes back as a `run`-stage error for self-repair.
+- **tests/test_codegen_provider.py** (M-B) — The codegen seam with both SDKs mocked at their
+  constructor: provider/model selection, the fail-fast key check, both adapters parsing a
+  mocked response into the same dict, and provider-error wrapping.
+- **tests/test_freeform.py** (M-B) — The orchestration with codegen mocked but the sandbox real:
+  param-schema normalization/coercion + labels, the pydantic model enforcing ge/le bounds,
+  first-try success (registered + persisted), the self-repair sequence (unsafe → bad build →
+  good, with retry_feedback threaded), an oversize part failing the DFM size gate, total
+  failure logging to the demand log, and disk rehydration after a simulated restart.
+- **tests/test_review.py** (M-B) — The full mocked freeform round trip over HTTP: create an
+  "other" intent → generate → measure the critical dims → join → `pending_review` record →
+  the download gate (CAD files 403 while pending, preview 200) → approve → files download;
+  plus reject-keeps-locked, generation-failure returns an honest error, freeform-409 when a
+  template already fits, review 404s, invalid-verdict 422, and Track A downloads staying
+  ungated. The `test_no_other_module_imports_provider_sdks` grep test (in
+  `tests/test_vision_provider.py`) was extended to also allow `codegen_provider.py`. **M7:**
+  the "already has a template" case is now `test_freeform_override_replaces_matched_template`
+  (freeform is the always-on override — it replaces the matched template and clears its dims).
+- **tests/test_routing.py** (M7 Part A) — Routing regression with the vision provider mocked:
+  8 canned intents (lego bridge plate, curved cable guide, hole-grid shelf, two-piece clamp
+  → freeform recommended; shelf bracket, tube adapter, knob, corner brace → stay on template)
+  assert `freeform_available`/`freeform_recommended` from `template_fit`/`unsupported_features`.
+  The real provider's routing on the same 8 is a live eval (reported in the milestone
+  write-up), which scored 8/8.
+- **tests/test_overlays.py** (M7 Part B) — Schema validation for the new overlay `kind`s
+  (dim_line/dim_ellipse/dim_depth all validate; legacy shapes still validate; a bogus kind is
+  rejected), plus a JS-free check that a mocked provider emitting the new kinds round-trips
+  through `POST /intents` with the overlays intact and still schema-valid.
 
 - **tests/test_bracket_shelf_l.py** — Tests the bracket template in isolation (no
   API/HTTP involved): every generated mesh is manifold for each `load_hint`, wall
@@ -473,7 +671,13 @@ non-expert can follow: what it does, why it exists, what talks to it).
   the annotation stored on the intent (round-trip asserted), the join returns a fetchable
   `files.composite` when a decodable photo is stored, and the join still succeeds and simply
   omits the composite when no photo is present. The cleanup fixture now also removes each
-  intent's photo directory.
+  intent's photo directory. **Also:** regression tests for the "dimension not found" / "no
+  dimension to measure" 422s — `_derive_dim_name` unit cases, a `measure_mm` question whose
+  dimension the provider omitted is answerable, one the provider gave no `dim_name` at all
+  (an invented `q_wall_to_faucet_center`) is answerable via a derived name, and a stored
+  intent predating the normalization is still answerable (`_apply_answer` creates the dim on
+  demand) — plus a deadline test for the ghost's bounded depth lookup (`_bounded_depth_mm_at`
+  returns None instead of blocking).
 - **tests/fixtures/intents/** (M3) — Ground-truth fixtures for `scripts/eval_intents.py`:
   `manifest.json` (fixture list: photos, text, optional annotation, ground-truth
   template_id/category/measured dimensions) + `photos/` + a `README.md` documenting the

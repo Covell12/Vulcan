@@ -961,6 +961,105 @@ def test_design_refuses_valueless_critical_dim(cleanup_intents: list[str]):
     assert "span_mm" in r.json()["detail"]
 
 
+def _measure_q(qid: str, dim: str) -> dict:
+    return {
+        "question_id": qid,
+        "dim_name": dim,
+        "prompt": f"{dim}?",
+        "kind": "measure_mm",
+        "choices": None,
+        "overlay": None,
+        "suggested_value": None,
+        "chosen_value": None,
+    }
+
+
+def test_measure_question_without_dimension_is_answerable(cleanup_intents: list[str]):
+    """Regression: a provider that emits a measure_mm question whose dim_name is
+    missing from dimensions[] must NOT dead-end the user with a 422. The gate
+    synthesizes the dimension at creation, and answering commits the value."""
+    variant = json.loads(json.dumps(BRACKET_INTENT))
+    variant["questions"].append(_measure_q("q_gap", "gap_wall_to_tap_mm"))
+
+    body = _create_intent(cleanup_intents, intent=variant)
+    # The gate synthesized the missing (non-critical) dimension.
+    gap = next(
+        (d for d in body["dimensions"] if d["name"] == "gap_wall_to_tap_mm"), None
+    )
+    assert gap is not None and gap["critical"] is False
+
+    updated = client.post(
+        f"/intents/{body['intent_id']}/answers",
+        json={"answers": [{"question_id": "q_gap", "measure_mm": 37.5}]},
+    )
+    assert updated.status_code == 200, updated.text
+    gap = next(
+        d for d in updated.json()["dimensions"] if d["name"] == "gap_wall_to_tap_mm"
+    )
+    assert gap["value_mm"] == 37.5 and gap["source"] == "user_measured"
+
+
+def test_derive_dim_name():
+    from api.intents import _derive_dim_name
+
+    assert _derive_dim_name("q_wall_to_faucet_center") == "wall_to_faucet_center_mm"
+    assert _derive_dim_name("reask-span_mm") == "span_mm"
+    assert _derive_dim_name("auto-shaft_dia_mm") == "shaft_dia_mm"
+    assert _derive_dim_name("Q_Weird Name!!") == "weird_name_mm"
+    assert _derive_dim_name(None) == "measurement_mm"
+    assert _derive_dim_name("") == "measurement_mm"
+
+
+def test_measure_question_with_null_dim_name_is_answerable(cleanup_intents: list[str]):
+    """Regression: a measure_mm question the provider invented with NO dim_name
+    (e.g. 'q_wall_to_faucet_center') must still be answerable — the gate derives
+    a dimension name from the question id and creates a backing dimension."""
+    variant = json.loads(json.dumps(BRACKET_INTENT))
+    q = _measure_q("q_wall_to_faucet_center", "unused")
+    q["dim_name"] = None  # provider left it null
+    variant["questions"].append(q)
+
+    body = _create_intent(cleanup_intents, intent=variant)
+    derived = "wall_to_faucet_center_mm"
+    assert any(d["name"] == derived for d in body["dimensions"])
+    q_out = next(
+        q for q in body["questions"] if q["question_id"] == "q_wall_to_faucet_center"
+    )
+    assert q_out["dim_name"] == derived  # persisted onto the question
+
+    updated = client.post(
+        f"/intents/{body['intent_id']}/answers",
+        json={
+            "answers": [{"question_id": "q_wall_to_faucet_center", "measure_mm": 150.0}]
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    dim = next(d for d in updated.json()["dimensions"] if d["name"] == derived)
+    assert dim["value_mm"] == 150.0 and dim["source"] == "user_measured"
+
+
+def test_stale_intent_missing_dim_is_answerable(cleanup_intents: list[str]):
+    """Defensive: even a persisted intent whose measure question predates the
+    gate normalization (no backing dimension) is answerable, not a 422 —
+    _apply_answer creates the dimension on demand."""
+    stale = json.loads(json.dumps(BRACKET_INTENT))
+    stale["intent_id"] = "staledim01"
+    stale["questions"].append(_measure_q("q_orphan", "orphan_mm"))
+    # Ensure there is NO backing dimension for orphan_mm.
+    assert not any(d["name"] == "orphan_mm" for d in stale["dimensions"])
+    INTENTS_DIR.mkdir(parents=True, exist_ok=True)
+    (INTENTS_DIR / "staledim01.json").write_text(json.dumps(stale))
+    cleanup_intents.append("staledim01")
+
+    r = client.post(
+        "/intents/staledim01/answers",
+        json={"answers": [{"question_id": "q_orphan", "measure_mm": 12.0}]},
+    )
+    assert r.status_code == 200, r.text
+    orphan = next(d for d in r.json()["dimensions"] if d["name"] == "orphan_mm")
+    assert orphan["value_mm"] == 12.0 and orphan["source"] == "user_measured"
+
+
 # ---------------------------------------------------------------------------
 # M5.5: photo persistence + the in-photo ghost composite
 # ---------------------------------------------------------------------------

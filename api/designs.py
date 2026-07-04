@@ -20,8 +20,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
-from api.rendering import export_design, mesh_is_watertight
-from templates_lib.registry import TemplateSpec, all_templates, get_template
+from api.rendering import export_design, mesh_is_watertight, render_preview
+from templates_lib.registry import (
+    EphemeralTemplateSpec,
+    TemplateSpec,
+    all_templates,
+    get_template,
+)
 
 router = APIRouter()
 
@@ -74,6 +79,59 @@ def _callout_dicts(
     return callouts
 
 
+def _produce_files(
+    spec: TemplateSpec,
+    params_obj: BaseModel,
+    design_dir: Path,
+    callouts: list[dict[str, Any]],
+) -> dict[str, Path]:
+    """Produce STEP/STL/3MF + preview for a design. Track A templates build a
+    solid in-process and export it; freeform (ephemeral) templates build in the
+    sandbox subprocess (their generated code never runs here) and the preview is
+    rendered in-process from the sandbox's STL. Both return the same file dict,
+    so the manifold gate and URL construction downstream are identical."""
+    if isinstance(spec, EphemeralTemplateSpec):
+        return _produce_files_freeform(spec, params_obj, design_dir, callouts)
+
+    try:
+        solid = spec.build_fn(params_obj)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return export_design(solid, design_dir, callouts)
+
+
+def _produce_files_freeform(
+    spec: EphemeralTemplateSpec,
+    params_obj: BaseModel,
+    design_dir: Path,
+    callouts: list[dict[str, Any]],
+) -> dict[str, Path]:
+    # Local import so the (heavy, subprocess-spawning) sandbox is only loaded on
+    # the freeform path, and to avoid any import cycle.
+    from api import sandbox
+
+    result = sandbox.run_generated_build(spec.code, params_obj.model_dump(), design_dir)
+    if not result.ok:
+        shutil.rmtree(design_dir, ignore_errors=True)
+        # A verify-stage failure would mean the stored code became unsafe — that's
+        # an internal problem (500). A run/timeout/output failure means these
+        # particular user params produced a bad build (422).
+        status = 422 if result.stage in ("run", "timeout", "output") else 500
+        raise HTTPException(
+            status_code=status,
+            detail=f"freeform build failed ({result.stage}): {result.error}",
+        )
+
+    preview_path = design_dir / "preview.png"
+    render_preview(result.files["stl"], preview_path, callouts)
+    return {
+        "step": result.files["step"],
+        "stl": result.files["stl"],
+        "threemf": result.files["threemf"],
+        "preview_png": preview_path,
+    }
+
+
 def build_design(
     template_id: str,
     params: dict[str, Any],
@@ -98,15 +156,10 @@ def build_design(
         # the raw exception object, which json.dumps can't serialize.
         raise HTTPException(status_code=422, detail=str(e))
 
-    try:
-        solid = spec.build_fn(params_obj)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
     design_id = uuid.uuid4().hex[:12]
     design_dir = EXPORTS_DIR / design_id
     callouts = _callout_dicts(spec, params_obj, source_map)
-    files = export_design(solid, design_dir, callouts)
+    files = _produce_files(spec, params_obj, design_dir, callouts)
 
     # Runtime manifold gate (M5.5): a part we hand to a printer must be a
     # watertight, manifold solid. The per-template pytest suite proves this for

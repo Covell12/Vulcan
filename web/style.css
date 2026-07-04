@@ -249,15 +249,114 @@ textarea {
   pointer-events: none;
 }
 
-.overlay-shape {
+/* --- Dimension-line overlays (M7 Part B): the photo as a live dim drawing --- */
+/* viewBox is set to the image's pixel size, so these units are pixels. */
+.dim-line {
   fill: none;
-  stroke: #e0562b;
-  stroke-width: 0.006;
+  stroke: #2f5fdb;
+  stroke-width: 2;
+  stroke-linecap: round;
 }
 
-circle.overlay-shape {
-  fill: rgba(224, 86, 43, 0.15);
-  stroke-width: 0.004;
+.dim-line.dim-depth {
+  stroke-dasharray: 6 5;
+  stroke: #6b7280;
+}
+
+.dim-tick {
+  stroke: #2f5fdb;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.dim-ellipse {
+  fill: rgba(47, 95, 219, 0.08);
+  stroke: #2f5fdb;
+  stroke-width: 2;
+}
+
+/* Label chip ON the dimension line. Color = the honest measurement state. */
+.dim-chip {
+  cursor: pointer;
+}
+
+.dim-chip-rect {
+  fill: #ffffff;
+  stroke: #c9ccd3;
+  stroke-width: 1;
+}
+
+.dim-chip-text {
+  font-size: 13px;
+  font-weight: 700;
+  fill: #1c2230;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* "?" — unanswered, attention. */
+.dim-chip.chip-unanswered .dim-chip-rect {
+  fill: #fdecef;
+  stroke: #e0562b;
+}
+.dim-chip.chip-unanswered .dim-chip-text {
+  fill: #c0392b;
+}
+
+/* "~210mm" — a vision/depth estimate (amber). */
+.dim-chip.chip-estimate .dim-chip-rect,
+.dim-chip.chip-pending .dim-chip-rect {
+  fill: #fdf6e9;
+  stroke: #e0a33b;
+}
+.dim-chip.chip-estimate .dim-chip-text,
+.dim-chip.chip-pending .dim-chip-text {
+  fill: #8a5a00;
+}
+
+/* "203.2mm ✓" — user-measured (green). */
+.dim-chip.chip-measured .dim-chip-rect {
+  fill: #e4f6ec;
+  stroke: #1f9254;
+}
+.dim-chip.chip-measured .dim-chip-text {
+  fill: #1f7a46;
+}
+
+/* mismatch re-ask — amber, both values shown. */
+.dim-chip.chip-mismatch .dim-chip-rect {
+  fill: #fdf6e9;
+  stroke: #e0a33b;
+}
+.dim-chip.chip-mismatch .dim-chip-text {
+  fill: #8a5a00;
+}
+
+/* Always-on "Design this custom instead" override (Part A). */
+#freeform-override {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 4px solid #7c5cff;
+  border-radius: 8px;
+  background: #faf9ff;
+}
+.freeform-recommend {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: #5a3ea0;
+  line-height: 1.45;
+}
+.override-btn {
+  margin: 0;
+  background: #7c5cff;
+}
+#freeform-override-status {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+#freeform-override-status.error {
+  color: #c0392b;
 }
 
 .question-row {
@@ -459,4 +558,148 @@ td.src-default {
 
 #design-downloads a:hover {
   background: #eef2ff;
+}
+
+/* --- Track B: freeform + review ------------------------------------------ */
+
+#freeform-panel {
+  border-left: 4px solid #7c5cff;
+}
+.freeform-note {
+  color: var(--muted);
+  line-height: 1.5;
+}
+#freeform-status {
+  margin-top: 8px;
+}
+#freeform-status.error,
+#review-status.error {
+  color: #c0392b;
+}
+
+#review-banner {
+  background: #fff8e6;
+  border: 1px solid #f0d68a;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.download-locked {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* Founder review page */
+.review-main {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 16px;
+}
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+.review-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 18px;
+  background: #fff;
+}
+.review-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.review-status-badge {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 12px;
+  background: #eee;
+}
+.status-pending_review {
+  background: #fff0cf;
+  color: #8a5a00;
+}
+.status-approved {
+  background: #dff3e6;
+  color: #1f9254;
+}
+.status-rejected {
+  background: #fbe0e0;
+  color: #c0392b;
+}
+.review-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+.review-render img {
+  max-width: 100%;
+  max-height: 340px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fafbfc;
+}
+.review-params {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin: 8px 0;
+}
+.review-params td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.review-dfm {
+  font-size: 13px;
+}
+.review-code {
+  background: #1e2230;
+  color: #e6e6e6;
+  padding: 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.review-code .tok-kw {
+  color: #c792ea;
+}
+.review-code .tok-string {
+  color: #c3e88d;
+}
+.review-code .tok-comment {
+  color: #7f8699;
+  font-style: italic;
+}
+.review-code .tok-num {
+  color: #f78c6c;
+}
+.review-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 12px;
+}
+.review-note {
+  flex: 1;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.reject-btn {
+  background: #c0392b;
+}
+.review-note-shown {
+  font-size: 14px;
+  color: var(--muted);
 }

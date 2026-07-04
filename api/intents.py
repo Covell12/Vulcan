@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -34,7 +35,8 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
-from api import composite
+from api import codegen_provider, composite, design_store, freeform
+from api.codegen_provider import CodegenProviderError
 from api.depth_provider import (
     DepthProviderError,
     ScaleRegion,
@@ -195,6 +197,10 @@ def _apply_critical_dim_gate(intent: dict[str, Any]) -> dict[str, Any]:
     template_id = intent.get("template_id")
     spec = get_template(template_id) if template_id else None
 
+    # Runs first, template or not: keep the intent internally consistent so a
+    # measure_mm question can always be answered (see the function's docstring).
+    _ensure_measure_question_dimensions(intent)
+
     if spec is not None:
         _ensure_critical_dimensions(intent, spec)
         _ensure_critical_questions(intent, spec)
@@ -211,6 +217,56 @@ def _apply_critical_dim_gate(intent: dict[str, Any]) -> dict[str, Any]:
         intent["status"] = "needs_answers"
 
     return intent
+
+
+def _derive_dim_name(question_id: str | None) -> str:
+    """A snake_case, `_mm`-suffixed dimension name derived from a question id, for
+    a measure_mm question the provider left with no dim_name (e.g. an invented
+    "q_wall_to_faucet_center" → "wall_to_faucet_center_mm"). Deterministic and
+    never empty, so the answer always has a dimension to land in."""
+    base = (
+        re.sub(r"[^0-9a-zA-Z]+", "_", question_id or "measurement").strip("_").lower()
+    )
+    for prefix in ("reask_", "auto_", "question_", "q_"):
+        if base.startswith(prefix):
+            base = base[len(prefix) :]
+            break
+    base = base.strip("_") or "measurement"
+    return base if base.endswith("_mm") else f"{base}_mm"
+
+
+def _ensure_measure_question_dimensions(intent: dict[str, Any]) -> None:
+    """Every measure_mm question implies a dimension to hold its answer. Vision
+    providers sometimes ask the user to measure something without a usable
+    `dim_name` — either a name that's absent from `dimensions[]` (e.g.
+    "gap_wall_to_tap_mm") or no dim_name at all (an invented extra measurement
+    like "q_wall_to_faucet_center") — both of which made answering that question
+    422. Give every measure_mm question a dim_name (deriving one from its id when
+    missing) and a matching dimension — non-critical by default; the critical-dim
+    gate that runs right after is the only thing that promotes a dim to critical,
+    and only for the template's real critical_dims. Runs at intent creation AND
+    after every answer, so the stored intent is always self-consistent."""
+    questions = intent.get("questions") or []
+    dims_by_name = {d["name"]: d for d in intent.setdefault("dimensions", [])}
+    for q in questions:
+        if q.get("kind") != "measure_mm":
+            continue
+        name = q.get("dim_name")
+        if not name:
+            name = _derive_dim_name(q.get("question_id"))
+            q["dim_name"] = name  # persist so the UI + answer path both see it
+        if name in dims_by_name:
+            continue
+        dim = {
+            "name": name,
+            "value_mm": None,
+            "source": "assumed",
+            "confidence": 0.0,
+            "critical": False,
+            "cross_check": None,
+        }
+        intent["dimensions"].append(dim)
+        dims_by_name[name] = dim
 
 
 def _ensure_critical_dimensions(intent: dict[str, Any], spec: TemplateSpec) -> None:
@@ -545,6 +601,10 @@ async def create_intent(
     # allows extra top-level fields.
     result["photos"] = _persist_photos(result["intent_id"], photo_inputs)
     result["annotation"] = parsed_annotation
+    # Keep the raw request text for the freeform code generator (the LLM
+    # restatement in `description` loses detail we want when authoring a template).
+    result["request_text"] = text
+    _apply_freeform_routing(result)
 
     errors = _validation_errors(result)
     if errors:
@@ -555,6 +615,112 @@ async def create_intent(
 
     _save_intent(result)
     return result
+
+
+# Below this template_fit, the matched template is treated as a poor fit and
+# freeform is recommended alongside it (Part A). Also recommended whenever the
+# provider listed unsupported_features it can't express, or no template matched.
+FREEFORM_FIT_THRESHOLD = 0.65
+
+
+def _apply_freeform_routing(intent: dict[str, Any]) -> None:
+    """Decide whether to offer / recommend the freeform (custom-design) path.
+
+    The intent router used to be greedy: it always rode a matched template even
+    when the template couldn't really make the part. Now the provider reports
+    `template_fit` (0-1) and `unsupported_features`; a poor fit (< threshold) or
+    ANY unsupported feature, or no template at all, makes freeform recommended.
+    freeform is AVAILABLE for any in-scope request (the UI's always-on "Design
+    this custom instead" override), and RECOMMENDED when the template is a bad
+    match. Sets fields the UI reads; never blocks the template path."""
+    in_scope = intent.get("status") != "out_of_scope"
+    has_template = bool(intent.get("template_id"))
+    fit = intent.get("template_fit")
+    unsupported = intent.get("unsupported_features") or []
+    poor_fit = (isinstance(fit, (int, float)) and fit < FREEFORM_FIT_THRESHOLD) or bool(
+        unsupported
+    )
+
+    intent["freeform_available"] = in_scope
+    intent["freeform_recommended"] = in_scope and (not has_template or poor_fit)
+
+
+def _load_intent_photos(intent: dict[str, Any]) -> list[PhotoInput]:
+    """Reload the persisted photos (M5.5) so the freeform generator can see what
+    the user photographed. Returns [] if none were stored / are missing."""
+    photos: list[PhotoInput] = []
+    for ref in intent.get("photos") or []:
+        path = DATA_DIR / ref.get("path", "")
+        if path.exists():
+            photos.append(
+                PhotoInput(
+                    content=path.read_bytes(),
+                    mime_type=ref.get("mime_type") or "image/jpeg",
+                )
+            )
+    return photos
+
+
+@router.post("/intents/{intent_id}/freeform")
+def start_freeform(intent_id: str) -> dict[str, Any]:
+    """Track B: author a one-off template and attach it to the intent so the
+    standard questions → measure → join → review flow takes over. Works as the
+    always-available user OVERRIDE too — a template may already be matched (Part
+    A: "Design this custom instead"), in which case the generated template
+    REPLACES it. On failure the request is logged to the demand log and an honest
+    error is returned on the intent."""
+    intent = _load_intent(intent_id)
+    if intent.get("status") == "out_of_scope":
+        raise HTTPException(
+            status_code=409,
+            detail=f"intent '{intent_id}' is out of scope: {intent.get('out_of_scope_reason')}",
+        )
+
+    # Clear, up-front error if the codegen provider isn't configured, rather than
+    # burning the whole self-repair budget on auth failures.
+    try:
+        codegen_provider.check_provider_configured()
+    except CodegenProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    dims_hints = [
+        {"name": d["name"], "value_mm": d.get("value_mm")}
+        for d in intent.get("dimensions", [])
+        if d.get("value_mm") is not None
+    ]
+    request_text = intent.get("request_text") or intent.get("description") or ""
+
+    outcome = freeform.generate_and_register(
+        request_text, _load_intent_photos(intent), dims_hints
+    )
+
+    if not outcome.ok:
+        intent["freeform_error"] = outcome.error
+        intent["freeform_available"] = False  # tried and failed; logged to demand
+        _save_intent(intent)
+        return intent
+
+    # Success: adopt the generated template. If this is an OVERRIDE of a matched
+    # template, drop that template's dimensions/questions — they measured a
+    # different part — so the gate synthesizes a clean set for the custom design.
+    intent["template_id"] = outcome.template_id
+    intent["freeform"] = True
+    intent["freeform_assumptions"] = outcome.assumptions
+    intent["freeform_dfm"] = outcome.dfm
+    intent["dimensions"] = []
+    intent["questions"] = []
+    intent.pop("freeform_error", None)
+    intent = _apply_critical_dim_gate(intent)
+    _apply_freeform_routing(intent)
+
+    errors = _validation_errors(intent)
+    if errors:
+        raise HTTPException(
+            status_code=500,
+            detail=f"IntentSpec became invalid after freeform generation: {'; '.join(errors)}",
+        )
+    _save_intent(intent)
+    return intent
 
 
 @router.get("/intents/{intent_id}")
@@ -796,18 +962,46 @@ def create_design_from_intent(intent_id: str) -> dict[str, Any]:
     if composite_url:
         files["composite"] = composite_url
 
+    # Freeform (Track B): every generated design lands in the founder review
+    # queue, and its CAD downloads are gated until approved (see api/review).
+    is_freeform = bool(intent.get("freeform"))
+    review_status = None
+    if is_freeform:
+        review_status = design_store.STATUS_PENDING
+        design_store.save_record(
+            {
+                "design_id": design_id,
+                "intent_id": intent_id,
+                "is_freeform": True,
+                "status": review_status,
+                "template_id": template_id,
+                "request": intent.get("request_text") or intent.get("description"),
+                "code": getattr(spec, "code", ""),
+                "params": summary,
+                "assumptions": intent.get("freeform_assumptions", []),
+                "dfm": intent.get("freeform_dfm"),
+                "files": files,
+                "created_at": freeform._now(),
+            }
+        )
+
     # Persist the intent -> design link.
     intent["design_id"] = design_id
     intent["design_files"] = files
     intent["design_params"] = summary
     _save_intent(intent)
 
-    return {
+    response: dict[str, Any] = {
         "design_id": design_id,
         "template_id": template_id,
         "files": files,
         "params": summary,
     }
+    if is_freeform:
+        response["freeform"] = True
+        response["review_status"] = review_status
+        response["assumptions"] = intent.get("freeform_assumptions", [])
+    return response
 
 
 def _apply_answer(
@@ -825,12 +1019,29 @@ def _apply_answer(
                 status_code=422,
                 detail=f"question '{answer.question_id}' needs measure_mm.",
             )
+        # A measure_mm question always has SOMETHING to measure: use its
+        # dim_name, or derive one from the question id when the provider left it
+        # null (normally the gate does this at creation, but an older stored
+        # intent may predate that). Either way answering it never 422s.
+        if not dim_name:
+            dim_name = _derive_dim_name(question.get("question_id"))
+            question["dim_name"] = dim_name
         dim = dims_by_name.get(dim_name)
         if dim is None:
-            raise HTTPException(
-                status_code=422,
-                detail=f"dimension '{dim_name}' not found on this intent.",
-            )
+            # A measure_mm question whose dimension the provider forgot to list
+            # (normally synthesized by the gate at intent creation, but an
+            # older/stored intent may predate that). Create it on demand rather
+            # than dead-end the user with a 422.
+            dim = {
+                "name": dim_name,
+                "value_mm": None,
+                "source": "assumed",
+                "confidence": 0.0,
+                "critical": False,
+                "cross_check": None,
+            }
+            intent.setdefault("dimensions", []).append(dim)
+            dims_by_name[dim_name] = dim
         # Commit / flag / accept-override is decided by the cross-check, which
         # compares the value against the depth prior (CLAUDE.md rule 3).
         _cross_check_measurement(intent, dim, answer.measure_mm)

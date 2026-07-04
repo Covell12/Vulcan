@@ -27,6 +27,16 @@ class DimCallout:
     label: str
 
 
+def _ephemeral_build_placeholder(_params: Any) -> cq.Workplane:
+    """EphemeralTemplateSpecs build via the sandboxed subprocess (their generated
+    code never runs in-process), so their build_fn is never called directly —
+    api/designs.build_design dispatches them to api/sandbox instead. This
+    placeholder makes any accidental in-process call loud rather than silent."""
+    raise RuntimeError(
+        "ephemeral (freeform) templates build in the sandbox, not via build_fn"
+    )
+
+
 @dataclass(frozen=True)
 class TemplateSpec:
     """Everything the API and test suite need to treat a template generically."""
@@ -55,7 +65,25 @@ class TemplateSpec:
     callouts_fn: Callable[[Any], list[DimCallout]]
 
 
+@dataclass(frozen=True)
+class EphemeralTemplateSpec(TemplateSpec):
+    """A one-off template authored by the LLM for a freeform request (Track B).
+    Same shape as a TemplateSpec so the existing machinery treats it identically,
+    plus `code`: the generated CadQuery source that api/sandbox runs to build it.
+    `build_fn` is the placeholder above — never called; the sandbox is the build."""
+
+    code: str = ""
+
+
 _REGISTRY: dict[str, TemplateSpec] = {}
+# Freeform templates live in a SEPARATE namespace so they never pollute the
+# Track A catalog (GET /templates, the generic template test suite, all_templates)
+# — but get_template still resolves them, so the intent flow / join / manifold
+# gate treat them like any template.
+_EPHEMERAL: dict[str, TemplateSpec] = {}
+# Optional loader so a get_template miss can rehydrate an ephemeral template from
+# disk after a restart. Set by api/freeform (keeps this leaf module import-free).
+_EPHEMERAL_LOADER: Callable[[str], TemplateSpec | None] | None = None
 
 
 def register_template(spec: TemplateSpec) -> TemplateSpec:
@@ -65,9 +93,29 @@ def register_template(spec: TemplateSpec) -> TemplateSpec:
     return spec
 
 
+def register_ephemeral_template(spec: TemplateSpec) -> TemplateSpec:
+    """Register (or replace) a freeform template. Replacement is allowed — the
+    same id may be re-registered on rehydrate from disk."""
+    _EPHEMERAL[spec.template_id] = spec
+    return spec
+
+
+def set_ephemeral_loader(loader: Callable[[str], TemplateSpec | None]) -> None:
+    global _EPHEMERAL_LOADER
+    _EPHEMERAL_LOADER = loader
+
+
 def get_template(template_id: str) -> TemplateSpec | None:
-    return _REGISTRY.get(template_id)
+    spec = _REGISTRY.get(template_id) or _EPHEMERAL.get(template_id)
+    if spec is None and _EPHEMERAL_LOADER is not None:
+        spec = _EPHEMERAL_LOADER(template_id)  # may register + return, or None
+    return spec
 
 
 def all_templates() -> dict[str, TemplateSpec]:
+    """Track A catalog only — freeform templates are deliberately excluded."""
     return dict(_REGISTRY)
+
+
+def all_ephemeral_templates() -> dict[str, TemplateSpec]:
+    return dict(_EPHEMERAL)

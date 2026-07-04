@@ -41,19 +41,35 @@
       <p id="intent-status"></p>
     </section>
 
+    <section class="panel" id="freeform-panel" hidden>
+      <h2>Custom design</h2>
+      <p class="freeform-note">
+        No standard template fits this one — but Vulcan can design a
+        <strong>custom part</strong> for it. Heads up: custom designs are
+        machine-generated and <strong>need a human check before they ship</strong>.
+        We'll design it now, then you'll confirm the key measurements.
+      </p>
+      <button id="freeform-btn" type="button">Design it for me</button>
+      <p id="freeform-status"></p>
+    </section>
+
     <section class="panel" id="questions-panel" hidden>
       <h2>2. Questions</h2>
       <p id="intent-description" class="template-description"></p>
+
+      <div id="freeform-override" hidden>
+        <p id="freeform-recommend-note" class="freeform-recommend" hidden></p>
+        <button id="freeform-override-btn" type="button" class="override-btn">
+          Design this custom instead
+        </button>
+        <p id="freeform-override-status"></p>
+      </div>
+
       <div id="overlay-wrap">
-        <img id="overlay-img" alt="Uploaded photo with question overlays" />
-        <svg id="overlay-svg" viewBox="0 0 1 1" preserveAspectRatio="none">
-          <defs>
-            <marker id="overlay-arrowhead" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
-              <path d="M0,0 L6,3 L0,6 Z" fill="#e0562b" />
-            </marker>
-          </defs>
-          <g id="overlay-shapes"></g>
-        </svg>
+        <img id="overlay-img" alt="Uploaded photo with dimension overlays" />
+        <!-- viewBox is set to the rendered image pixel size at draw time so the
+             dimension lines, ellipses and label chips render 1:1 and undistorted. -->
+        <svg id="overlay-svg" preserveAspectRatio="none"></svg>
       </div>
       <div id="questions-list"></div>
       <button id="submit-answers-btn" type="button">Submit answers</button>
@@ -65,6 +81,11 @@
       <p id="result-status-line"></p>
       <button id="generate-part-btn" disabled>Generate my part</button>
       <p id="generate-status"></p>
+
+      <div id="review-banner" hidden>
+        <strong>Custom design — pending review.</strong>
+        <span id="review-banner-text"></span>
+      </div>
 
       <div id="design-result" hidden>
         <div id="design-views">

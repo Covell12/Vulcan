@@ -18,7 +18,7 @@ const intentStatusEl = document.getElementById("intent-status");
 const questionsPanel = document.getElementById("questions-panel");
 const intentDescriptionEl = document.getElementById("intent-description");
 const overlayImg = document.getElementById("overlay-img");
-const overlaySvg = document.getElementById("overlay-shapes");
+const overlaySvg = document.getElementById("overlay-svg");
 const questionsList = document.getElementById("questions-list");
 const submitAnswersBtn = document.getElementById("submit-answers-btn");
 const answersStatusEl = document.getElementById("answers-status");
@@ -34,6 +34,17 @@ const compositeFigure = document.getElementById("composite-figure");
 const designCompositeImg = document.getElementById("design-composite-img");
 const designParamsTable = document.getElementById("design-params-table");
 const designDownloads = document.getElementById("design-downloads");
+
+const freeformPanel = document.getElementById("freeform-panel");
+const freeformBtn = document.getElementById("freeform-btn");
+const freeformStatusEl = document.getElementById("freeform-status");
+const reviewBanner = document.getElementById("review-banner");
+const reviewBannerText = document.getElementById("review-banner-text");
+
+const freeformOverride = document.getElementById("freeform-override");
+const freeformOverrideBtn = document.getElementById("freeform-override-btn");
+const freeformOverrideStatus = document.getElementById("freeform-override-status");
+const freeformRecommendNote = document.getElementById("freeform-recommend-note");
 
 let selectedPhotos = [];
 let annotationPoints = []; // normalized [x, y] pairs on photo 0
@@ -153,8 +164,16 @@ submitIntentBtn.addEventListener("click", async () => {
     const response = await fetch("/intents", { method: "POST", body: formData });
     if (!response.ok) throw new Error(await describeFetchError(response));
     currentIntent = await response.json();
-    renderQuestions();
-    renderResult();
+    if (currentIntent.freeform_available && !currentIntent.template_id) {
+      // No template fits — offer the custom-design path instead of empty questions.
+      questionsPanel.hidden = true;
+      resultPanel.hidden = true;
+      renderFreeform();
+    } else {
+      freeformPanel.hidden = true;
+      renderQuestions();
+      renderResult();
+    }
     setIntentStatus(`Got it — intent ${currentIntent.intent_id}.`, false);
   } catch (err) {
     setIntentStatus(`Error: ${errorText(err)}`, true);
@@ -172,10 +191,12 @@ function questionInputId(questionId) {
 function renderQuestions() {
   questionsPanel.hidden = false;
   intentDescriptionEl.textContent = currentIntent.description || "";
+  renderFreeformOptions();
 
   overlayImg.src = annotateImg.src || "";
   questionsList.innerHTML = "";
   overlaySvg.innerHTML = "";
+  dimChips = {};
 
   const dimsByName = Object.fromEntries((currentIntent.dimensions || []).map((d) => [d.name, d]));
   const questions = currentIntent.questions || [];
@@ -194,11 +215,22 @@ function renderQuestions() {
     }
   }
 
+  // Collect the overlays to draw (one per dim, the preferred question's).
+  overlayDrawList = [];
+  const overlaidDims = new Set();
+  for (const q of questions) {
+    if (!q.overlay || q.overlay.photo_index !== 0) continue;
+    if (q.dim_name) {
+      if (overlaidDims.has(q.dim_name)) continue;
+      if (preferredByDim[q.dim_name] && preferredByDim[q.dim_name] !== q) continue;
+      overlaidDims.add(q.dim_name);
+    }
+    overlayDrawList.push({ q, dim: dimsByName[q.dim_name] });
+  }
+  scheduleOverlayDraw();
+
   const renderedDims = new Set();
   for (const question of questions) {
-    if (question.overlay && question.overlay.photo_index === 0) {
-      drawOverlay(question.overlay);
-    }
     if (question.dim_name) {
       if (renderedDims.has(question.dim_name)) continue;
       if (preferredByDim[question.dim_name] !== question) continue; // wait for the preferred one
@@ -208,28 +240,139 @@ function renderQuestions() {
   }
 }
 
-function drawOverlay(overlay) {
-  const ns = "http://www.w3.org/2000/svg";
-  const points = overlay.points || [];
-  if (points.length === 0) return;
+// --- Dimension-line overlays with live label chips (Part B) --------------
+// The photo becomes a live dimension drawing: each critical measurement is a
+// dimension line / ellipse over the photo with a label chip ON it, whose state
+// (?, ~estimate, measured ✓) mirrors the dimension and updates as the user types.
+const SVG_NS = "http://www.w3.org/2000/svg";
+let dimChips = {}; // question_id -> { group, rect, text, mid:[x,y], dimension }
+let overlayDrawList = [];
 
-  if (overlay.shape === "circle") {
-    const [cx, cy] = points[0];
-    const circle = document.createElementNS(ns, "circle");
-    circle.setAttribute("cx", cx);
-    circle.setAttribute("cy", cy);
-    circle.setAttribute("r", 0.03);
-    circle.setAttribute("class", "overlay-shape");
-    overlaySvg.appendChild(circle);
-    return;
+function svgEl(name, attrs) {
+  const el = document.createElementNS(SVG_NS, name);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  return el;
+}
+
+function fmtMm(v) {
+  if (v == null || !Number.isFinite(Number(v))) return "";
+  return (Math.round(Number(v) * 10) / 10).toString();
+}
+
+// HONESTY (Part B rule 6): "?" for unanswered, "~X" for a vision/depth estimate
+// (never without the ~), "X ✓" ONLY for user_measured, mismatch shows both.
+function dimChipState(dimension) {
+  if (!dimension) return { text: "?", cls: "chip-unanswered" };
+  const cc = dimension.cross_check;
+  if (cc && cc.status === "mismatch_reask") {
+    return { text: `${fmtMm(dimension.value_mm)} vs ~${fmtMm(cc.depth_value_mm)}mm`, cls: "chip-mismatch" };
+  }
+  if (dimension.source === "user_measured" && dimension.value_mm != null) {
+    return { text: `${fmtMm(dimension.value_mm)}mm ✓`, cls: "chip-measured" };
+  }
+  if (dimension.value_mm != null) {
+    return { text: `~${fmtMm(dimension.value_mm)}mm`, cls: "chip-estimate" };
+  }
+  return { text: "?", cls: "chip-unanswered" };
+}
+
+function scheduleOverlayDraw() {
+  if (overlayImg.complete && overlayImg.naturalWidth) drawAllOverlays();
+  else overlayImg.addEventListener("load", drawAllOverlays, { once: true });
+}
+
+function drawAllOverlays() {
+  const W = overlayImg.clientWidth || overlayImg.naturalWidth || 1;
+  const H = overlayImg.clientHeight || overlayImg.naturalHeight || 1;
+  overlaySvg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  overlaySvg.innerHTML = "";
+  dimChips = {};
+  for (const { q, dim } of overlayDrawList) drawDimOverlay(q, dim, W, H);
+  // Sync each chip with any value already typed (e.g. after a re-render).
+  for (const { q } of overlayDrawList) updateChipFromInput(q.question_id);
+}
+
+function drawDimOverlay(question, dimension, W, H) {
+  const ov = question.overlay;
+  const kind = ov.kind || (ov.shape === "circle" ? "dim_ellipse" : "dim_line");
+  const g = svgEl("g", { class: "dim-overlay" });
+  let mid;
+
+  if (kind === "dim_ellipse") {
+    const c = ov.center || (ov.points && ov.points[0]) || [0.5, 0.5];
+    const cx = c[0] * W, cy = c[1] * H;
+    const rx = (ov.rx != null ? ov.rx : 0.04) * W;
+    const ry = (ov.ry != null ? ov.ry : ov.rx != null ? ov.rx : 0.04) * W;
+    const rot = ov.rotation || 0;
+    const xf = `rotate(${rot} ${cx} ${cy})`;
+    g.appendChild(svgEl("ellipse", { cx, cy, rx, ry, class: "dim-ellipse", transform: xf }));
+    g.appendChild(svgEl("line", { x1: cx - rx, y1: cy, x2: cx + rx, y2: cy, class: "dim-line", transform: xf }));
+    mid = [cx, cy - ry - 13];
+  } else {
+    const pts = ov.points && ov.points.length >= 2 ? ov.points : [[0.4, 0.5], [0.6, 0.5]];
+    const p0 = [pts[0][0] * W, pts[0][1] * H];
+    const p1 = [pts[pts.length - 1][0] * W, pts[pts.length - 1][1] * H];
+    const cls = kind === "dim_depth" ? "dim-line dim-depth" : "dim-line";
+    g.appendChild(svgEl("line", { x1: p0[0], y1: p0[1], x2: p1[0], y2: p1[1], class: cls }));
+    const dx = p1[0] - p0[0], dy = p1[1] - p0[1], len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len, t = 9; // perpendicular extension ticks
+    for (const p of [p0, p1]) {
+      g.appendChild(svgEl("line", { x1: p[0] - nx * t, y1: p[1] - ny * t, x2: p[0] + nx * t, y2: p[1] + ny * t, class: "dim-tick" }));
+    }
+    mid = [(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2];
   }
 
-  // "arrow" and "line" both render as a polyline; arrow gets a marker.
-  const line = document.createElementNS(ns, "polyline");
-  line.setAttribute("points", points.map(([x, y]) => `${x},${y}`).join(" "));
-  line.setAttribute("class", "overlay-shape");
-  if (overlay.shape === "arrow") line.setAttribute("marker-end", "url(#overlay-arrowhead)");
-  overlaySvg.appendChild(line);
+  const chipG = svgEl("g", { class: "dim-chip" });
+  const rect = svgEl("rect", { rx: 5, ry: 5, class: "dim-chip-rect" });
+  const text = svgEl("text", { class: "dim-chip-text", "text-anchor": "middle", "dominant-baseline": "central" });
+  chipG.appendChild(rect);
+  chipG.appendChild(text);
+  g.appendChild(chipG);
+  overlaySvg.appendChild(g);
+
+  const chip = { group: chipG, rect, text, mid, dimension };
+  dimChips[question.question_id] = chip;
+  // Click a chip to focus (edit) its input — the other half of the two-way bind.
+  chipG.addEventListener("click", () => {
+    const input = document.getElementById(questionInputId(question.question_id));
+    if (input) {
+      input.focus();
+      input.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  });
+
+  const state = dimChipState(dimension);
+  setChip(chip, state.text, state.cls);
+}
+
+function setChip(chip, textStr, cls) {
+  chip.text.textContent = textStr || "?";
+  chip.group.setAttribute("class", `dim-chip ${cls || ""}`);
+  const pad = 6;
+  const bb = chip.text.getBBox();
+  const w = Math.max(bb.width, 8) + pad * 2;
+  const h = bb.height + pad * 2;
+  const [mx, my] = chip.mid;
+  chip.text.setAttribute("x", mx);
+  chip.text.setAttribute("y", my);
+  chip.rect.setAttribute("x", mx - w / 2);
+  chip.rect.setAttribute("y", my - h / 2);
+  chip.rect.setAttribute("width", w);
+  chip.rect.setAttribute("height", h);
+}
+
+// Live-update a chip from what's typed in its input (pending, not yet submitted).
+function updateChipFromInput(questionId) {
+  const chip = dimChips[questionId];
+  if (!chip) return;
+  const mm = collectMm(questionId); // converts cm/in -> mm; null if empty
+  if (mm == null) {
+    const s = dimChipState(chip.dimension);
+    setChip(chip, s.text, s.cls);
+  } else {
+    // Pending: show the typed value with NO ✓ (it isn't user_measured yet).
+    setChip(chip, `${fmtMm(mm)}mm`, "chip-pending");
+  }
 }
 
 // A measurement input with a mm/cm/in unit selector (default = remembered
@@ -258,7 +401,12 @@ function appendMeasureField(parent, questionId, placeholder) {
 
   const dual = document.createElement("span");
   dual.className = "dual-display";
-  const refresh = () => (dual.textContent = formatDual(input.value, unit.value));
+  // On every keystroke / unit change: update the dual display AND the photo's
+  // dimension label chip live (two-way binding, with unit conversion).
+  const refresh = () => {
+    dual.textContent = formatDual(input.value, unit.value);
+    updateChipFromInput(questionId);
+  };
 
   input.addEventListener("input", refresh);
   unit.addEventListener("refresh-dual", refresh);
@@ -442,6 +590,72 @@ function renderResult() {
   if (currentIntent.status !== "ready_for_design") designResult.hidden = true;
 }
 
+// --- Freeform (Track B): the custom-design path + the always-on override --
+
+function renderFreeform() {
+  // The PRIMARY freeform panel shows only when the request is in scope but no
+  // template matched (freeform is then the only real path).
+  const offer = currentIntent.freeform_available && !currentIntent.template_id;
+  freeformPanel.hidden = !offer;
+  if (currentIntent.freeform_error) {
+    setStatusText(freeformStatusEl, currentIntent.freeform_error, true);
+  } else if (!offer) {
+    setStatusText(freeformStatusEl, "", false);
+  }
+}
+
+// The always-available "Design this custom instead" override, shown inside the
+// questions panel whenever a template DID match — with a recommend note when the
+// router flagged the template as a poor fit (Part A).
+function renderFreeformOptions() {
+  const showOverride = currentIntent.freeform_available && !!currentIntent.template_id;
+  freeformOverride.hidden = !showOverride;
+  setStatusText(freeformOverrideStatus, "", false);
+
+  const recommend = currentIntent.freeform_recommended && !!currentIntent.template_id;
+  if (recommend) {
+    const feats = currentIntent.unsupported_features || [];
+    freeformRecommendNote.textContent = feats.length
+      ? `Heads up: the closest template (${currentIntent.template_id}) can't do: ${feats.join(", ")}. A custom design is recommended.`
+      : "Heads up: this is only a rough template match — a custom design may fit better.";
+    freeformRecommendNote.hidden = false;
+  } else {
+    freeformRecommendNote.hidden = true;
+  }
+}
+
+function setStatusText(el, message, isError) {
+  el.textContent = message;
+  el.classList.toggle("error", Boolean(isError));
+}
+
+async function runFreeform(statusEl, btn) {
+  if (!currentIntent) return;
+  btn.disabled = true;
+  setStatusText(statusEl, "Designing your custom part… this can take a moment (generating code, building, and safety-checking it).", false);
+  try {
+    const response = await fetch(`/intents/${currentIntent.intent_id}/freeform`, { method: "POST" });
+    if (!response.ok) throw new Error(await describeFetchError(response));
+    currentIntent = await response.json();
+    if (currentIntent.template_id) {
+      setStatusText(statusEl, "Custom design ready — confirm the measurements below.", false);
+      freeformPanel.hidden = true;
+      renderQuestions();
+      renderResult();
+    } else {
+      // Generation failed (logged to the demand log); show the honest message.
+      setStatusText(statusEl, currentIntent.freeform_error || "We couldn't design this automatically.", true);
+    }
+  } catch (err) {
+    setStatusText(statusEl, `Error: ${errorText(err)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+freeformBtn.addEventListener("click", () => runFreeform(freeformStatusEl, freeformBtn));
+freeformOverrideBtn.addEventListener("click", () => runFreeform(freeformOverrideStatus, freeformOverrideBtn));
+
 const SOURCE_BADGE = {
   measured: "measured ✓",
   chosen: "chosen ✓",
@@ -452,6 +666,17 @@ const SOURCE_BADGE = {
 
 function renderDesign(design) {
   designResult.hidden = false;
+
+  // Freeform designs land in the founder review queue; CAD downloads are locked
+  // until approved. Show an honest banner + the model's assumptions.
+  if (design.review_status === "pending_review") {
+    const notes = (design.assumptions || []).join(" ");
+    reviewBannerText.textContent =
+      ` A person needs to check this custom part before it can ship, so the STEP/STL/3MF downloads are locked for now. ${notes}`;
+    reviewBanner.hidden = false;
+  } else {
+    reviewBanner.hidden = true;
+  }
 
   // In-photo ghost first ("In your photo"), when the API produced one. The
   // cache-buster keeps a re-generated design from showing a stale image.
@@ -488,15 +713,22 @@ function renderDesign(design) {
     designParamsTable.appendChild(tr);
   }
 
-  // Download links.
+  // Download links — locked (server returns 403) while a freeform design is
+  // pending review, so present them as locked rather than dead links.
+  const locked = design.review_status === "pending_review";
   designDownloads.innerHTML = "";
   for (const [label, key] of [["STEP", "step"], ["3MF", "threemf"], ["STL", "stl"]]) {
     const li = document.createElement("li");
-    const a = document.createElement("a");
-    a.href = design.files[key];
-    a.download = "";
-    a.textContent = `Download ${label}`;
-    li.appendChild(a);
+    if (locked) {
+      li.textContent = `${label} — 🔒 locked until approved`;
+      li.className = "download-locked";
+    } else {
+      const a = document.createElement("a");
+      a.href = design.files[key];
+      a.download = "";
+      a.textContent = `Download ${label}`;
+      li.appendChild(a);
+    }
     designDownloads.appendChild(li);
   }
 }

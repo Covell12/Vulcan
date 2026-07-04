@@ -17,6 +17,17 @@
     "context_notes": { "type": "string", "description": "Environment/function notes: load hints, outdoor/UV, moisture, heat." },
     "material_suggestion": { "enum": ["PLA", "PETG", "TPU", "CF-PETG"], "default": "PETG" },
     "out_of_scope_reason": { "type": ["string", "null"] },
+    "template_fit": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "How well the chosen template_id can actually express the request (0=not at all, 1=perfect). Null when template_id is null. Be honest: shoehorning a bad fit is worse than admitting 'other'."
+    },
+    "unsupported_features": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Features the request needs that the matched template CANNOT express (e.g. 'hole grid/pattern', 'curved profile', 'embossed text', 'multiple bodies', 'hinge/joint'). Non-empty => the request should probably go freeform."
+    },
     "dimensions": {
       "type": "array",
       "items": {
@@ -55,11 +66,23 @@
           "chosen_value": { "type": ["string", "null"], "description": "Filled in when the user answers a choice question. Never set by the provider." },
           "overlay": {
             "type": ["object", "null"],
-            "description": "Where to draw the arrow/circle on the photo (normalized 0-1 coords).",
+            "description": "A dimension-line overlay drawn on the photo (normalized 0-1 coords). The label chip's value/state comes from the linked dimension, not from here.",
             "properties": {
               "photo_index": { "type": "integer" },
-              "shape": { "enum": ["arrow", "circle", "line"] },
-              "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } }
+              "kind": {
+                "enum": ["dim_line", "dim_ellipse", "dim_depth"],
+                "description": "dim_line: a straight linear measurement between two points. dim_depth: a receding measurement going away from the camera (drawn dashed/foreshortened). dim_ellipse: a diameter of a round feature seen in perspective (a circle looks like an ellipse)."
+              },
+              "points": {
+                "type": ["array", "null"],
+                "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                "description": "For dim_line / dim_depth: exactly two [x,y] endpoints — the two ends of the measured distance."
+              },
+              "center": { "type": ["array", "null"], "items": { "type": "number" }, "minItems": 2, "maxItems": 2, "description": "For dim_ellipse: the [x,y] center of the round feature." },
+              "rx": { "type": ["number", "null"], "description": "For dim_ellipse: horizontal radius, as a fraction of image WIDTH." },
+              "ry": { "type": ["number", "null"], "description": "For dim_ellipse: vertical radius, as a fraction of image WIDTH (a circle head-on has rx==ry; in perspective ry<rx)." },
+              "rotation": { "type": ["number", "null"], "description": "For dim_ellipse: rotation of the ellipse in DEGREES." },
+              "shape": { "enum": ["arrow", "circle", "line"], "description": "Legacy overlay shape (superseded by kind); still accepted for backward compatibility." }
             }
           }
         }
