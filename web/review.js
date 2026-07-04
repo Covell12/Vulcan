@@ -8,10 +8,40 @@ const statusEl = document.getElementById("review-status");
 const countEl = document.getElementById("review-count");
 const filterEl = document.getElementById("review-filter");
 const refreshBtn = document.getElementById("review-refresh");
+const tokenEl = document.getElementById("review-token");
+
+// The founder token authorizes both recording a verdict and downloading a
+// pending design's files. Remembered locally; blank is fine in local dev (the
+// server treats any presented token as founder when none is configured).
+const TOKEN_KEY = "vulcan_review_token";
+tokenEl.value = localStorage.getItem(TOKEN_KEY) || "";
+tokenEl.addEventListener("change", () => localStorage.setItem(TOKEN_KEY, tokenEl.value));
+function founderToken() {
+  return tokenEl.value || "founder"; // non-empty so the header is always sent
+}
 
 function setStatus(message, isError) {
   statusEl.textContent = message;
   statusEl.classList.toggle("error", Boolean(isError));
+}
+
+// Fetch a file WITH the founder token header (so a pending design's CAD files
+// download from the dashboard) and save it, keeping the token out of the URL.
+async function downloadFile(url, filename) {
+  setStatus(`Downloading ${filename}…`, false);
+  try {
+    const resp = await fetch(url, { headers: { "X-Review-Token": founderToken() } });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setStatus("", false);
+  } catch (err) {
+    setStatus(`Download failed: ${err.message || err}`, true);
+  }
 }
 
 // Escape only the tag-injection characters, then color a few token classes. Not
@@ -114,6 +144,28 @@ function renderCard(record) {
   const details = el("details", {}, [el("summary", {}, "Generated CadQuery code"), codePre]);
   card.append(details);
 
+  // Downloads: the founder can pull the files from their dashboard for ANY
+  // freeform design — pending (to inspect before approving) or approved.
+  if (record.files) {
+    const btns = [];
+    for (const [label, key] of [["STEP", "step"], ["3MF", "threemf"], ["STL", "stl"]]) {
+      const url = record.files[key];
+      if (!url) continue;
+      const name = `${record.design_id}-${key}${url.slice(url.lastIndexOf("."))}`;
+      btns.push(
+        el("button", { type: "button", className: "download-btn", textContent: `Download ${label}` }, []),
+      );
+      btns[btns.length - 1].addEventListener("click", () => downloadFile(url, name));
+    }
+    if (btns.length) {
+      const wrap = el("div", { className: "review-downloads" }, btns);
+      if (status === "pending_review") {
+        wrap.prepend(el("span", { className: "review-download-note" }, "Founder preview (not yet approved): "));
+      }
+      card.append(wrap);
+    }
+  }
+
   // Verdict controls (only for pending).
   if (status === "pending_review") {
     const note = el("input", { type: "text", placeholder: "note (why / what to templatize)", className: "review-note" });
@@ -134,7 +186,7 @@ async function submitVerdict(designId, verdict, note) {
   try {
     const resp = await fetch(`/review/${designId}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Review-Token": founderToken() },
       body: JSON.stringify({ verdict, note: note || null }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);

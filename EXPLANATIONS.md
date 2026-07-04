@@ -362,7 +362,12 @@ sandbox; every freeform design requires founder review before its files can ship
   requires the `X-Review-Token` header when `VULCAN_REVIEW_TOKEN` is set (so downloads can't be
   self-approved). The AST verifier was also hardened (see api/code_verifier.py) after a
   red-team pass found a submodule-attribute escape, and the sandbox now SIGKILLs the child's
-  whole process group on timeout.
+  whole process group on timeout. **M7 follow-up (founder downloads):** the gate exists to stop
+  the CUSTOMER getting files early, not the reviewer — so the download route now accepts the
+  founder's `X-Review-Token` (`_founder_authorized`) to serve a PENDING design's CAD files, and
+  the review dashboard (web/review.js) shows download buttons for every design (pending =
+  "Founder preview") that fetch WITH the token (kept out of the URL) and also sends the token on
+  approve/reject. A plain customer request (no token) still 403s until approved.
 
 ## templates_lib/ (M1, extended M2, M3, M5, and M-B)
 
@@ -453,8 +458,13 @@ sandbox; every freeform design requires founder review before its files can ship
   pending/all filter; each card shows the request, the model's assumptions, the DFM/manifold
   results, the render, the resolved params, and the generated code (lightly, XSS-safely
   highlighted — only `<>&` are escaped, then token spans are added), with Approve/Reject
-  buttons + a note field. Verdicts `POST /review/{id}` and drive the download gate. **M-B
-  additions to the photo tab** (`web/index.html` + `web/intents.js` + `web/style.css`): when
+  buttons + a note field. Verdicts `POST /review/{id}` and drive the download gate. **M7
+  follow-up:** a founder-token field (localStorage-backed) is sent as `X-Review-Token` on
+  approve/reject AND on downloads, and every design card shows Download STEP/3MF/STL buttons
+  that fetch WITH the token (blob download, token kept out of the URL) — so the founder can
+  pull a design's files straight from the dashboard, even while it's pending ("Founder
+  preview"). The customer-facing result panel keeps its "🔒 locked until approved" links and
+  now points to `/review.html` to approve. **M-B additions to the photo tab** (`web/index.html` + `web/intents.js` + `web/style.css`): when
   `POST /intents` returns `freeform_available` with no template, a "Custom design" panel
   offers "Design it for me" (calls `POST /intents/{id}/freeform`, shows generation progress,
   then the standard questions/preview flow), honestly labelled "needs a human check before it
@@ -465,10 +475,12 @@ sandbox; every freeform design requires founder review before its files can ship
   (shown whenever freeform is available), with a recommend note listing the template's
   `unsupported_features` when the router flagged a poor fit; the shared `runFreeform()` drives
   both it and the no-template panel. (Part B) the question overlays are now proper DIMENSION
-  drawings on the photo: `drawDimOverlay` renders extension ticks + a line (or a perspective
-  ellipse for diameters, or a dashed foreshortened line for depth) into an SVG whose viewBox
-  is set to the image's rendered pixel size (so lines/ellipses/chips are 1:1 and undistorted),
-  with a label chip ON the line. The chip's state is HONEST and matches the source rules
+  drawings on the photo, styled like a RULER laid on the scene: `drawRulerLine` draws a white
+  legibility halo, evenly-spaced graduation ticks, end serifs (witness marks) and outward
+  arrowheads; diameters are drawn as a FULL circle/ellipse hugging the round feature with the
+  measured diameter as a ruler line across it and a ⌀ label; depth is a dashed foreshortened
+  line. It all goes into an SVG whose viewBox is set to the image's rendered pixel size (so
+  lines/ellipses/chips are 1:1 and undistorted), with a label chip ON the line. The chip's state is HONEST and matches the source rules
   everywhere else — "?" (unanswered, red), "~210mm" (a vision/depth estimate, amber, never
   without the ~), "203.2mm ✓" (green, ONLY user_measured), or a mismatch showing both. It's a
   two-way live binding: typing in a measurement input updates its chip immediately (with unit

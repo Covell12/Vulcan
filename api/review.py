@@ -55,6 +55,18 @@ def _check_review_auth(token: str | None) -> None:
         )
 
 
+def _founder_authorized(token: str | None) -> bool:
+    """Whether a request is the FOUNDER (who may download a design's files even
+    while it's pending — the review gate exists to stop the CUSTOMER getting
+    files early, not the reviewer). A missing token (the default customer path)
+    is never authorized. When no token is configured (local dev) any presented
+    token works, so the founder dashboard can download without setup."""
+    if token is None:
+        return False
+    expected = os.getenv(_REVIEW_TOKEN_ENV, "").strip()
+    return expected == "" or token == expected
+
+
 class ReviewVerdict(BaseModel):
     verdict: str  # "approve" | "reject"
     note: str | None = None
@@ -106,11 +118,17 @@ def submit_verdict(
 
 
 @router.get("/exports/{design_id}/{filename}")
-def download_export(design_id: str, filename: str) -> FileResponse:
+def download_export(
+    design_id: str,
+    filename: str,
+    x_review_token: str | None = Header(default=None),
+) -> FileResponse:
     """Serve a generated file, enforcing the freeform review gate. The ONLY route
     that serves /exports (there is no StaticFiles mount over the same dir), so no
     non-canonical spelling can slip a gated file out under an ungated path.
-    Track A designs (no record) pass straight through."""
+    Track A designs (no record) pass straight through. The FOUNDER dashboard may
+    download a pending design's files by presenting the review token (the gate is
+    to stop the customer, not the reviewer)."""
     # Reject anything that isn't a plain <id>/<file.ext> — no separators, no
     # dot-segments, no absolute/traversal shapes. This is the whole surface.
     for part in (design_id, filename):
@@ -132,6 +150,7 @@ def download_export(design_id: str, filename: str) -> FileResponse:
         and record.get("is_freeform")
         and record.get("status") != STATUS_APPROVED
         and is_cad
+        and not _founder_authorized(x_review_token)
     ):
         raise HTTPException(
             status_code=403,

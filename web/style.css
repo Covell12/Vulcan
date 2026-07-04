@@ -249,30 +249,52 @@ textarea {
   pointer-events: none;
 }
 
-/* --- Dimension-line overlays (M7 Part B): the photo as a live dim drawing --- */
-/* viewBox is set to the image's pixel size, so these units are pixels. */
+/* --- Dimension-line overlays (M7 Part B): the photo as a live ruler drawing --- */
+/* viewBox is set to the image's pixel size, so these units are pixels. A white
+   halo under every stroke keeps the annotation legible over a busy photo. */
+.dim-halo {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.92);
+  stroke-width: 5;
+  stroke-linecap: round;
+}
+
 .dim-line {
   fill: none;
   stroke: #2f5fdb;
-  stroke-width: 2;
+  stroke-width: 2.25;
   stroke-linecap: round;
 }
 
 .dim-line.dim-depth {
-  stroke-dasharray: 6 5;
-  stroke: #6b7280;
+  stroke-dasharray: 7 5;
+  stroke: #4b74e0;
 }
 
-.dim-tick {
+/* Ruler graduation ticks + end serifs (witness marks). */
+.dim-grad {
   stroke: #2f5fdb;
-  stroke-width: 2;
+  stroke-width: 1.4;
   stroke-linecap: round;
+}
+.dim-witness {
+  stroke: #2f5fdb;
+  stroke-width: 2.25;
+  stroke-linecap: round;
+}
+.dim-arrowhead {
+  fill: #2f5fdb;
 }
 
 .dim-ellipse {
-  fill: rgba(47, 95, 219, 0.08);
+  fill: none;
   stroke: #2f5fdb;
-  stroke-width: 2;
+  stroke-width: 2.25;
+}
+.dim-ellipse-halo {
+  fill: rgba(47, 95, 219, 0.06);
+  stroke: rgba(255, 255, 255, 0.92);
+  stroke-width: 5;
 }
 
 /* Label chip ON the dimension line. Color = the honest measurement state. */
@@ -605,6 +627,54 @@ td.src-default {
 .download-locked {
   color: var(--muted);
   font-size: 14px;
+}
+
+.review-banner-action {
+  margin: 8px 0 0;
+  font-size: 14px;
+}
+#review-banner-link {
+  font-weight: 600;
+  color: #8a5a00;
+}
+.review-banner-hint {
+  color: var(--muted);
+  margin-left: 6px;
+}
+
+/* Download buttons on a card in the founder review page. */
+.review-downloads {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.download-btn {
+  margin: 0;
+  padding: 8px 12px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--accent);
+  font-size: 14px;
+}
+.download-btn:hover {
+  background: #eef2ff;
+}
+.review-download-note {
+  font-size: 13px;
+  color: var(--muted);
+}
+.token-field {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.token-field input {
+  padding: 6px 8px;
+  font-size: 13px;
 }
 
 /* Founder review page */

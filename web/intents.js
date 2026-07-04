@@ -281,15 +281,60 @@ function scheduleOverlayDraw() {
   else overlayImg.addEventListener("load", drawAllOverlays, { once: true });
 }
 
+// Arrowhead markers for the dimension lines, sized in pixels (userSpaceOnUse) so
+// they don't scale with stroke width. Both ends point OUTWARD like a real
+// engineering dimension.
+const OVERLAY_DEFS = `
+  <marker id="dim-arrow-end" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" refX="10" refY="7" orient="auto">
+    <path d="M2,2 L11,7 L2,12 Z" class="dim-arrowhead"/>
+  </marker>
+  <marker id="dim-arrow-start" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" refX="4" refY="7" orient="auto-start-reverse">
+    <path d="M2,2 L11,7 L2,12 Z" class="dim-arrowhead"/>
+  </marker>`;
+
 function drawAllOverlays() {
   const W = overlayImg.clientWidth || overlayImg.naturalWidth || 1;
   const H = overlayImg.clientHeight || overlayImg.naturalHeight || 1;
   overlaySvg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const defs = svgEl("defs");
+  defs.innerHTML = OVERLAY_DEFS;
   overlaySvg.innerHTML = "";
+  overlaySvg.appendChild(defs);
   dimChips = {};
   for (const { q, dim } of overlayDrawList) drawDimOverlay(q, dim, W, H);
   // Sync each chip with any value already typed (e.g. after a re-render).
   for (const { q } of overlayDrawList) updateChipFromInput(q.question_id);
+}
+
+// Draw a dimension line between two pixel points, styled like a ruler laid on
+// the photo: a white legibility halo, evenly-spaced graduation ticks, end serifs
+// (witness marks), and outward arrowheads.
+function drawRulerLine(g, p0, p1, dashed) {
+  const dx = p1[0] - p0[0], dy = p1[1] - p0[1], len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len, ny = dx / len; // unit perpendicular
+
+  g.appendChild(svgEl("line", { x1: p0[0], y1: p0[1], x2: p1[0], y2: p1[1], class: "dim-halo" }));
+
+  // Ruler graduation ticks (every 5th a little longer, like real gradations).
+  const ticks = Math.min(28, Math.max(6, Math.round(len / 20)));
+  for (let i = 1; i < ticks; i++) {
+    const px = p0[0] + dx * (i / ticks), py = p0[1] + dy * (i / ticks);
+    const h = i % 5 === 0 ? 6 : 3;
+    g.appendChild(svgEl("line", { x1: px - nx * h, y1: py - ny * h, x2: px + nx * h, y2: py + ny * h, class: "dim-grad" }));
+  }
+
+  const main = svgEl("line", {
+    x1: p0[0], y1: p0[1], x2: p1[0], y2: p1[1],
+    class: dashed ? "dim-line dim-depth" : "dim-line",
+    "marker-start": "url(#dim-arrow-start)",
+    "marker-end": "url(#dim-arrow-end)",
+  });
+  g.appendChild(main);
+
+  const s = 12; // end serifs (witness marks)
+  for (const p of [p0, p1]) {
+    g.appendChild(svgEl("line", { x1: p[0] - nx * s, y1: p[1] - ny * s, x2: p[0] + nx * s, y2: p[1] + ny * s, class: "dim-witness" }));
+  }
 }
 
 function drawDimOverlay(question, dimension, W, H) {
@@ -297,6 +342,7 @@ function drawDimOverlay(question, dimension, W, H) {
   const kind = ov.kind || (ov.shape === "circle" ? "dim_ellipse" : "dim_line");
   const g = svgEl("g", { class: "dim-overlay" });
   let mid;
+  let prefix = "";
 
   if (kind === "dim_ellipse") {
     const c = ov.center || (ov.points && ov.points[0]) || [0.5, 0.5];
@@ -305,21 +351,22 @@ function drawDimOverlay(question, dimension, W, H) {
     const ry = (ov.ry != null ? ov.ry : ov.rx != null ? ov.rx : 0.04) * W;
     const rot = ov.rotation || 0;
     const xf = `rotate(${rot} ${cx} ${cy})`;
+    // Full circle/ellipse outline: a white halo under a crisp colored ring.
+    g.appendChild(svgEl("ellipse", { cx, cy, rx, ry, class: "dim-ellipse-halo", transform: xf }));
     g.appendChild(svgEl("ellipse", { cx, cy, rx, ry, class: "dim-ellipse", transform: xf }));
-    g.appendChild(svgEl("line", { x1: cx - rx, y1: cy, x2: cx + rx, y2: cy, class: "dim-line", transform: xf }));
-    mid = [cx, cy - ry - 13];
+    // The measured diameter drawn as a ruler line across it (rotated endpoints).
+    const a = (rot * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
+    drawRulerLine(g, [cx - rx * ca, cy - rx * sa], [cx + rx * ca, cy + rx * sa], false);
+    mid = [cx, cy - ry - 15];
+    prefix = "⌀ "; // diameter symbol
   } else {
     const pts = ov.points && ov.points.length >= 2 ? ov.points : [[0.4, 0.5], [0.6, 0.5]];
     const p0 = [pts[0][0] * W, pts[0][1] * H];
     const p1 = [pts[pts.length - 1][0] * W, pts[pts.length - 1][1] * H];
-    const cls = kind === "dim_depth" ? "dim-line dim-depth" : "dim-line";
-    g.appendChild(svgEl("line", { x1: p0[0], y1: p0[1], x2: p1[0], y2: p1[1], class: cls }));
+    drawRulerLine(g, p0, p1, kind === "dim_depth");
     const dx = p1[0] - p0[0], dy = p1[1] - p0[1], len = Math.hypot(dx, dy) || 1;
-    const nx = -dy / len, ny = dx / len, t = 9; // perpendicular extension ticks
-    for (const p of [p0, p1]) {
-      g.appendChild(svgEl("line", { x1: p[0] - nx * t, y1: p[1] - ny * t, x2: p[0] + nx * t, y2: p[1] + ny * t, class: "dim-tick" }));
-    }
-    mid = [(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2];
+    // Lift the chip slightly off the line so it doesn't cover the gradations.
+    mid = [(p0[0] + p1[0]) / 2 + (-dy / len) * 16, (p0[1] + p1[1]) / 2 + (dx / len) * 16];
   }
 
   const chipG = svgEl("g", { class: "dim-chip" });
@@ -330,7 +377,7 @@ function drawDimOverlay(question, dimension, W, H) {
   g.appendChild(chipG);
   overlaySvg.appendChild(g);
 
-  const chip = { group: chipG, rect, text, mid, dimension };
+  const chip = { group: chipG, rect, text, mid, dimension, prefix };
   dimChips[question.question_id] = chip;
   // Click a chip to focus (edit) its input — the other half of the two-way bind.
   chipG.addEventListener("click", () => {
@@ -346,7 +393,7 @@ function drawDimOverlay(question, dimension, W, H) {
 }
 
 function setChip(chip, textStr, cls) {
-  chip.text.textContent = textStr || "?";
+  chip.text.textContent = (chip.prefix || "") + (textStr || "?");
   chip.group.setAttribute("class", `dim-chip ${cls || ""}`);
   const pad = 6;
   const bb = chip.text.getBBox();

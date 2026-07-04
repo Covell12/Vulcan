@@ -317,6 +317,32 @@ def test_gate_not_bypassable_by_casing_or_noncanonical_paths(cleanup):
         assert client.get(path).status_code != 200, path
 
 
+def test_founder_can_download_pending_with_token(cleanup):
+    """The founder dashboard downloads a PENDING design's files by presenting the
+    review token; a plain (customer) request without one stays 403."""
+    did = _pending_freeform_design(cleanup)
+    assert client.get(f"/exports/{did}/part.stl").status_code == 403  # customer
+    r = client.get(f"/exports/{did}/part.stl", headers={"X-Review-Token": "founder"})
+    assert r.status_code == 200 and len(r.content) > 0  # founder, still pending
+
+
+def test_founder_download_requires_matching_token_when_set(cleanup, monkeypatch):
+    did = _pending_freeform_design(cleanup)
+    monkeypatch.setenv("VULCAN_REVIEW_TOKEN", "s3cret")
+    assert (
+        client.get(
+            f"/exports/{did}/part.stl", headers={"X-Review-Token": "wrong"}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.get(
+            f"/exports/{did}/part.stl", headers={"X-Review-Token": "s3cret"}
+        ).status_code
+        == 200
+    )
+
+
 def test_review_token_enforced_when_set(cleanup, monkeypatch):
     did = _pending_freeform_design(cleanup)
     monkeypatch.setenv("VULCAN_REVIEW_TOKEN", "s3cret")
