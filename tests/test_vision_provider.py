@@ -20,6 +20,7 @@ from api.vision_provider import (
     _to_anthropic_tool_schema,
     _to_openai_strict_schema,
     check_provider_configured,
+    env_shadowing,
     get_model_name,
     get_provider_name,
     parse_intent,
@@ -408,3 +409,43 @@ def test_no_other_module_imports_provider_sdks():
         "only api/vision_provider.py and api/codegen_provider.py may import a "
         "provider SDK:\n" + "\n".join(offenders)
     )
+
+
+# --- Shell-env-shadows-.env detection (the "why is it still anthropic?" trap) ---
+
+
+def _write_env(tmp_path, body: str):
+    p = tmp_path / ".env"
+    p.write_text(body)
+    return p
+
+
+def test_env_shadowing_detects_shell_override(tmp_path, monkeypatch):
+    """A shell VISION_PROVIDER that differs from .env is reported as shadowing."""
+    env = _write_env(tmp_path, "VISION_PROVIDER=openai\n")
+    monkeypatch.setenv("VISION_PROVIDER", "anthropic")
+    assert env_shadowing("VISION_PROVIDER", env) == ("anthropic", "openai")
+
+
+def test_env_shadowing_none_when_values_agree(tmp_path, monkeypatch):
+    env = _write_env(tmp_path, "VISION_PROVIDER=openai\n")
+    monkeypatch.setenv("VISION_PROVIDER", "openai")
+    assert env_shadowing("VISION_PROVIDER", env) is None
+
+
+def test_env_shadowing_none_when_no_shell_var(tmp_path, monkeypatch):
+    env = _write_env(tmp_path, "VISION_PROVIDER=openai\n")
+    monkeypatch.delenv("VISION_PROVIDER", raising=False)
+    assert env_shadowing("VISION_PROVIDER", env) is None
+
+
+def test_env_shadowing_none_when_key_absent_from_dotenv(tmp_path, monkeypatch):
+    env = _write_env(tmp_path, "OPENAI_API_KEY=sk-x\n")  # no VISION_PROVIDER line
+    monkeypatch.setenv("VISION_PROVIDER", "anthropic")
+    assert env_shadowing("VISION_PROVIDER", env) is None
+
+
+def test_env_shadowing_ignores_case_and_whitespace(tmp_path, monkeypatch):
+    env = _write_env(tmp_path, "VISION_PROVIDER=OpenAI\n")
+    monkeypatch.setenv("VISION_PROVIDER", "  openai  ")
+    assert env_shadowing("VISION_PROVIDER", env) is None

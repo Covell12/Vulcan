@@ -24,11 +24,15 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from api.photo import PhotoInput  # re-exported; shared with api/depth_provider.py
 
 load_dotenv()
+
+# The .env this repo ships with. Used to detect a shell env var silently
+# shadowing a different value in .env (see env_shadowing()).
+_DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 _SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent / "schemas" / "intent_spec.schema.json"
@@ -148,6 +152,29 @@ def _env_value_set(name: str) -> bool:
 
 def get_provider_name() -> str:
     return os.getenv("VISION_PROVIDER", "openai").strip().lower()
+
+
+def env_shadowing(key: str, dotenv_path: Path | None = None) -> tuple[str, str] | None:
+    """Detect the #1 "why is it using the wrong provider?" gotcha: a shell/OS
+    environment variable silently shadowing a different value in .env.
+
+    `load_dotenv()` does NOT override an already-set OS env var, so if you
+    `export VISION_PROVIDER=anthropic` in your shell and then set
+    `VISION_PROVIDER=openai` in .env, the shell wins and the .env edit does
+    nothing. This compares the effective OS value (post-load) to what's written
+    in .env and returns `(os_value, dotenv_value)` when they disagree — meaning
+    the OS var is shadowing the file — else None.
+    """
+    os_val = (os.environ.get(key) or "").strip()
+    if not os_val:
+        return None
+    try:
+        file_val = (dotenv_values(dotenv_path or _DOTENV_PATH).get(key) or "").strip()
+    except OSError:
+        return None
+    if file_val and file_val.lower() != os_val.lower():
+        return (os_val, file_val)
+    return None
 
 
 def get_model_name(provider: str | None = None) -> str:

@@ -71,6 +71,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   call the API — the allowlist is `VULCAN_CORS_ORIGINS` (comma-separated, default `*`), with
   `allow_credentials=False` because the founder token is a request header, not a cookie
   (that's what makes a `*` allowlist safe). CORS does not weaken the `/exports` download gate.
+  The lifespan hook now also LOGS the effective vision provider and, using
+  `vision_provider.env_shadowing`, WARNS (before the credential check, so the reason shows even
+  when the check then fails) when a shell `VISION_PROVIDER` is shadowing a different value in
+  `.env` — the classic "I set .env=openai but it still uses anthropic" trap (`load_dotenv` never
+  overrides an OS env var). Logs go to the `uvicorn.error` logger so they appear in the console.
 - **api/photo.py** (M4) — The tiny `PhotoInput` container (bytes + mime type) shared by
   both provider seams. Lives in its own neutral module so `api/vision_provider.py` and
   `api/depth_provider.py` can both accept the same type without importing each other;
@@ -167,7 +172,13 @@ non-expert can follow: what it does, why it exists, what talks to it).
   human-readable cause (auth / quota / rate-limit / model-not-found / bad-image /
   network — mapped from the exception's `status_code` + message by `_humanize_provider_error`
   without importing any SDK's error classes). That guarantees `api/intents.py` can always
-  turn a provider failure into a clean 502, never a bare 500.
+  turn a provider failure into a clean 502, never a bare 500. **env_shadowing():** a small
+  diagnostic — compares the effective `VISION_PROVIDER` (post-`load_dotenv`) against the value
+  written in `.env` and, when they differ, returns `(os_value, dotenv_value)` (else None). Since
+  `load_dotenv` never overrides an OS env var, a `export VISION_PROVIDER=…` in the shell silently
+  wins over `.env`; `api/main.py`'s startup hook uses this to warn the founder. Covered by
+  `tests/test_vision_provider.py` (shell-shadows-.env, agree, no-shell-var, key-absent, case/
+  whitespace).
 - **api/depth_provider.py** (M4) — The depth analogue of `api/vision_provider.py`, and
   the one file allowed to import `replicate` (enforced by
   `tests/test_depth_provider.py::test_only_depth_provider_imports_replicate`). Exposes one
