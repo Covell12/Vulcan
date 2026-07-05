@@ -73,7 +73,9 @@ MULTI_GEN = {
         "import cadquery as cq\n"
         "def build(params):\n"
         "    peg = cq.Workplane('XY').cylinder(float(params['w_mm']), 4)\n"
-        "    base = cq.Workplane('XY').box(20, 20, 6).translate((0, 0, -14))\n"
+        "    base = cq.Workplane('XY').box(\n"
+        "        float(params['d_mm']), float(params['d_mm']), float(params['h_mm'])\n"
+        "    ).translate((0, 0, -float(params['w_mm']) / 2 - 6))\n"
         "    return {'peg': peg, 'base': base}\n"
     ),
 }
@@ -168,7 +170,11 @@ def test_generate_success_first_try(cleanup_generated):
     assert (ff.GENERATED_DIR / r.template_id / "code.py").exists()
 
 
-def test_self_repair_unsafe_then_badbuild_then_good(cleanup_generated):
+def test_self_repair_unsafe_then_badbuild_then_good(cleanup_generated, monkeypatch):
+    # Force single-candidate rounds (BEST_OF_N=1) so the self-repair loop is
+    # sequential and deterministic: round 1 unsafe → round 2 bad-build → round 3
+    # good, each round fed the previous round's failure as retry feedback.
+    monkeypatch.setattr(ff, "BEST_OF_N", 1)
     seq = [dict(UNSAFE_GEN), dict(BADBUILD_GEN), dict(GOOD_GEN)]
     with patch("api.freeform.codegen_provider.generate_template", side_effect=seq) as m:
         r = ff.generate_and_register("a block", [])
@@ -268,3 +274,163 @@ def test_rehydrate_from_disk(cleanup_generated):
     assert reg._EPHEMERAL.get(gid) is None
     spec = get_template(gid)  # should lazily reload from disk
     assert isinstance(spec, EphemeralTemplateSpec) and spec.code
+
+
+# --- dimensional contract (Feature 3) ------------------------------------
+
+# A build() that declares h_mm but IGNORES it (fixed height 20) — the classic
+# "dead parameter" the dimensional contract must catch.
+IGNORES_PARAM_GEN = {
+    **GOOD_GEN,
+    "cadquery_code": (
+        "import cadquery as cq\n"
+        "def build(params):\n"
+        "    return cq.Workplane('XY').box(params['w_mm'], params['d_mm'], 20)\n"
+    ),
+}
+
+
+def test_dimensional_contract_flags_dead_param():
+    """Pure check: a length param whose perturbation moves neither bbox nor volume
+    is flagged dead, named in the feedback, and drops the score below 1."""
+    schema = ff.normalize_param_schema(GOOD_GEN["param_schema"])  # w_mm, d_mm, h_mm
+    measurements = {
+        "baseline": {"bbox": [40.0, 30.0, 20.0], "volume": 24000.0, "area": 5200.0},
+        "probes": {
+            "w_mm": {"built": True, "bbox": [50.0, 30.0, 20.0], "volume": 30000.0},
+            "d_mm": {"built": True, "bbox": [40.0, 37.5, 20.0], "volume": 30000.0},
+            "h_mm": {"built": True, "bbox": [40.0, 30.0, 20.0], "volume": 24000.0},
+        },
+    }
+    ok, score, feedback, detail = ff.dimensional_contract_check(schema, measurements)
+    assert ok is False
+    assert detail["dead"] == ["h_mm"]
+    assert "h_mm" in feedback
+    assert 0.0 < score < 1.0
+
+
+def test_dimensional_contract_passes_when_all_reflected():
+    schema = ff.normalize_param_schema(GOOD_GEN["param_schema"])
+    measurements = {
+        "baseline": {"bbox": [40.0, 30.0, 20.0], "volume": 24000.0},
+        "probes": {
+            "w_mm": {"built": True, "bbox": [50.0, 30.0, 20.0], "volume": 30000.0},
+            "d_mm": {"built": True, "bbox": [40.0, 37.5, 20.0], "volume": 30000.0},
+            "h_mm": {"built": True, "bbox": [40.0, 30.0, 25.0], "volume": 30000.0},
+        },
+    }
+    ok, score, feedback, detail = ff.dimensional_contract_check(schema, measurements)
+    assert ok and score == 1.0 and feedback is None and detail["dead"] == []
+
+
+def test_dimensional_contract_credits_internal_feature_via_volume():
+    """A hole diameter changes volume but not the bounding box — it must still
+    count as reflected (bbox-only checking would wrongly flag it dead)."""
+    schema = ff.normalize_param_schema(
+        [
+            {
+                "name": "hole_dia_mm",
+                "type": "number",
+                "default": 6,
+                "minimum": 2,
+                "maximum": 20,
+            }
+        ]
+    )
+    measurements = {
+        "baseline": {"bbox": [40.0, 30.0, 20.0], "volume": 23434.0},
+        "probes": {
+            "hole_dia_mm": {
+                "built": True,
+                "bbox": [40.0, 30.0, 20.0],
+                "volume": 22000.0,
+            },
+        },
+    }
+    ok, score, feedback, detail = ff.dimensional_contract_check(schema, measurements)
+    assert ok and detail["dead"] == []
+
+
+def test_ignored_param_rejected_by_generation_loop(cleanup_generated):
+    """End-to-end: a design that ignores h_mm never ships (fails the contract every
+    round) and lands in the demand log with a param-named reason."""
+    with patch(
+        "api.freeform.codegen_provider.generate_template",
+        return_value=dict(IGNORES_PARAM_GEN),
+    ):
+        r = ff.generate_and_register("a block that ignores height", [])
+    if r.template_id:
+        cleanup_generated.append(r.template_id)
+    assert not r.ok
+    assert all(a["stage"] == "dimcontract" for a in r.attempts)
+
+
+# --- best-of-N (Feature 2) -----------------------------------------------
+
+
+def test_best_of_n_evaluates_three_and_records_candidates(cleanup_generated):
+    """The first round fans out to BEST_OF_N candidates; all are recorded in
+    provenance with scores, exactly one is the winner, and losers keep their
+    code + scores for the review page."""
+    with patch(
+        "api.freeform.codegen_provider.generate_template", return_value=dict(GOOD_GEN)
+    ) as m:
+        r = ff.generate_and_register("a block", [])
+    cleanup_generated.append(r.template_id)
+    assert r.ok
+    assert m.call_count == ff.BEST_OF_N == 3
+    assert len(r.candidates) == 3
+    assert sum(1 for c in r.candidates if c["winner"]) == 1
+    for c in r.candidates:
+        assert c["code"] and c["param_schema"] and "score" in c
+    # A shippable candidate scores in [0.5, 1.0].
+    assert r.score is not None and r.score >= 0.5
+
+
+# --- visual critique loop (Feature 1) ------------------------------------
+
+
+def test_critique_below_threshold_regenerates_with_fixes(
+    cleanup_generated, monkeypatch
+):
+    """With critique enabled, a below-0.7 visual match triggers a regeneration whose
+    prompt carries the targeted fixes; a subsequent passing critique wins."""
+    monkeypatch.setenv("VULCAN_CRITIQUE", "on")
+    monkeypatch.setattr(ff, "BEST_OF_N", 1)  # deterministic single-candidate rounds
+    critiques = [
+        {
+            "matches_request": 0.4,
+            "defects": ["too plain"],
+            "targeted_fixes": ["add a chamfer"],
+        },
+        {"matches_request": 0.92, "defects": [], "targeted_fixes": []},
+    ]
+    with patch(
+        "api.freeform.codegen_provider.generate_template", return_value=dict(GOOD_GEN)
+    ) as m, patch(
+        "api.freeform.vision_provider.critique_design", side_effect=critiques
+    ) as cm:
+        r = ff.generate_and_register("a nice block", [])
+    cleanup_generated.append(r.template_id)
+    assert r.ok
+    assert cm.call_count == 2 and m.call_count == 2
+    assert r.critique["matches_request"] == 0.92
+    # The regeneration prompt included the fix from the first critique.
+    assert "add a chamfer" in (m.call_args_list[1].kwargs.get("retry_feedback") or "")
+    # All critiques are stored in provenance.
+    from api.freeform import GENERATED_DIR
+    import json as _json
+
+    prov = _json.loads((GENERATED_DIR / r.template_id / "provenance.json").read_text())
+    assert len(prov["critiques"]) == 2
+
+
+def test_critique_disabled_skips_and_still_succeeds(cleanup_generated):
+    """Default (critique off): no vision call, critique is None, design still ships."""
+    with patch(
+        "api.freeform.codegen_provider.generate_template", return_value=dict(GOOD_GEN)
+    ), patch("api.freeform.vision_provider.critique_design") as cm:
+        r = ff.generate_and_register("a block", [])
+    cleanup_generated.append(r.template_id)
+    assert r.ok and r.critique is None
+    cm.assert_not_called()

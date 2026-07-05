@@ -23,8 +23,11 @@ never exec()s it.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +36,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, create_model
 
 from api import codegen_provider
+from api import exemplar_store
 from api import sandbox
+from api import vision_provider
 from api.code_verifier import find_violations
 from api.photo import PhotoInput
 from templates_lib.registry import (
@@ -51,9 +56,43 @@ DEMAND_LOG = DATA_DIR / "demand_log.jsonl"
 # Freeform ids get a prefix so they're recognizable as generated (vs Track A).
 EPHEMERAL_PREFIX = "gen_"
 
-MAX_ATTEMPTS = 3  # 1 initial + 2 self-repair retries (per the milestone)
+MAX_ATTEMPTS = 3  # generation ROUNDS: round 1 is best-of-N, rounds 2-3 are repairs
+BEST_OF_N = 3  # candidates generated in parallel on the first round (competition)
+CRITIQUE_THRESHOLD = 0.7  # below this visual-match score → regenerate with fixes
 MAX_BBOX_MM = 250.0
 _VALID_TYPES = {"number", "integer", "boolean", "choice"}
+
+# Ranking weights for a shippable candidate (passed all hard gates). A shippable
+# candidate always outscores a non-shippable one (see _score_candidate).
+_W_GATES, _W_DIM, _W_CRIT = 0.5, 0.2, 0.3
+# How far each failed candidate got, for ranking losers so the best feedback wins.
+_STAGE_RANK = {
+    "provider": 0,
+    "validate": 1,
+    "run": 2,
+    "timeout": 2,
+    "output": 2,
+    "dfm": 3,
+    "dimcontract": 4,
+    "ok": 5,
+}
+
+
+# matplotlib/pyplot is process-global; best-of-N renders in worker threads, so
+# serialize the render step to avoid corrupting pyplot's global figure registry.
+_RENDER_LOCK = threading.Lock()
+
+
+def _critique_enabled() -> bool:
+    """Visual critique is real work (a vision call per candidate), so it's gated by
+    VULCAN_CRITIQUE (default on). Tests default it off (see tests/conftest.py) for
+    deterministic, offline, network-free runs."""
+    return os.getenv("VULCAN_CRITIQUE", "on").strip().lower() in (
+        "1",
+        "on",
+        "true",
+        "yes",
+    )
 
 
 class GenerationRejected(ValueError):
@@ -73,6 +112,68 @@ class GenerationResult:
     dfm: dict[str, Any] | None = None
     attempts: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    # M10a generation-quality provenance:
+    critique: dict[str, Any] | None = None  # the winner's visual critique
+    dim_contract: dict[str, Any] | None = (
+        None  # the winner's dimensional-contract detail
+    )
+    score: float | None = None  # the winner's overall score
+    candidates: list[dict[str, Any]] = field(
+        default_factory=list
+    )  # all evaluated (review page)
+
+
+@dataclass
+class Candidate:
+    """One generated candidate, fully evaluated (gates + dimensional contract +
+    visual critique). Holds no filesystem paths — renders/exports live only inside
+    the temp dir during evaluation; what survives is the code, scores, and the
+    critique dict, so a losing candidate is still fully reviewable."""
+
+    code: str
+    param_schema: list[dict[str, Any]]
+    critical: list[str]
+    assumptions: list[str]
+    overlays: dict[str, dict[str, Any]]
+    stage: str  # where it stopped: provider/validate/run/.../dfm/dimcontract/ok
+    ok_hard: bool  # passed sandbox + DFM + dimensional contract (shippable geometry)
+    error: str | None = None
+    dfm: dict[str, Any] | None = None
+    dim_score: float = 0.0
+    dim_detail: dict[str, Any] | None = None
+    critique: dict[str, Any] | None = None  # {matches_request, defects, targeted_fixes}
+    feedback: str | None = None  # self-repair feedback if not ideal
+    score: float = 0.0
+
+    @property
+    def critique_score(self) -> float | None:
+        if not self.critique:
+            return None
+        try:
+            return float(self.critique.get("matches_request"))
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def critique_ok(self) -> bool:
+        """A skipped critique (None) does NOT block — only a real score below the
+        threshold does."""
+        cs = self.critique_score
+        return cs is None or cs >= CRITIQUE_THRESHOLD
+
+    def provenance(self, *, winner: bool) -> dict[str, Any]:
+        return {
+            "winner": winner,
+            "stage": self.stage,
+            "ok_hard": self.ok_hard,
+            "score": round(self.score, 4),
+            "dim_score": round(self.dim_score, 4),
+            "critique": self.critique,
+            "dfm": self.dfm,
+            "error": self.error,
+            "code": self.code,
+            "param_schema": self.param_schema,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +388,156 @@ def _dfm_feedback(dfm: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Dimensional contract: every declared length param must actually move the solid
+# ---------------------------------------------------------------------------
+#
+# The codegen model sometimes declares a parameter (so the user is asked to
+# measure it) but writes build() to IGNORE it — the value has no effect on the
+# geometry, so measuring it is theatre. We catch that by PERTURBING each length
+# param and rebuilding in the sandbox: if changing the value by a real delta
+# leaves the built solid's bounding box AND volume unchanged, the param is dead.
+# Volume (not just bbox) is measured so an internal feature the bbox can't see —
+# a hole diameter, a pocket depth — still counts as "reflected".
+
+_MAX_PROBES = 6  # cap sensitivity rebuilds per candidate to bound sandbox time
+_DIM_MIN_BBOX_MM = 0.1  # a bbox shift below this (and 0.5% of size) doesn't count
+_DIM_REL = 0.005  # a >=0.5% bbox-or-volume change counts as "reflected"
+
+
+def _is_length_param(f: dict[str, Any]) -> bool:
+    """A fit dimension we can sensitivity-probe: a numeric millimetre length
+    (mm-valued names end in _mm, per the codegen contract). Counts/booleans/
+    choices/angles are not length params and aren't probed."""
+    return f["type"] in ("number", "integer") and str(f["name"]).endswith("_mm")
+
+
+def build_dimensional_probes(
+    param_schema: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One perturbed full-params set per length param (up to _MAX_PROBES), for the
+    sandbox to rebuild and measure. Perturb by max(25%, 5mm); move up if it stays
+    within `maximum`, else down within `minimum`, else skip (bounds too tight)."""
+    base = default_params(param_schema)
+    probes: list[dict[str, Any]] = []
+    for f in param_schema:
+        if not _is_length_param(f):
+            continue
+        name = f["name"]
+        try:
+            b = float(base[name])
+        except (TypeError, ValueError):
+            continue
+        delta = max(0.25 * abs(b), 5.0)
+        lo, hi = f.get("minimum"), f.get("maximum")
+        up, down = b + delta, b - delta
+        if hi is None or up <= hi:
+            v: float = up
+        elif lo is None or down >= lo:
+            v = down
+        else:
+            continue  # can't move within bounds
+        if f["type"] == "integer":
+            v = round(v)
+        if abs(v - b) < 1e-9:
+            continue
+        probes.append(
+            {"name": name, "params": {**base, name: v}, "base": b, "value": v}
+        )
+        if len(probes) >= _MAX_PROBES:
+            break
+    return probes
+
+
+def _dim_feedback(dead: list[str], probe_meta: dict[str, dict[str, Any]]) -> str:
+    bits = []
+    for name in dead:
+        pm = probe_meta.get(name, {})
+        b, v = pm.get("base"), pm.get("value")
+        if b is not None and v is not None:
+            bits.append(f"'{name}' (changed from {b:g} to {v:g} mm)")
+        else:
+            bits.append(f"'{name}'")
+    return (
+        "dimensional contract violation: parameter(s) "
+        + ", ".join(bits)
+        + " are declared but do NOT affect the built geometry — perturbing them left "
+        "the solid's bounding box AND volume unchanged. Every length parameter must "
+        "drive a real feature; rewrite build() to actually use "
+        + ", ".join(f"params['{n}']" for n in dead)
+        + "."
+    )
+
+
+def dimensional_contract_check(
+    param_schema: list[dict[str, Any]], measurements: dict[str, Any] | None
+) -> tuple[bool, float, str | None, dict[str, Any]]:
+    """Given the sandbox's baseline + per-probe measurements, verify every length
+    param moved the solid. Returns (ok, score 0-1, self-repair feedback or None,
+    detail). ok=False (with a param-named feedback) iff a probed param changed
+    NOTHING. Inconclusive params (couldn't perturb within bounds, or the perturbed
+    build failed) are neither scored nor blocked — we only fail on hard evidence."""
+    length_params = [f["name"] for f in param_schema if _is_length_param(f)]
+    if not length_params:
+        return True, 1.0, None, {"length_params": 0, "checked": [], "dead": []}
+
+    meas = measurements or {}
+    base = meas.get("baseline") or {}
+    base_bbox = base.get("bbox")
+    base_vol = base.get("volume")
+    if not base_bbox:
+        return True, 1.0, None, {"skipped": "no baseline measurement"}
+    base_size = max(base_bbox) or 1.0
+
+    probe_meas = meas.get("probes") or {}
+    probe_meta = {p["name"]: p for p in build_dimensional_probes(param_schema)}
+    checked: list[str] = []
+    dead: list[str] = []
+    details: list[dict[str, Any]] = []
+    for name in length_params:
+        pm = probe_meta.get(name)
+        r = probe_meas.get(name)
+        if pm is None or not r or not r.get("built"):
+            continue  # inconclusive
+        pbbox, pvol = r.get("bbox"), r.get("volume")
+        bbox_change = (
+            max(abs(pbbox[i] - base_bbox[i]) for i in range(3)) if pbbox else 0.0
+        )
+        vol_rel = (
+            abs(pvol - base_vol) / max(abs(base_vol), 1e-6)
+            if (pvol is not None and base_vol is not None)
+            else 0.0
+        )
+        reflected = (
+            bbox_change > max(_DIM_MIN_BBOX_MM, _DIM_REL * base_size)
+            or vol_rel > _DIM_REL
+        )
+        checked.append(name)
+        details.append(
+            {
+                "param": name,
+                "delta_mm": round(abs(pm["value"] - pm["base"]), 3),
+                "bbox_change_mm": round(bbox_change, 3),
+                "volume_change_frac": round(vol_rel, 4),
+                "reflected": reflected,
+            }
+        )
+        if not reflected:
+            dead.append(name)
+
+    total = len(checked)
+    score = 1.0 if total == 0 else (total - len(dead)) / total
+    detail = {
+        "length_params": len(length_params),
+        "checked": checked,
+        "dead": dead,
+        "probes": details,
+    }
+    if dead:
+        return False, score, _dim_feedback(dead, probe_meta), detail
+    return True, score, None, detail
+
+
+# ---------------------------------------------------------------------------
 # Persistence + rehydration
 # ---------------------------------------------------------------------------
 
@@ -417,100 +668,384 @@ def _normalize_overlays(raw: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _probe_timeout(n_probes: int) -> int:
+    """Give the sandbox a bit more wall-clock when it must also rebuild N probes."""
+    return min(120, sandbox.DEFAULT_TIMEOUT_S + 8 * max(0, n_probes))
+
+
+def _critique_feedback(critique: dict[str, Any]) -> str:
+    """Turn a below-threshold visual critique into self-repair feedback."""
+    defects = [str(d) for d in (critique.get("defects") or []) if d]
+    fixes = [str(f) for f in (critique.get("targeted_fixes") or []) if f]
+    lines = []
+    if defects:
+        lines.append(
+            "A visual review of the rendered part found: " + "; ".join(defects) + "."
+        )
+    if fixes:
+        lines.append("Apply these specific fixes: " + "; ".join(fixes) + ".")
+    return " ".join(lines) or (
+        "The rendered part did not clearly match the request; redesign it to be "
+        "obviously the requested part with the right functional features."
+    )
+
+
+def _score_candidate(c: Candidate) -> float:
+    """Overall ranking score. A shippable candidate (all hard gates passed) scores
+    in [0.5, 1.0] = gates + dimensional-contract + critique; a non-shippable one
+    scores in [0, 0.32] by how far it got — so shippable ALWAYS wins."""
+    if c.ok_hard:
+        crit = c.critique_score if c.critique_score is not None else CRITIQUE_THRESHOLD
+        c.score = _W_GATES * 1.0 + _W_DIM * c.dim_score + _W_CRIT * crit
+    else:
+        c.score = 0.4 * (_STAGE_RANK.get(c.stage, 0) / 5.0)
+    return c.score
+
+
+def _run_critique(
+    parts: list[dict],
+    request_text: str,
+    params: dict[str, Any],
+    param_schema: list[dict[str, Any]],
+    tmpdir: str,
+) -> dict[str, Any] | None:
+    """Render the built part from 4 canonical views and get a visual critique.
+    Best-effort: any failure (provider down, render/pyplot error) → None, so
+    critique never blocks an otherwise-good candidate. The render is serialized
+    (matplotlib/pyplot is process-global and best-of-N runs candidates in threads)."""
+    try:
+        from api.rendering import render_canonical_views
+
+        stl_paths = [p["stl"] for p in parts]
+        with _RENDER_LOCK:
+            views = render_canonical_views(stl_paths, Path(tmpdir) / "views")
+        if not views:
+            return None
+        return vision_provider.critique_design(
+            views, request_text, params, param_schema
+        )
+    except vision_provider.VisionProviderError:
+        return None
+    except Exception:  # noqa: BLE001 — critique is advisory; never let it crash a build
+        return None
+
+
+def _evaluate_candidate(
+    gen: dict[str, Any],
+    request_text: str,
+    run_critique: bool,
+    progress: Any = None,
+) -> Candidate:
+    """Take one raw codegen output through every gate: validate → sandbox build
+    (+ dimensional probes) → DFM → dimensional contract → visual critique. Returns
+    a fully-scored Candidate. Never raises."""
+    code = gen.get("cadquery_code") or ""
+    critical = list(gen.get("critical_dims") or [])
+    assumptions = list(gen.get("assumptions") or [])
+    overlays = _normalize_overlays(gen.get("overlays"))
+
+    def make(
+        stage: str, *, ok_hard: bool = False, param_schema=None, **kw
+    ) -> Candidate:
+        c = Candidate(
+            code=code,
+            param_schema=param_schema or [],
+            critical=critical,
+            assumptions=assumptions,
+            overlays=overlays,
+            stage=stage,
+            ok_hard=ok_hard,
+            **kw,
+        )
+        _score_candidate(c)
+        return c
+
+    try:
+        param_schema = normalize_param_schema(gen.get("param_schema") or [])
+        _validate_candidate(code, param_schema, critical)
+    except GenerationRejected as e:
+        return make("validate", error=str(e), feedback=str(e))
+
+    probes = build_dimensional_probes(param_schema)
+    with tempfile.TemporaryDirectory(prefix="vulcan_gen_") as tmp:
+        result = sandbox.run_generated_build(
+            code,
+            default_params(param_schema),
+            Path(tmp) / "out",
+            timeout_s=_probe_timeout(len(probes)),
+            probe_params=probes,
+        )
+        if not result.ok:
+            fb = f"The generated code failed to build ({result.stage}): {result.error}"
+            return make(
+                result.stage, param_schema=param_schema, error=result.error, feedback=fb
+            )
+
+        dfm_ok, dfm = dfm_check_parts(result.parts or [])
+        if not dfm_ok:
+            fb = "The built part failed DFM checks: " + _dfm_feedback(dfm)
+            return make("dfm", param_schema=param_schema, dfm=dfm, feedback=fb)
+
+        dim_ok, dim_score, dim_fb, dim_detail = dimensional_contract_check(
+            param_schema, result.measurements
+        )
+        if not dim_ok:
+            return make(
+                "dimcontract",
+                param_schema=param_schema,
+                dfm=dfm,
+                dim_score=dim_score,
+                dim_detail=dim_detail,
+                error=dim_fb,
+                feedback=dim_fb,
+            )
+
+        critique = None
+        if run_critique:
+            if progress:
+                progress("critiquing")
+            critique = _run_critique(
+                result.parts or [],
+                request_text,
+                default_params(param_schema),
+                param_schema,
+                tmp,
+            )
+
+    c = make(
+        "ok",
+        ok_hard=True,
+        param_schema=param_schema,
+        dfm=dfm,
+        dim_score=dim_score,
+        dim_detail=dim_detail,
+        critique=critique,
+    )
+    if critique is not None and not c.critique_ok:
+        c.feedback = _critique_feedback(critique)
+    return c
+
+
+def _generate_one(
+    request_text: str,
+    photos: list[PhotoInput],
+    dims_hints: list[dict[str, Any]] | None,
+    feedback: str | None,
+    exemplars: list[dict[str, Any]] | None,
+    run_critique: bool,
+    progress: Any = None,
+) -> Candidate:
+    """Generate ONE candidate (codegen → full evaluation). Runs in a worker thread
+    during best-of-N; never raises."""
+    try:
+        gen = codegen_provider.generate_template(
+            request_text,
+            photos,
+            dims_hints,
+            retry_feedback=feedback,
+            exemplars=exemplars,
+        )
+    except codegen_provider.CodegenProviderError as e:
+        c = Candidate(
+            code="",
+            param_schema=[],
+            critical=[],
+            assumptions=[],
+            overlays={},
+            stage="provider",
+            ok_hard=False,
+            error=str(e),
+            feedback=f"The generation service errored: {e}",
+        )
+        _score_candidate(c)
+        return c
+    return _evaluate_candidate(gen, request_text, run_critique, progress)
+
+
+def _attempt_record(rnd: int, c: Candidate) -> dict[str, Any]:
+    return {
+        "round": rnd,
+        "stage": c.stage,
+        "score": round(c.score, 4),
+        "ok_hard": c.ok_hard,
+        "dim_score": round(c.dim_score, 4),
+        "dfm": c.dfm,
+        "critique": c.critique,
+        "error": c.error,
+    }
+
+
+def _finalize(
+    winner: Candidate,
+    request_text: str,
+    attempts: list[dict[str, Any]],
+    all_candidates: list[Candidate],
+    critiques: list[dict[str, Any]],
+    *,
+    low_critique: bool = False,
+) -> GenerationResult:
+    """Persist the winning candidate + full provenance (every evaluated candidate,
+    all critiques) and register it as an ephemeral template."""
+    gen_id = EPHEMERAL_PREFIX + uuid.uuid4().hex[:12]
+    provenance_candidates = [
+        c.provenance(winner=(c is winner))
+        for c in all_candidates
+        if c.code or c is winner
+    ]
+    _persist(
+        gen_id,
+        winner.code,
+        winner.param_schema,
+        winner.critical,
+        {
+            "request": request_text,
+            "assumptions": winner.assumptions,
+            "critical_dims": winner.critical,
+            "overlays": winner.overlays,
+            "dfm": winner.dfm,
+            "attempts": attempts,
+            "critique": winner.critique,
+            "dim_contract": winner.dim_detail,
+            "score": round(winner.score, 4),
+            "best_of_n": BEST_OF_N,
+            "low_critique": low_critique,
+            "candidates": provenance_candidates,
+            "critiques": critiques,
+            "created_at": _now(),
+        },
+    )
+    spec = _make_spec(gen_id, winner.code, winner.param_schema, winner.critical)
+    return GenerationResult(
+        ok=True,
+        template_id=gen_id,
+        spec=spec,
+        param_schema=winner.param_schema,
+        critical_dims=winner.critical,
+        assumptions=winner.assumptions,
+        overlays=winner.overlays,
+        dfm=winner.dfm,
+        attempts=attempts,
+        critique=winner.critique,
+        dim_contract=winner.dim_detail,
+        score=round(winner.score, 4),
+        candidates=provenance_candidates,
+    )
+
+
 def generate_and_register(
     request_text: str,
     photos: list[PhotoInput],
     dims_hints: list[dict[str, Any]] | None = None,
+    *,
+    progress: Any = None,
 ) -> GenerationResult:
-    """Run the generate → verify → sandbox-build → DFM loop with self-repair.
-    Returns a GenerationResult; on total failure logs to the demand log."""
-    feedback: str | None = None
+    """The Track B loop with COMPETITION + EYES + MEMORY (M10a):
+
+      round 1  → best-of-N: BEST_OF_N candidates generated IN PARALLEL, each taken
+                 through validate → sandbox build (+ dimensional probes) → DFM →
+                 dimensional contract → visual critique, then scored; the winner
+                 is auto-selected.
+      rounds   → if the winner isn't shippable OR its visual-match score is below
+       2..MAX    CRITIQUE_THRESHOLD, regenerate ONE candidate with the winner's
+                 feedback appended (critique defects/fixes, or the gate error).
+
+    Retrieved approved exemplars (api/exemplar_store) are fed to codegen as extra
+    few-shot references. Returns a GenerationResult; if the geometry is valid but
+    critique never cleared the bar, the best shippable candidate still ships (the
+    founder review gate is the final backstop). Total failure → demand log."""
+    run_critique = _critique_enabled()
+    if progress:
+        progress("generating")
+    try:
+        exemplars = exemplar_store.retrieve(request_text, k=2) or None
+    except Exception:  # noqa: BLE001 — memory is an optimization; never block on it
+        exemplars = None
+
     attempts: list[dict[str, Any]] = []
+    all_candidates: list[Candidate] = []
+    critiques: list[dict[str, Any]] = []
+    best_shippable: Candidate | None = None
+    feedback: str | None = None
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            gen = codegen_provider.generate_template(
-                request_text, photos, dims_hints, retry_feedback=feedback
-            )
-        except codegen_provider.CodegenProviderError as e:
-            attempts.append({"attempt": attempt, "stage": "provider", "error": str(e)})
-            feedback = f"The generation service errored: {e}"
-            continue
-
-        code = gen.get("cadquery_code") or ""
-        critical = list(gen.get("critical_dims") or [])
-        assumptions = list(gen.get("assumptions") or [])
-        overlays = _normalize_overlays(gen.get("overlays"))
-
-        try:
-            param_schema = normalize_param_schema(gen.get("param_schema") or [])
-            _validate_candidate(code, param_schema, critical)
-        except GenerationRejected as e:
-            attempts.append({"attempt": attempt, "stage": "validate", "error": str(e)})
-            feedback = str(e)
-            continue
-
-        with tempfile.TemporaryDirectory(prefix="vulcan_gen_") as tmp:
-            result = sandbox.run_generated_build(
-                code, default_params(param_schema), Path(tmp) / "out"
-            )
-            if not result.ok:
-                attempts.append(
-                    {"attempt": attempt, "stage": result.stage, "error": result.error}
+    for rnd in range(1, MAX_ATTEMPTS + 1):
+        n = BEST_OF_N if rnd == 1 else 1
+        if n == 1:
+            candidates = [
+                _generate_one(
+                    request_text,
+                    photos,
+                    dims_hints,
+                    feedback,
+                    exemplars,
+                    run_critique,
+                    progress,
                 )
-                feedback = f"The generated code failed to build ({result.stage}): {result.error}"
-                continue
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=n) as pool:
+                futures = [
+                    pool.submit(
+                        _generate_one,
+                        request_text,
+                        photos,
+                        dims_hints,
+                        feedback,
+                        exemplars,
+                        run_critique,
+                        progress,
+                    )
+                    for _ in range(n)
+                ]
+                candidates = [f.result() for f in futures]  # submission order
 
-            dfm_ok, dfm = dfm_check_parts(result.parts or [])
+        for c in candidates:
+            attempts.append(_attempt_record(rnd, c))
+            if c.critique is not None:
+                critiques.append(
+                    {
+                        "round": rnd,
+                        "matches_request": c.critique_score,
+                        "defects": c.critique.get("defects"),
+                        "targeted_fixes": c.critique.get("targeted_fixes"),
+                    }
+                )
+        all_candidates.extend(candidates)
 
-        if not dfm_ok:
-            attempts.append({"attempt": attempt, "stage": "dfm", "dfm": dfm})
-            feedback = "The built part failed DFM checks: " + _dfm_feedback(dfm)
-            continue
+        ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
+        winner = ranked[0]
+        for c in ranked:
+            if c.ok_hard and (best_shippable is None or c.score > best_shippable.score):
+                best_shippable = c
 
-        # Success.
-        gen_id = EPHEMERAL_PREFIX + uuid.uuid4().hex[:12]
-        attempts.append({"attempt": attempt, "stage": "ok", "dfm": dfm})
-        _persist(
-            gen_id,
-            code,
-            param_schema,
-            critical,
-            {
-                "request": request_text,
-                "assumptions": assumptions,
-                "critical_dims": critical,
-                "overlays": overlays,
-                "dfm": dfm,
-                "attempts": attempts,
-                "created_at": _now(),
-            },
+        if winner.ok_hard and winner.critique_ok:
+            return _finalize(winner, request_text, attempts, all_candidates, critiques)
+
+        feedback = (
+            winner.feedback
+            or (best_shippable.feedback if best_shippable else None)
+            or "Redesign the part so it more clearly and correctly fulfills the request."
         )
-        spec = _make_spec(gen_id, code, param_schema, critical)
-        return GenerationResult(
-            ok=True,
-            template_id=gen_id,
-            spec=spec,
-            param_schema=param_schema,
-            critical_dims=critical,
-            assumptions=assumptions,
-            overlays=overlays,
-            dfm=dfm,
-            attempts=attempts,
+
+    # Rounds exhausted. Valid geometry that never cleared the critique bar still
+    # ships — a real, printable part beats nothing, and the founder review gate is
+    # the final quality check.
+    if best_shippable is not None:
+        return _finalize(
+            best_shippable,
+            request_text,
+            attempts,
+            all_candidates,
+            critiques,
+            low_critique=True,
         )
 
-    # All attempts failed.
-    log_demand(
-        request_text,
-        "auto_generation_failed",
-        {"attempts": attempts},
-    )
+    log_demand(request_text, "auto_generation_failed", {"attempts": attempts})
     return GenerationResult(
         ok=False,
         attempts=attempts,
         error=(
             "We couldn't design this automatically after "
-            f"{MAX_ATTEMPTS} attempts. Your request has been logged for a human to look at."
+            f"{MAX_ATTEMPTS} rounds. Your request has been logged for a human to look at."
         ),
     )
 

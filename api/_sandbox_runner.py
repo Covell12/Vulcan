@@ -9,7 +9,12 @@ CadQuery module) and `<workdir>/params.json`, then:
      admits cadquery/math/numpy, and builtins with open/eval/exec/compile/input
      removed,
   3. calls `build(params)` and exports STEP/STL/3MF into `<workdir>/out/`,
-  4. writes `<workdir>/result.json` with the outcome.
+  4. MEASURES the built solid (overall bbox extents, total volume, total surface
+     area) and, if `<workdir>/probes.json` lists alternate param sets, rebuilds
+     the solid under each (measure only, no export) so the parent can check the
+     DIMENSIONAL CONTRACT — that every declared length param actually drives the
+     geometry (a param that changes nothing is a dead param),
+  5. writes `<workdir>/result.json` with the outcome + measurements.
 
 Untrusted stdout/stderr are silenced; all communication back to the parent is
 via result.json, so a flood of prints can't matter. This runner itself is
@@ -69,22 +74,78 @@ def _write_result(
     ok: bool,
     error: str | None = None,
     parts: list[str] | None = None,
+    measurements: dict | None = None,
 ) -> None:
     try:
         (workdir / "result.json").write_text(
-            json.dumps({"ok": ok, "error": error, "parts": parts or []}),
+            json.dumps(
+                {
+                    "ok": ok,
+                    "error": error,
+                    "parts": parts or [],
+                    "measurements": measurements or {},
+                }
+            ),
             encoding="utf-8",
         )
     except Exception:
         pass
 
 
-def _run(workdir: Path, repo_root: str) -> list[str]:
+def _measure_parts(parts: list[tuple[str, object]]) -> dict:
+    """Measure an assembly straight from the CadQuery solids — overall bounding-box
+    extents [x,y,z] (union across parts), total volume, total surface area. No
+    export; each metric is best-effort (a metric that can't be computed is None).
+    These feed the parent's dimensional-contract check (perturb a param → does the
+    built solid actually change?)."""
+    import math
+
+    mins = [math.inf, math.inf, math.inf]
+    maxs = [-math.inf, -math.inf, -math.inf]
+    volume = 0.0
+    area = 0.0
+    bb_ok = vol_ok = area_ok = False
+    for _name, solid in parts:
+        try:
+            shape = solid.val() if hasattr(solid, "val") else solid
+        except Exception:
+            continue
+        try:
+            bb = shape.BoundingBox()
+            mins[0], maxs[0] = min(mins[0], bb.xmin), max(maxs[0], bb.xmax)
+            mins[1], maxs[1] = min(mins[1], bb.ymin), max(maxs[1], bb.ymax)
+            mins[2], maxs[2] = min(mins[2], bb.zmin), max(maxs[2], bb.zmax)
+            bb_ok = True
+        except Exception:
+            pass
+        try:
+            volume += float(shape.Volume())
+            vol_ok = True
+        except Exception:
+            pass
+        try:
+            area += float(shape.Area())
+            area_ok = True
+        except Exception:
+            pass
+    bbox = [round(maxs[i] - mins[i], 4) for i in range(3)] if bb_ok else None
+    return {
+        "bbox": bbox,
+        "volume": round(volume, 4) if vol_ok else None,
+        "area": round(area, 4) if area_ok else None,
+    }
+
+
+def _run(workdir: Path, repo_root: str) -> tuple[list[str], dict]:
     sys.path.insert(0, repo_root)
     from api.code_verifier import ALLOWED_IMPORT_ROOTS, ENTRYPOINT, verify_code
 
     code = (workdir / "code.py").read_text(encoding="utf-8")
     params = json.loads((workdir / "params.json").read_text(encoding="utf-8"))
+    try:
+        probes = json.loads((workdir / "probes.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        probes = []
 
     # Belt to the parent's braces: reject again here, in the sandbox, before exec.
     verify_code(code)
@@ -143,7 +204,24 @@ def _run(workdir: Path, repo_root: str) -> list[str]:
             exporters.export(solid, str(out / f"{name}.stl"))
             exporters.export(solid, str(out / f"{name}.3mf"))
             names.append(name)
-        return names
+
+        # Dimensional contract: measure the baseline, then rebuild under each
+        # probe's perturbed params and measure (no export) so the parent can tell
+        # whether every declared length param actually moves the geometry.
+        measurements: dict = {"baseline": _measure_parts(parts), "probes": {}}
+        for probe in probes[:_MAX_PARTS]:
+            pname = str(probe.get("name", ""))
+            try:
+                pbuilt = _normalize_parts(build(probe.get("params", {})))
+                measurements["probes"][pname] = {
+                    "built": True,
+                    **_measure_parts(pbuilt),
+                }
+            except (
+                Exception
+            ) as e:  # noqa: BLE001 — a probe that can't build is inconclusive
+                measurements["probes"][pname] = {"built": False, "error": str(e)[:200]}
+        return names, measurements
     finally:
         sys.stdout, sys.stderr = saved_out, saved_err
         devnull.close()
@@ -153,8 +231,8 @@ def main() -> None:
     workdir = Path(sys.argv[1])
     repo_root = sys.argv[2]
     try:
-        names = _run(workdir, repo_root)
-        _write_result(workdir, True, parts=names)
+        names, measurements = _run(workdir, repo_root)
+        _write_result(workdir, True, parts=names, measurements=measurements)
     except Exception as e:  # noqa: BLE001 — any failure is a build failure
         detail = f"{type(e).__name__}: {e}"
         tb = traceback.format_exc()

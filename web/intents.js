@@ -1044,22 +1044,55 @@ function setStatusText(el, message, isError) {
   el.classList.toggle("error", Boolean(isError));
 }
 
+// Friendly per-stage progress copy for the async generation job.
+const FREEFORM_STAGE_MESSAGE = {
+  queued: "Queued…",
+  generating: "Designing candidates in parallel… (generating code, building, and safety-checking each).",
+  critiquing: "Reviewing the renders and picking the best design…",
+  ready: "Custom design ready — confirm the measurements below.",
+  failed: "We couldn't design this automatically.",
+};
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function runFreeform(statusEl, btn) {
   if (!currentIntent) return;
   btn.disabled = true;
-  setStatusText(statusEl, "Designing your custom part… this can take a moment (generating code, building, and safety-checking it).", false);
+  setStatusText(statusEl, FREEFORM_STAGE_MESSAGE.generating, false);
   try {
-    const response = await VulcanAPI.freeform(currentIntent.intent_id);
-    if (!response.ok) throw new Error(await describeFetchError(response));
-    currentIntent = await response.json();
-    if (currentIntent.template_id) {
-      setStatusText(statusEl, "Custom design ready — confirm the measurements below.", false);
+    const startResp = await VulcanAPI.freeform(currentIntent.intent_id);
+    if (!startResp.ok) throw new Error(await describeFetchError(startResp));
+    const started = await startResp.json();
+    const statusUrl = started.status_url;
+
+    // Poll the job, surfacing each stage (generating → critiquing → ready/failed).
+    let job = started;
+    for (let i = 0; i < 600; i += 1) {
+      const jobResp = await VulcanAPI.freeformJob(statusUrl);
+      if (!jobResp.ok) throw new Error(await describeFetchError(jobResp));
+      job = await jobResp.json();
+      const stage = job.stage || job.status;
+      if (stage === "ready" || stage === "failed") break;
+      setStatusText(statusEl, FREEFORM_STAGE_MESSAGE[stage] || "Working…", false);
+      await sleep(1200);
+    }
+
+    if (job.status === "ready" && job.intent && job.intent.template_id) {
+      currentIntent = job.intent;
+      setStatusText(statusEl, FREEFORM_STAGE_MESSAGE.ready, false);
       freeformPanel.hidden = true;
       renderQuestions();
       renderResult();
     } else {
       // Generation failed (logged to the demand log); show the honest message.
-      setStatusText(statusEl, currentIntent.freeform_error || "We couldn't design this automatically.", true);
+      if (job.intent) currentIntent = job.intent;
+      const msg =
+        (currentIntent && currentIntent.freeform_error) ||
+        job.error ||
+        FREEFORM_STAGE_MESSAGE.failed;
+      setStatusText(statusEl, msg, true);
     }
   } catch (err) {
     setStatusText(statusEl, `Error: ${errorText(err)}`, true);

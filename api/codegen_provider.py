@@ -301,14 +301,19 @@ def generate_template(
     dims_hints: list[dict[str, Any]] | None = None,
     *,
     retry_feedback: str | None = None,
+    exemplars: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Ask the model to author a one-off parametric template. Returns a dict with
     cadquery_code / param_schema / assumptions / critical_dims. Raises
-    CodegenProviderError on any provider/parse failure."""
+    CodegenProviderError on any provider/parse failure.
+
+    `exemplars` (optional): previously-approved designs retrieved by similarity
+    (api/exemplar_store) to append as EXTRA few-shot references beyond the two
+    static ones baked into the system prompt."""
     provider = get_provider_name()
     check_provider_configured(provider)
     model = get_model_name(provider)
-    user_text = _build_user_prompt(request_text, dims_hints, retry_feedback)
+    user_text = _build_user_prompt(request_text, dims_hints, retry_feedback, exemplars)
 
     if provider == "openai":
         return _generate_openai(photos, user_text, model)
@@ -317,10 +322,32 @@ def generate_template(
     raise CodegenProviderError(f"Unknown CODEGEN_PROVIDER '{provider}'.")
 
 
+_MAX_EXEMPLAR_CODE_CHARS = 4000
+
+
+def _render_exemplars(exemplars: list[dict[str, Any]] | None) -> str | None:
+    """Format retrieved approved designs as extra few-shot references for the
+    prompt. Returns None when there are none (caller then relies on the static
+    exemplars in the system prompt)."""
+    if not exemplars:
+        return None
+    blocks = [
+        "Here are previously-APPROVED Vulcan designs for SIMILAR requests. Study "
+        "them as strong references for structure, parameter naming, and how to keep "
+        "each piece one manifold solid. Do NOT copy them — design for THIS request:"
+    ]
+    for i, ex in enumerate(exemplars, start=1):
+        req = str(ex.get("request_text", "")).strip()
+        code = str(ex.get("code", ""))[:_MAX_EXEMPLAR_CODE_CHARS]
+        blocks.append(f'APPROVED EXEMPLAR {i} (request: "{req}"):\n{code}')
+    return "\n\n".join(blocks)
+
+
 def _build_user_prompt(
     request_text: str,
     dims_hints: list[dict[str, Any]] | None,
     retry_feedback: str | None,
+    exemplars: list[dict[str, Any]] | None = None,
 ) -> str:
     parts = [f"User's request: {request_text}"]
     if dims_hints:
@@ -328,6 +355,9 @@ def _build_user_prompt(
             "Rough size hints inferred from the photo/text (millimetres, "
             f"uncalibrated — treat as starting points, not truth): {json.dumps(dims_hints)}"
         )
+    rendered = _render_exemplars(exemplars)
+    if rendered:
+        parts.append(rendered)
     if retry_feedback:
         parts.append(
             "Your PREVIOUS attempt failed — fix it and return a fully corrected design. "

@@ -189,6 +189,62 @@ function el(tag, props = {}, children = []) {
   return node;
 }
 
+// One-line summary of the winning candidate's visual critique (M10a Feature 1).
+function critiqueLine(critique, score) {
+  const bits = [];
+  if (critique && critique.matches_request !== undefined && critique.matches_request !== null) {
+    const pct = Math.round(Number(critique.matches_request) * 100);
+    bits.push(`visual match ${pct}%`);
+    const defects = (critique.defects || []).filter(Boolean);
+    if (defects.length) bits.push(`defects: ${defects.join("; ")}`);
+  } else {
+    bits.push("visual critique: not run");
+  }
+  if (score !== undefined && score !== null) bits.push(`overall score ${Number(score).toFixed(2)}`);
+  return bits.join(" · ");
+}
+
+// Dimensional-contract summary: which length params were verified to actually
+// drive the geometry (M10a Feature 3).
+function dimContractLine(dim) {
+  if (!dim) return null;
+  if (dim.dead && dim.dead.length) return `dead params: ${dim.dead.join(", ")} ✗`;
+  const checked = (dim.checked || []).length;
+  if (!checked) return "no length params probed";
+  return `all ${checked} length param(s) verified to drive geometry ✓`;
+}
+
+// Best-of-N provenance: every evaluated candidate with its stage + scores, the
+// winner marked (M10a Feature 2).
+function candidatesBlock(candidates) {
+  if (!candidates || candidates.length <= 1) return null;
+  const rows = candidates.map((c, i) => {
+    const crit =
+      c.critique && c.critique.matches_request != null
+        ? `${Math.round(Number(c.critique.matches_request) * 100)}%`
+        : "—";
+    return el("tr", { className: c.winner ? "candidate-winner" : "" }, [
+      el("td", { textContent: c.winner ? `#${i + 1} ★` : `#${i + 1}` }),
+      el("td", { textContent: c.stage }),
+      el("td", { textContent: c.score != null ? Number(c.score).toFixed(2) : "—" }),
+      el("td", { textContent: crit }),
+    ]);
+  });
+  const table = el("table", { className: "review-candidates" }, [
+    el("tr", {}, [
+      el("th", {}, "cand"),
+      el("th", {}, "stage"),
+      el("th", {}, "score"),
+      el("th", {}, "visual"),
+    ]),
+    ...rows,
+  ]);
+  return el("details", {}, [
+    el("summary", {}, `Best-of-${candidates.length} candidates`),
+    table,
+  ]);
+}
+
 function renderCard(record) {
   const card = el("div", { className: "review-card" });
 
@@ -218,6 +274,22 @@ function renderCard(record) {
   }
 
   card.append(el("p", { className: "review-dfm" }, [el("strong", {}, "DFM: "), dfmLine(record.dfm)]));
+
+  // Generation quality (M10a): visual critique + dimensional contract.
+  card.append(
+    el("p", { className: "review-critique" }, [
+      el("strong", {}, "Quality: "),
+      critiqueLine(record.critique, record.score),
+    ])
+  );
+  const dimLine = dimContractLine(record.dim_contract);
+  if (dimLine) {
+    card.append(
+      el("p", { className: "review-dimcontract" }, [el("strong", {}, "Dimensions: "), dimLine])
+    );
+  }
+  const cands = candidatesBlock(record.candidates);
+  if (cands) card.append(cands);
 
   // The part: dimensioned render, the in-photo composite (with/without model),
   // and an interactive 3D viewer — the founder can fly around the model.

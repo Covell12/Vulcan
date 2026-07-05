@@ -171,6 +171,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   now requires every `measure_mm` question to set `dim_name` to a template param and to
   ONLY ask about the chosen template's own numeric params (no invented extra measurements)
   — `api/intents.py` still handles the stragglers, but this reduces them at the source.
+  **M10a (visual critique):** this seam also exposes `critique_design(render_paths,
+  request_text, params, param_schema)` — it sends 4 canonical renders of a generated part to
+  the vision model and returns `{matches_request 0–1, defects[], targeted_fixes[]}` (same
+  provider selection + `VisionProviderError` contract). This is the "eyes" of the freeform
+  best-of-N loop.
   **M7:** the prompt now demands routing honesty — it sets `template_fit` (0-1) and lists
   `unsupported_features` the template can't express, and is told that shoehorning a bad fit
   is worse than admitting "other" (fixing the greedy router). The overlay instructions were
@@ -294,6 +299,14 @@ non-expert can follow: what it does, why it exists, what talks to it).
   failure it returns the intent with an honest `freeform_error` (the request is already logged
   to the demand log). The join, for a freeform intent, writes a `pending_review` design record
   (api/design_store) so it lands in the founder queue with downloads gated (api/review).
+  **M10a (async freeform):** because best-of-N + visual critique is slow, `POST
+  /intents/{id}/freeform` is now ASYNC — it does the cheap pre-checks, then returns `202` with
+  `{job_id, status_url}` and runs generation on a background job (`api/jobs`). `GET
+  /intents/{id}/freeform/{job_id}` polls the job (stage generating→critiquing→ready|failed) and,
+  on ready, returns the updated intent. `_apply_freeform_outcome` (run on the job thread) adopts
+  the winning template and stashes the generation-quality provenance (`freeform_critique`,
+  `freeform_dim_contract`, `freeform_score`, `freeform_candidates`) on the intent — which the
+  design join then copies onto the review record.
   **M7 (Part A routing fix):** `_apply_freeform_routing` sets `freeform_available` (true for
   any in-scope request — the always-on override) and `freeform_recommended` (true when no
   template matched, `template_fit` < 0.65, or any `unsupported_features`) so the greedy router
@@ -351,6 +364,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   3D limits, so a degenerate/flat mesh (e.g. a broken template producing a single planar
   face) renders instead of crashing matplotlib's projection — the manifold gate is what then
   rejects such a part, with a clean message rather than a traceback from the preview step.
+  **M10a:** adds `render_canonical_views(stl_paths, out_dir)` — 4 fixed camera angles
+  (`CANONICAL_VIEWS`: iso/front/side/top, colored per part) written as PNGs, the "eyes" the
+  freeform visual-critique loop feeds to `vision_provider.critique_design`. Same headless
+  trimesh+matplotlib path; freeform serializes calls to it (pyplot is process-global and
+  best-of-N renders in threads).
 
 ### Track B — freeform generation (M-B)
 
@@ -382,12 +400,22 @@ sandbox; every freeform design requires founder review before its files can ship
   come back as `SandboxResult(ok=False, stage=...)` (never an exception) so the self-repair
   loop can learn from them. Honest limitation, documented in the module + security notes: this
   is static-analysis + process-isolation + rlimits, NOT a syscall jail (no container/seccomp);
-  on macOS some rlimits aren't enforced (the timeout is the primary bound there).
+  on macOS some rlimits aren't enforced (the timeout is the primary bound there). **M10a
+  (dimensional contract):** `run_generated_build` takes an optional `probe_params` (a list of
+  perturbed full-param sets); the runner builds each and measures it, and the measurements
+  (`{baseline, probes}` each with bbox/volume/area) ride back on `SandboxResult.measurements`.
+  The CPU rlimit now scales with the wall-clock timeout (`_make_preexec`), since a probe-heavy
+  build legitimately takes longer.
 - **api/_sandbox_runner.py** (M-B) — The tiny script that runs INSIDE that subprocess (never
   imported into the API process). Re-verifies the code (defense in depth), then `exec`s it in
   a locked-down namespace — a guarded `__import__` admitting only cadquery/math/numpy and
   builtins with `open`/`eval`/`exec`/`compile` removed — calls `build(params)`, exports the
   three formats, and writes `result.json`. The untrusted code's stdout/stderr are silenced.
+  **M10a:** after exporting, it MEASURES the built solid straight from the CadQuery shapes
+  (`_measure_parts`: union bbox extents, total volume, total surface area — no extra export),
+  and if `probes.json` lists alternate param sets it rebuilds under each and measures those too
+  (measure-only), so the parent can verify every declared length param actually moves the
+  geometry. Measurements go into `result.json`.
 - **api/codegen_provider.py** (M-B) — The code-generation seam (same shape as
   `vision_provider`/`depth_provider`): `generate_template(request, photos, dims_hints,
   retry_feedback=None)` returns `{cadquery_code, param_schema, assumptions, critical_dims}`.
@@ -406,21 +434,54 @@ sandbox; every freeform design requires founder review before its files can ship
   floating fragments) and function-first geometry, and allows returning a dict of SEPARATE named
   pieces when the hardware genuinely needs an assembly (positioned where they mate, with a
   printing clearance, NOT fused). `freeform.dfm_check_parts` runs the gate on every piece and
-  `_dfm_feedback` names the failing piece for the self-repair loop.
-- **api/freeform.py** (M-B) — Orchestrates generation: normalizes the model's param_schema and
-  builds a pydantic params model from it (`create_model`, with ge/le bounds + Literal enums),
-  verifies the code, TEST-BUILDS it in the sandbox with default params, and runs the DFM gate
-  (`dfm_check`: manifold + size ceiling; min-wall is prompt-guided + founder-reviewed, not
-  auto-verified — stated in the security notes). SELF-REPAIR loop: any failure (unsafe code,
-  sandbox error, timeout, DFM) retries generation up to 2 more times with the error appended;
-  all failing → append to the demand log and return failure. On success it persists
-  code+schema+provenance under `data/generated_templates/<id>/` and registers an
-  `EphemeralTemplateSpec`. Also rehydrates a stored template on a registry miss after a
-  restart (wired via `registry.set_ephemeral_loader`), and owns `log_demand`.
+  `_dfm_feedback` names the failing piece for the self-repair loop. **M10a:**
+  `generate_template` also accepts retrieved `exemplars` (approved designs from
+  `api/exemplar_store`) and renders them as EXTRA few-shot references in the user prompt.
+- **api/freeform.py** (M-B; M10a rewrite) — Orchestrates generation with COMPETITION + EYES +
+  MEMORY. Round 1 is BEST-OF-N: `BEST_OF_N` candidates are generated IN PARALLEL
+  (`ThreadPoolExecutor`) and each taken through validate → sandbox build (+ dimensional probes)
+  → DFM → **dimensional contract** → **visual critique**, then scored (gates + dim-contract +
+  critique); the highest scorer wins. Rounds 2–3 regenerate ONE candidate with the winner's
+  feedback (critique fixes or the gate error) appended — the retry budget is `MAX_ATTEMPTS`
+  rounds. **Dimensional contract** (`build_dimensional_probes` + `dimensional_contract_check`):
+  perturb each length param (`_mm`), rebuild in the sandbox, and require the built solid's bbox
+  OR volume to actually change; a param that moves nothing is a DEAD param and hard-fails with a
+  param-named self-repair message (so we never ask a user to measure a dimension the code
+  ignores). **Visual critique** (gated by `VULCAN_CRITIQUE`, default on): renders the winner
+  candidate from 4 canonical views and asks `vision_provider.critique_design` for a
+  `matches_request` 0–1 score + defects + fixes; below `CRITIQUE_THRESHOLD` (0.7) → regenerate.
+  Still normalizes param_schema → pydantic model, keeps `dfm_check`, self-repair, demand log,
+  persistence under `data/generated_templates/<id>/`, and rehydration. On success persists full
+  provenance (every candidate's code+scores, all critiques, the dimensional-contract detail).
+  If geometry is valid but critique never clears the bar after all rounds, the best shippable
+  candidate STILL ships (founder review is the backstop). Takes an optional `progress` callback
+  (used by the async job to report generating→critiquing).
+- **api/embedding_provider.py** (M10a) — The text-embedding seam (same shape as the other
+  provider seams; on the SDK-isolation allowlist because the OpenAI path imports `openai`).
+  `embed()`/`embed_one()`; `EMBEDDING_PROVIDER` (openai|anthropic|local, default openai). openai
+  hits the real endpoint (`text-embedding-3-small`); anthropic (no native embeddings) and local
+  both use `local_embedding` — a deterministic, offline, dependency-free signed feature-hashing
+  of the text's tokens into an L2-normalized vector, good enough to rank request similarity (and
+  what the tests use). Only the openai path raises.
+- **api/exemplar_store.py** (M10a) — Approved-design few-shot MEMORY. On approval (see
+  `api/review._remember_exemplar`) every freeform design is stored under `data/exemplars/<id>.json`
+  as `(request_text, param_schema, code)`. `retrieve(request_text, k)` embeds the query + every
+  stored request via `embedding_provider` (falling back to the local embedding if the provider is
+  offline) and returns the top-k by cosine similarity — fed to codegen as extra exemplars.
+  `add_exemplar` is idempotent per design_id. Empty store → `[]` (codegen then uses its two
+  static exemplars).
+- **api/jobs.py** (M10a) — In-process async job registry (a dict + lock + daemon threads) backing
+  the now-async freeform endpoint. `start(intent_id, target)` runs `target(progress)` on a
+  background thread (or INLINE when `VULCAN_JOBS_SYNC` is set — tests use this so a provider mock
+  stays active and polling is deterministic), updating stage generating→critiquing→ready|failed;
+  `get_job` is what the poll endpoint reads. Right-sized for the single-founder Phase-0 deploy; a
+  multi-worker deploy would swap in a real queue without changing the API surface.
 - **api/design_store.py** (M-B) — One JSON record per freeform design under `data/designs/`
   (request, generated code, resolved params, DFM results, files, and the founder's verdict +
   note). Only freeform designs get a record; Track A designs don't (so they're never gated).
-  This record set is also the templatization-mining corpus.
+  This record set is also the templatization-mining corpus. **M10a:** records also carry the
+  generation-quality provenance (visual `critique`, `dim_contract`, overall `score`, and the
+  best-of-N `candidates`) for the review page.
 - **api/review.py** (M-B) — The founder review queue + the download gate. `GET /review`
   lists records (pending by default), `POST /review/{id}` records an approve/reject verdict +
   note. `GET /exports/{id}/{file}` is the gated download route — registered BEFORE the static
@@ -438,7 +499,9 @@ sandbox; every freeform design requires founder review before its files can ship
   founder's `X-Review-Token` (`_founder_authorized`) to serve a PENDING design's CAD files, and
   the review dashboard (web/review.js) shows download buttons for every design (pending =
   "Founder preview") that fetch WITH the token (kept out of the URL) and also sends the token on
-  approve/reject. A plain customer request (no token) still 403s until approved.
+  approve/reject. A plain customer request (no token) still 403s until approved. **M10a:** on
+  APPROVAL, `_remember_exemplar` stores the design (request → param_schema → code) via
+  `api/exemplar_store` so future generations learn from it (best-effort — never blocks approval).
 
 ## templates_lib/ (M1, extended M2, M3, M5, and M-B)
 
@@ -548,7 +611,8 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   `url()`/`asset()` which resolve a `files.*` path (or any API path) against `apiBase`
   (absolute/`blob:`/`data:` pass through; same-origin is a no-op). Also home to the shared
   `describeFetchError`/`errorText` globals (moved here from app.js). Change `apiBase` and the
-  whole site follows the API to a new origin — no other edits.
+  whole site follows the API to a new origin — no other edits. **M10a:** freeform is async, so
+  `freeform()` starts the job and a new `freeformJob(statusUrl)` polls it.
 - **web/site.js** (Production UI) — Presentation-only chrome: nav solidify-on-scroll, mobile
   menu toggle, and reveal-on-scroll via IntersectionObserver. Fully progressive — the app flow
   never depends on it; every hook is guarded so a missing element is a no-op.
@@ -567,7 +631,12 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   pending/all filter; each card shows the request, the model's assumptions, the DFM/manifold
   results, the render, the resolved params, and the generated code (lightly, XSS-safely
   highlighted — only `<>&` are escaped, then token spans are added), with Approve/Reject
-  buttons + a note field. Verdicts `POST /review/{id}` and drive the download gate. **M7
+  buttons + a note field. Verdicts `POST /review/{id}` and drive the download gate. **M10a:**
+  each card also shows the generation-quality provenance — the winner's visual-critique score +
+  defects (`critiqueLine`), the dimensional-contract summary (which length params were verified
+  to drive geometry, or dead ones flagged — `dimContractLine`), and an expandable best-of-N
+  table listing every candidate's stage/score/visual-match with the winner starred
+  (`candidatesBlock`). **M7
   follow-up:** a founder-token field (localStorage-backed) is sent as `X-Review-Token` on
   approve/reject AND on downloads, and every design card shows Download STEP/3MF/STL buttons
   that fetch WITH the token (blob download, token kept out of the URL) — so the founder can
@@ -577,7 +646,9 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   `POST /intents` returns `freeform_available` with no template, a "Custom design" panel
   offers "Design it for me" (calls `POST /intents/{id}/freeform`, shows generation progress,
   then the standard questions/preview flow), honestly labelled "needs a human check before it
-  ships"; a freeform design's result shows a pending-review banner + the model's assumptions
+  ships"; **M10a:** `runFreeform` now polls the async job and shows per-stage progress
+  ("Designing candidates in parallel…" → "Reviewing the renders and picking the best design…")
+  before adopting the winner. A freeform design's result shows a pending-review banner + the model's assumptions
   and renders its CAD downloads as "🔒 locked until approved" (matching the server-side 403).
   **M7 additions to the photo tab** (`web/index.html` + `web/intents.js` + `web/style.css`):
   (Part A) an always-on "Design this custom instead" OVERRIDE inside the questions panel
@@ -779,8 +850,23 @@ only the chrome around them and the network seam changed. See `web/README.md`.
 - **tests/test_freeform.py** (M-B) — The orchestration with codegen mocked but the sandbox real:
   param-schema normalization/coercion + labels, the pydantic model enforcing ge/le bounds,
   first-try success (registered + persisted), the self-repair sequence (unsafe → bad build →
-  good, with retry_feedback threaded), an oversize part failing the DFM size gate, total
-  failure logging to the demand log, and disk rehydration after a simulated restart.
+  good, with retry_feedback threaded — pinned to `BEST_OF_N=1` for a deterministic sequence),
+  an oversize part failing the DFM size gate, total failure logging to the demand log, and disk
+  rehydration after a simulated restart. **M10a:** the dimensional contract (a dead param is
+  flagged + named; internal-hole changes credited via volume; an ignored-param design is
+  rejected end-to-end), best-of-N (3 candidates evaluated, one winner, losers kept in
+  provenance), and the visual-critique loop (a below-0.7 critique regenerates with the fixes
+  appended; critique disabled → skipped and still ships).
+- **tests/conftest.py** (M10a) — Autouse test defaults so the suite runs offline/deterministic:
+  `VULCAN_CRITIQUE=off` (critique tests opt back in + mock the provider), `EMBEDDING_PROVIDER=local`
+  (deterministic embeddings), and `VULCAN_JOBS_SYNC=1` (freeform jobs run inline so a provider
+  mock stays active and polling is deterministic).
+- **tests/test_exemplar_store.py** (M10a) — The approved-design memory with the local embedding:
+  empty store → no exemplars, retrieval ORDERING by request similarity (a bridge query surfaces
+  the bridge exemplar first), and idempotent add per design_id.
+- **tests/test_jobs.py** (M10a) — The async job registry with plain-callable targets (no network):
+  sync inline execution → ready, an `ok=False` payload and a raised exception → failed, the
+  async/background path transitioning to ready, and an unknown job id → None.
 - **tests/test_review.py** (M-B) — The full mocked freeform round trip over HTTP: create an
   "other" intent → generate → measure the critical dims → join → `pending_review` record →
   the download gate (CAD files 403 while pending, preview 200) → approve → files download;

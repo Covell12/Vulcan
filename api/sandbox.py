@@ -53,10 +53,10 @@ _REPO_ROOT = _THIS_DIR.parent
 _RUNNER = _THIS_DIR / "_sandbox_runner.py"
 
 DEFAULT_TIMEOUT_S = 30
-# CPU seconds allowed the child — a hair above the wall-clock timeout so the
-# wall-clock timeout is normally what fires, but a busy-loop that dodges it
-# (e.g. blocked on the GIL) still gets killed.
-_CPU_SECONDS = DEFAULT_TIMEOUT_S + 10
+# CPU seconds allowed the child are set per-run to (timeout_s + 10) by
+# _make_preexec — a hair above the wall-clock timeout so the wall-clock timeout is
+# normally what fires, but a busy-loop that dodges it (e.g. blocked on the GIL)
+# still gets killed.
 _MAX_OUTPUT_BYTES = 256 * 1024 * 1024  # per exported file; also the RLIMIT_FSIZE
 _MAX_RESULT_BYTES = 1 * 1024 * 1024  # result.json is tiny; cap the parent's read
 _MAX_PROCS = 64  # cap forks (crude fork-bomb guard)
@@ -89,6 +89,10 @@ class SandboxResult:
     # One entry per exported part: {"name": str, "step"/"stl"/"threemf": Path}.
     # A single-solid design has exactly one part named "part".
     parts: list[dict] | None = None
+    # Dimensional-contract measurements from the runner:
+    # {"baseline": {"bbox","volume","area"}, "probes": {param: {...}}}.
+    # Present on a successful build; {} when probing wasn't requested.
+    measurements: dict | None = None
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -115,26 +119,34 @@ def _clean_env() -> dict[str, str]:
     }
 
 
-def _set_limits() -> None:  # pragma: no cover - runs in the forked child
-    """preexec_fn: apply OS resource limits in the child before exec. Best-effort
-    — a platform that rejects a given limit (macOS ignores some) just skips it;
-    the wall-clock timeout is the guaranteed bound."""
-    import resource
+def _make_preexec(timeout_s: int):  # pragma: no cover - closure runs in the child
+    """Build a preexec_fn that applies OS resource limits in the child before
+    exec. The CPU limit tracks the wall-clock timeout (a hair above it) so a
+    longer, probe-heavy build gets a correspondingly longer CPU budget rather than
+    being killed by a fixed cap. Best-effort — a platform that rejects a given
+    limit (macOS ignores some) just skips it; the wall-clock timeout is the
+    guaranteed bound."""
+    cpu_seconds = timeout_s + 10
 
-    limits = [
-        ("RLIMIT_CPU", (_CPU_SECONDS, _CPU_SECONDS)),
-        ("RLIMIT_FSIZE", (_MAX_OUTPUT_BYTES, _MAX_OUTPUT_BYTES)),
-        ("RLIMIT_NPROC", (_MAX_PROCS, _MAX_PROCS)),
-        ("RLIMIT_NOFILE", (_MAX_OPEN_FILES, _MAX_OPEN_FILES)),
-    ]
-    for name, value in limits:
-        const = getattr(resource, name, None)
-        if const is None:
-            continue
-        try:
-            resource.setrlimit(const, value)
-        except (ValueError, OSError):
-            pass
+    def _set_limits() -> None:
+        import resource
+
+        limits = [
+            ("RLIMIT_CPU", (cpu_seconds, cpu_seconds)),
+            ("RLIMIT_FSIZE", (_MAX_OUTPUT_BYTES, _MAX_OUTPUT_BYTES)),
+            ("RLIMIT_NPROC", (_MAX_PROCS, _MAX_PROCS)),
+            ("RLIMIT_NOFILE", (_MAX_OPEN_FILES, _MAX_OPEN_FILES)),
+        ]
+        for name, value in limits:
+            const = getattr(resource, name, None)
+            if const is None:
+                continue
+            try:
+                resource.setrlimit(const, value)
+            except (ValueError, OSError):
+                pass
+
+    return _set_limits
 
 
 def run_generated_build(
@@ -143,11 +155,17 @@ def run_generated_build(
     out_dir: Path,
     *,
     timeout_s: int = DEFAULT_TIMEOUT_S,
+    probe_params: list[dict] | None = None,
 ) -> SandboxResult:
     """Verify, then run `build(params)` from `code` in the isolated subprocess,
     copying the exported STEP/STL/3MF into `out_dir`. Returns a SandboxResult;
     never raises for a *build* failure (bad geometry, exception, timeout) — those
-    are `ok=False` with a `stage` and `error` the self-repair loop can use."""
+    are `ok=False` with a `stage` and `error` the self-repair loop can use.
+
+    `probe_params` (optional): a list of {"name": param, "params": <full dict>}
+    the runner also builds (measure only, no export) so the caller can verify the
+    dimensional contract — that each perturbed length param actually moves the
+    geometry. Measurements come back on `SandboxResult.measurements`."""
     try:
         verify_code(code)
     except UnsafeCodeError as e:
@@ -158,9 +176,13 @@ def run_generated_build(
     try:
         (workdir / "code.py").write_text(code, encoding="utf-8")
         (workdir / "params.json").write_text(json.dumps(params), encoding="utf-8")
+        if probe_params:
+            (workdir / "probes.json").write_text(
+                json.dumps(probe_params), encoding="utf-8"
+            )
 
         cmd = [sys.executable, "-I", str(_RUNNER), str(workdir), str(_REPO_ROOT)]
-        preexec = _set_limits if os.name == "posix" else None
+        preexec = _make_preexec(timeout_s) if os.name == "posix" else None
         # start_new_session=True puts the child in its OWN process group, so on
         # timeout we can SIGKILL the WHOLE group — otherwise a grandchild the code
         # spawned (fork/subprocess) would outlive the timeout (security review).
@@ -212,7 +234,8 @@ def run_generated_build(
             )
 
         part_names = result.get("parts") or ["part"]
-        return _collect_outputs(workdir, out_dir, part_names)
+        measurements = result.get("measurements") or {}
+        return _collect_outputs(workdir, out_dir, part_names, measurements)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -220,7 +243,9 @@ def run_generated_build(
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{1,40}$")
 
 
-def _collect_outputs(workdir: Path, out_dir: Path, part_names: list) -> SandboxResult:
+def _collect_outputs(
+    workdir: Path, out_dir: Path, part_names: list, measurements: dict | None = None
+) -> SandboxResult:
     """For EACH part, verify its three export files exist, are non-empty and under
     the size cap, then copy them into out_dir. Re-validates each part name against
     a strict allowlist (defense-in-depth: names came from the sandbox, but they
@@ -256,4 +281,6 @@ def _collect_outputs(workdir: Path, out_dir: Path, part_names: list) -> SandboxR
         parts.append(entry)
     if not parts:
         return SandboxResult(ok=False, stage="output", error="no parts were exported")
-    return SandboxResult(ok=True, stage="ok", parts=parts)
+    return SandboxResult(
+        ok=True, stage="ok", parts=parts, measurements=measurements or {}
+    )

@@ -391,9 +391,15 @@ def test_no_other_module_imports_provider_sdks():
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     pattern = re.compile(r"^\s*(import (openai|anthropic)\b|from (openai|anthropic)\b)")
-    # Both LLM-provider seams legitimately import these SDKs: the vision parser
-    # and (Track B) the freeform code generator. Nothing else may.
-    allowed = {"vision_provider.py", "codegen_provider.py", "test_vision_provider.py"}
+    # These provider seams legitimately import these SDKs: the vision parser +
+    # critic, the freeform code generator, and the embedding seam (exemplar
+    # memory). Nothing else may.
+    allowed = {
+        "vision_provider.py",
+        "codegen_provider.py",
+        "embedding_provider.py",
+        "test_vision_provider.py",
+    }
     offenders = []
 
     for path in repo_root.rglob("*.py"):

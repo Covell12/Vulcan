@@ -35,7 +35,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
-from api import codegen_provider, composite, design_store, freeform
+from api import codegen_provider, composite, design_store, freeform, jobs
 from api.codegen_provider import CodegenProviderError
 from api.depth_provider import (
     DepthProviderError,
@@ -721,14 +721,16 @@ def _freeform_questions(outcome: "freeform.GenerationResult") -> list[dict[str, 
     return questions
 
 
-@router.post("/intents/{intent_id}/freeform")
+@router.post("/intents/{intent_id}/freeform", status_code=202)
 def start_freeform(intent_id: str) -> dict[str, Any]:
-    """Track B: author a one-off template and attach it to the intent so the
-    standard questions → measure → join → review flow takes over. Works as the
-    always-available user OVERRIDE too — a template may already be matched (Part
-    A: "Design this custom instead"), in which case the generated template
-    REPLACES it. On failure the request is logged to the demand log and an honest
-    error is returned on the intent."""
+    """Track B (ASYNC): kick off a background best-of-N generation job and return
+    {job_id, status_url} immediately. Generation authors one-off candidates,
+    scores them (gates + dimensional contract + visual critique), and on success
+    attaches the winning template to the intent so the standard questions →
+    measure → join → review flow takes over — also works as the always-available
+    user OVERRIDE of a matched template. Poll the status_url; on 'ready' the
+    payload carries the updated intent. On failure the request is logged to the
+    demand log and an honest error is returned on the job + intent."""
     intent = _load_intent(intent_id)
     if intent.get("status") == "out_of_scope":
         raise HTTPException(
@@ -749,11 +751,58 @@ def start_freeform(intent_id: str) -> dict[str, Any]:
         if d.get("value_mm") is not None
     ]
     request_text = intent.get("request_text") or intent.get("description") or ""
+    photos = _load_intent_photos(intent)
 
-    outcome = freeform.generate_and_register(
-        request_text, _load_intent_photos(intent), dims_hints
-    )
+    def _target(progress: Any) -> dict[str, Any]:
+        outcome = freeform.generate_and_register(
+            request_text, photos, dims_hints, progress=progress
+        )
+        updated = _apply_freeform_outcome(intent_id, outcome)
+        ok = outcome.ok and not updated.get("freeform_error")
+        return {
+            "ok": ok,
+            "intent": updated,
+            "template_id": outcome.template_id if ok else None,
+            "error": updated.get("freeform_error") or outcome.error,
+        }
 
+    job_id = jobs.start(intent_id, _target)
+    return {
+        "job_id": job_id,
+        "status_url": f"/intents/{intent_id}/freeform/{job_id}",
+        "status": "generating",
+        "stage": "generating",
+    }
+
+
+@router.get("/intents/{intent_id}/freeform/{job_id}")
+def get_freeform_job(intent_id: str, job_id: str) -> dict[str, Any]:
+    """Poll a freeform generation job. Stage advances generating → critiquing →
+    ready | failed. On 'ready' the updated intent (with the attached template and
+    seeded questions) is included so the client can proceed without a second GET."""
+    job = jobs.get_job(job_id)
+    if job is None or job.get("intent_id") != intent_id:
+        raise HTTPException(status_code=404, detail=f"No freeform job '{job_id}'.")
+    resp: dict[str, Any] = {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "stage": job.get("stage"),
+        "error": job.get("error"),
+    }
+    result = job.get("result") or {}
+    if result.get("intent") is not None:
+        resp["intent"] = result["intent"]
+        resp["template_id"] = result.get("template_id")
+    return resp
+
+
+def _apply_freeform_outcome(
+    intent_id: str, outcome: "freeform.GenerationResult"
+) -> dict[str, Any]:
+    """Apply a finished generation outcome to the intent (loaded fresh, since we
+    run on a background thread): adopt the winning template + seed questions on
+    success, or record the honest error on failure. Returns the saved intent."""
+    intent = _load_intent(intent_id)
     if not outcome.ok:
         intent["freeform_error"] = outcome.error
         intent["freeform_available"] = False  # tried and failed; logged to demand
@@ -763,12 +812,16 @@ def start_freeform(intent_id: str) -> dict[str, Any]:
     # Success: adopt the generated template. If this is an OVERRIDE of a matched
     # template, drop that template's dimensions/questions — they measured a
     # different part. Seed the questions for the generated critical dims WITH the
-    # overlays the codegen model placed on the photo, so the photo shows the
-    # dimension drawing (freeform questions used to be synthesized overlay-less).
+    # overlays the codegen model placed on the photo.
     intent["template_id"] = outcome.template_id
     intent["freeform"] = True
     intent["freeform_assumptions"] = outcome.assumptions
     intent["freeform_dfm"] = outcome.dfm
+    # M10a generation-quality provenance (surfaced on the review page).
+    intent["freeform_critique"] = outcome.critique
+    intent["freeform_dim_contract"] = outcome.dim_contract
+    intent["freeform_score"] = outcome.score
+    intent["freeform_candidates"] = outcome.candidates
     intent["dimensions"] = []
     intent["questions"] = _freeform_questions(outcome)
     intent.pop("freeform_error", None)
@@ -777,9 +830,10 @@ def start_freeform(intent_id: str) -> dict[str, Any]:
 
     errors = _validation_errors(intent)
     if errors:
-        raise HTTPException(
-            status_code=500,
-            detail=f"IntentSpec became invalid after freeform generation: {'; '.join(errors)}",
+        # Can't raise a clean HTTP error from a background thread; surface it on
+        # the intent/job instead so the poller sees the failure.
+        intent["freeform_error"] = (
+            "IntentSpec became invalid after freeform generation: " + "; ".join(errors)
         )
     _save_intent(intent)
     return intent
@@ -1054,6 +1108,11 @@ def create_design_from_intent(
                 "params": summary,
                 "assumptions": intent.get("freeform_assumptions", []),
                 "dfm": intent.get("freeform_dfm"),
+                # M10a: generation-quality provenance for the review page.
+                "critique": intent.get("freeform_critique"),
+                "dim_contract": intent.get("freeform_dim_contract"),
+                "score": intent.get("freeform_score"),
+                "candidates": intent.get("freeform_candidates", []),
                 "files": files,
                 "fulfillment": fulfillment,
                 "created_at": freeform._now(),

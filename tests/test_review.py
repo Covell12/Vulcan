@@ -115,14 +115,18 @@ def _make_other_intent(cleanup: dict) -> str:
 
 
 def _generate(cleanup: dict, iid: str, gen=GOOD_GEN) -> dict:
+    # Freeform is async now: POST starts a job (runs inline under VULCAN_JOBS_SYNC,
+    # set in conftest), then we poll the status_url for the finished intent.
     with patch(
         "api.freeform.codegen_provider.generate_template", return_value=dict(gen)
     ), patch("api.intents.codegen_provider.check_provider_configured"):
-        r = client.post(f"/intents/{iid}/freeform")
-    body = r.json()
-    if body.get("template_id"):
-        cleanup["generated"].append(body["template_id"])
-    return body
+        started = client.post(f"/intents/{iid}/freeform")
+        assert started.status_code == 202, started.text
+        job = client.get(started.json()["status_url"]).json()
+    intent = job.get("intent") or {}
+    if intent.get("template_id"):
+        cleanup["generated"].append(intent["template_id"])
+    return intent
 
 
 def test_freeform_end_to_end_and_review_gate(cleanup):

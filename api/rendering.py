@@ -164,6 +164,64 @@ def render_assembly_preview(
         plt.close(fig)
 
 
+# Four canonical camera angles (elev, azim) for the visual-critique renders — an
+# isometric plus front/side/top, so the critique model can judge the shape from
+# every side (a defect hidden in one view shows in another).
+CANONICAL_VIEWS = [
+    ("iso", 25, -60),
+    ("front", 8, -90),
+    ("side", 8, 0),
+    ("top", 89, -90),
+]
+
+
+def render_canonical_views(
+    stl_paths: list[Path], out_dir: Path, prefix: str = "view"
+) -> list[Path]:
+    """Render the part (or colored assembly) from the 4 CANONICAL_VIEWS into
+    out_dir as `<prefix>_<name>.png`, and return the paths. Used by the freeform
+    visual-critique loop to give the vision model 'eyes' on what it built. Reuses
+    the same matplotlib/trimesh path as the previews (headless, no GPU)."""
+    import numpy as np
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meshes = [trimesh.load(str(p), force="mesh") for p in stl_paths]
+    allv = np.vstack([m.vertices for m in meshes])
+    lo, hi = allv.min(axis=0), allv.max(axis=0)
+    for i in range(3):
+        if hi[i] - lo[i] <= 1e-9:
+            lo[i] -= 1.0
+            hi[i] += 1.0
+
+    paths: list[Path] = []
+    for name, elev, azim in CANONICAL_VIEWS:
+        fig = plt.figure(figsize=(5, 5))
+        try:
+            ax = fig.add_subplot(111, projection="3d")
+            for j, mesh in enumerate(meshes):
+                color = PART_PALETTE[j % len(PART_PALETTE)]
+                ax.add_collection3d(
+                    Poly3DCollection(
+                        mesh.vertices[mesh.faces],
+                        facecolor=color,
+                        edgecolor=(0.1, 0.1, 0.1, 0.25),
+                        linewidths=0.2,
+                    )
+                )
+            ax.set_xlim(lo[0], hi[0])
+            ax.set_ylim(lo[1], hi[1])
+            ax.set_zlim(lo[2], hi[2])
+            ax.set_box_aspect(hi - lo)
+            ax.view_init(elev=elev, azim=azim)
+            ax.axis("off")
+            out = out_dir / f"{prefix}_{name}.png"
+            fig.savefig(str(out), dpi=100, bbox_inches="tight")
+            paths.append(out)
+        finally:
+            plt.close(fig)
+    return paths
+
+
 def _draw_callouts(ax: Any, callouts: list[dict[str, Any]], bounds: Any) -> None:
     """Draw each dimension as a colored line between its two 3D endpoints with a
     text label offset outward from the part so it stays legible."""

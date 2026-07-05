@@ -316,6 +316,195 @@ def _humanize_provider_error(label: str, exc: Exception) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Visual critique (Track B generation quality): give the freeform loop "eyes"
+# ---------------------------------------------------------------------------
+
+CRITIQUE_SYSTEM_PROMPT = """You are the design critic for Vulcan, a service that 3D-prints \
+custom parts. You are shown renders of a part our system just GENERATED from a user's \
+request, taken from four canonical camera angles (isometric, front, side, top). You are \
+also given the user's original request and the part's declared parameters. Your job: judge \
+how well the rendered part actually FULFILLS the request, as a hard-nosed reviewer.
+
+Return ONLY the structured object you are given a schema/tool for:
+- matches_request: a single number from 0.0 to 1.0 — how well this part, as rendered, does \
+what the user asked for. 1.0 = it clearly is the requested part with the right features; \
+0.5 = roughly the right idea but missing or wrong features; 0.0 = it is not the requested \
+thing at all. Be strict: a plain block when a bracket with mounting holes was asked for is \
+NOT a match.
+- defects: a list of short, concrete problems you can SEE in the renders (e.g. "no mounting \
+holes", "arm is too thin to bear load", "hook opening faces the wrong way", "two pieces are \
+not aligned to mate", "proportions look nothing like a phone stand"). Empty list if none.
+- targeted_fixes: a list of short, specific, actionable instructions the code generator \
+could apply to fix each defect (e.g. "add two 4mm mounting holes on the vertical face", \
+"thicken the arm to at least 6mm", "flip the hook so its opening points up"). Empty if the \
+part is already good. Keep each fix a single imperative phrase.
+
+Judge only what the renders show. Do not restate the request; do not add commentary outside \
+the structure."""
+
+_CRITIQUE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "matches_request": {
+            "type": "number",
+            "description": "0.0-1.0: how well the rendered part fulfills the request.",
+        },
+        "defects": {"type": "array", "items": {"type": "string"}},
+        "targeted_fixes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["matches_request", "defects", "targeted_fixes"],
+}
+
+
+def _critique_user_text(
+    request_text: str,
+    params: dict[str, Any] | None,
+    param_schema: list[dict[str, Any]] | None,
+) -> str:
+    parts = [
+        f"User's original request: {request_text}",
+        "The four images are renders of the part we generated (isometric, front, "
+        "side, top).",
+    ]
+    if params:
+        parts.append(f"Declared parameters (mm unless noted): {json.dumps(params)}")
+    if param_schema:
+        names = [f.get("name") for f in param_schema if isinstance(f, dict)]
+        parts.append(f"Parameter names: {json.dumps(names)}")
+    parts.append(
+        "Judge how well the rendered part fulfills the request and list concrete "
+        "defects + targeted fixes."
+    )
+    return "\n\n".join(parts)
+
+
+def critique_design(
+    render_paths: list[Path],
+    request_text: str,
+    params: dict[str, Any] | None = None,
+    param_schema: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Vision seam: show the model 4 renders of a generated part and get back
+    {matches_request 0-1, defects[], targeted_fixes[]}. Same provider selection /
+    error contract as parse_intent — raises VisionProviderError on any provider or
+    parse failure so the freeform loop can treat critique as best-effort."""
+    provider = get_provider_name()
+    check_provider_configured(provider)
+    model = get_model_name(provider)
+    user_text = _critique_user_text(request_text, params, param_schema)
+    images = _load_render_bytes(render_paths)
+    if not images:
+        raise VisionProviderError("critique_design got no readable render images.")
+
+    if provider == "openai":
+        return _critique_openai(images, user_text, model)
+    if provider == "anthropic":
+        return _critique_anthropic(images, user_text, model)
+    raise VisionProviderError(f"Unknown VISION_PROVIDER '{provider}'.")
+
+
+def _load_render_bytes(render_paths: list[Path]) -> list[tuple[str, bytes]]:
+    """Read each render into (mime, bytes), skipping any that can't be read."""
+    out: list[tuple[str, bytes]] = []
+    for p in render_paths:
+        try:
+            out.append(("image/png", Path(p).read_bytes()))
+        except OSError:
+            continue
+    return out
+
+
+def _critique_openai(
+    images: list[tuple[str, bytes]], user_text: str, model: str
+) -> dict[str, Any]:
+    content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+    for mime, data in images:
+        b64 = base64.b64encode(data).decode("ascii")
+        content.append(
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+        )
+    try:
+        import openai
+
+        client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": CRITIQUE_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "design_critique",
+                    "schema": _CRITIQUE_SCHEMA,
+                    "strict": True,
+                },
+            },
+        )
+    except Exception as e:
+        raise VisionProviderError(_humanize_provider_error("OpenAI", e)) from e
+    try:
+        message = response.choices[0].message
+        if not message.content:
+            raise VisionProviderError("OpenAI returned an empty critique.")
+        return json.loads(message.content)
+    except VisionProviderError:
+        raise
+    except Exception as e:
+        raise VisionProviderError(
+            f"Could not parse OpenAI critique ({type(e).__name__}: {e})"
+        ) from e
+
+
+def _critique_anthropic(
+    images: list[tuple[str, bytes]], user_text: str, model: str
+) -> dict[str, Any]:
+    content: list[dict[str, Any]] = []
+    for mime, data in images:
+        b64 = base64.b64encode(data).decode("ascii")
+        content.append(
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": b64},
+            }
+        )
+    content.append({"type": "text", "text": user_text})
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        response = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            system=CRITIQUE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+            tools=[
+                {
+                    "name": "record_design_critique",
+                    "description": "Record the visual critique of the generated part.",
+                    "input_schema": _CRITIQUE_SCHEMA,
+                }
+            ],
+            tool_choice={"type": "tool", "name": "record_design_critique"},
+        )
+    except Exception as e:
+        raise VisionProviderError(_humanize_provider_error("Anthropic", e)) from e
+    try:
+        for block in response.content:
+            if getattr(block, "type", None) == "tool_use":
+                return dict(block.input)
+    except VisionProviderError:
+        raise
+    except Exception as e:
+        raise VisionProviderError(
+            f"Could not parse Anthropic critique ({type(e).__name__}: {e})"
+        ) from e
+    raise VisionProviderError("Anthropic critique had no tool_use block.")
+
+
+# ---------------------------------------------------------------------------
 # OpenAI adapter
 # ---------------------------------------------------------------------------
 

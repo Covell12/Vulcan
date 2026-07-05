@@ -1662,15 +1662,36 @@ td.src-default {
 }
 .review-request strong,
 .review-assumptions strong,
-.review-dfm strong {
+.review-dfm strong,
+.review-critique strong,
+.review-dimcontract strong {
   color: var(--muted);
   font-weight: 600;
 }
 .review-assumptions,
-.review-dfm {
+.review-dfm,
+.review-critique,
+.review-dimcontract {
   font-size: 13.5px;
   color: var(--muted);
   margin-bottom: 6px;
+}
+.review-candidates {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  margin: 8px 0 12px;
+}
+.review-candidates th,
+.review-candidates td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  text-align: left;
+}
+.review-candidates .candidate-winner td {
+  color: var(--text);
+  font-weight: 600;
 }
 .review-view {
   margin: 14px 0;

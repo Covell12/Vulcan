@@ -82,7 +82,9 @@ window.VulcanAPI = (function () {
         headers: JSON_HEADERS,
         body: JSON.stringify(body),
       }),
+    // Freeform is async: POST starts a job ({job_id, status_url}); poll the job.
     freeform: (intentId) => req(`/intents/${intentId}/freeform`, { method: "POST" }),
+    freeformJob: (statusUrl) => req(statusUrl),
     joinDesign: (intentId, body) =>
       req(`/intents/${intentId}/design`, {
         method: "POST",

@@ -16,6 +16,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,13 +26,16 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from api import design_store
+from api import design_store, exemplar_store
 from api.design_store import STATUS_APPROVED, STATUS_REJECTED
 
 router = APIRouter()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 EXPORTS_DIR = BASE_DIR / "exports"
+# Where the freeform generator persists each template (code + schema); read here
+# to recover a design's param_schema when storing it as an approved exemplar.
+_GENERATED_DIR = BASE_DIR / "data" / "generated_templates"
 
 # The CAD deliverables gated behind approval. The preview PNG is intentionally
 # NOT here — it must stay viewable while pending. Compared case-folded (a
@@ -114,7 +118,34 @@ def submit_verdict(
         review_note=body.note,
         reviewed_at=datetime.now(timezone.utc).isoformat(),
     )
+    if new_status == STATUS_APPROVED and updated and updated.get("is_freeform"):
+        _remember_exemplar(updated)
     return updated  # type: ignore[return-value]
+
+
+def _remember_exemplar(record: dict[str, Any]) -> None:
+    """On approval, store the design as a reusable exemplar (request → schema →
+    code) for the codegen few-shot memory. Best-effort: never fail an approval on
+    a memory hiccup. param_schema is recovered from the persisted generated
+    template, since the design record only keeps a param SUMMARY."""
+    try:
+        code = record.get("code") or ""
+        request = record.get("request") or ""
+        if not code or not request:
+            return
+        param_schema: list[Any] = []
+        tid = record.get("template_id")
+        if tid:
+            schema_path = _GENERATED_DIR / str(tid) / "schema.json"
+            if schema_path.exists():
+                param_schema = json.loads(schema_path.read_text(encoding="utf-8")).get(
+                    "param_schema", []
+                )
+        exemplar_store.add_exemplar(
+            request, param_schema, code, design_id=record.get("design_id")
+        )
+    except Exception:  # noqa: BLE001 — exemplar memory must never block approval
+        pass
 
 
 @router.get("/exports/{design_id}/{filename}")
