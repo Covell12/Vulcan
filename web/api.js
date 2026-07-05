@@ -83,7 +83,12 @@ window.VulcanAPI = (function () {
         body: JSON.stringify(body),
       }),
     freeform: (intentId) => req(`/intents/${intentId}/freeform`, { method: "POST" }),
-    joinDesign: (intentId) => req(`/intents/${intentId}/design`, { method: "POST" }),
+    joinDesign: (intentId, body) =>
+      req(`/intents/${intentId}/design`, {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify(body || {}),
+      }),
 
     // Founder review dashboard. The token is a request header (no cookies).
     reviewQueue: (status) => req(`/review?status=${encodeURIComponent(status)}`),

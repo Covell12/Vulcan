@@ -1130,6 +1130,36 @@ def test_join_produces_fetchable_composite(cleanup_intents: list[str]):
         shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
 
 
+def test_join_defaults_fulfillment_to_files(cleanup_intents: list[str]):
+    """An empty join body defaults the delivery choice to 'files'."""
+    iid = _ready_intent_with_valid_photo(cleanup_intents, annotation=None)
+    body = client.post(f"/intents/{iid}/design").json()
+    try:
+        assert body["fulfillment"] == "files"
+    finally:
+        shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
+
+
+def test_join_records_ship_fulfillment(cleanup_intents: list[str]):
+    """Choosing 'ship' at submit is captured on the response AND persisted on the
+    intent, so the founder can see the customer wants it mailed."""
+    iid = _ready_intent_with_valid_photo(cleanup_intents, annotation=None)
+    body = client.post(f"/intents/{iid}/design", json={"fulfillment": "ship"}).json()
+    try:
+        assert body["fulfillment"] == "ship"
+        stored = json.loads((INTENTS_DIR / f"{iid}.json").read_text())
+        assert stored["fulfillment"] == "ship"
+    finally:
+        shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
+
+
+def test_join_rejects_bad_fulfillment(cleanup_intents: list[str]):
+    """An unknown delivery value is a 422 (Literal validation), not silently kept."""
+    iid = _ready_intent_with_valid_photo(cleanup_intents, annotation=None)
+    resp = client.post(f"/intents/{iid}/design", json={"fulfillment": "teleport"})
+    assert resp.status_code == 422
+
+
 def test_join_without_photo_has_no_composite(cleanup_intents: list[str]):
     """Absent a stored photo, the join still succeeds and simply omits the
     composite (no error) — the part files are the real deliverable."""

@@ -189,9 +189,15 @@ def dfm_check(stl_path: Path) -> tuple[bool, dict[str, Any]]:
     for it and founder review is the backstop. Stated in the security notes.)"""
     import trimesh
 
+    from api.rendering import heal_mesh_file
+
+    # Try a light, print-safe repair first (and re-export the healed STL), so a
+    # valid generated solid whose tessellation has hairline gaps / bad winding
+    # isn't wrongly rejected — a genuinely broken mesh still fails.
+    manifold = heal_mesh_file(stl_path)
     mesh = trimesh.load(str(stl_path), force="mesh")
     faces = getattr(mesh, "faces", [])
-    manifold = bool(getattr(mesh, "is_watertight", False)) and len(faces) > 0
+    manifold = manifold and len(faces) > 0
     bounds = getattr(mesh, "bounds", None)
     if bounds is None:
         extent = [0.0, 0.0, 0.0]

@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
-from api.rendering import export_design, mesh_is_watertight, render_preview
+from api.rendering import export_design, heal_mesh_file, render_preview
 from templates_lib.registry import (
     EphemeralTemplateSpec,
     TemplateSpec,
@@ -163,11 +163,14 @@ def build_design(
 
     # Runtime manifold gate (M5.5): a part we hand to a printer must be a
     # watertight, manifold solid. The per-template pytest suite proves this for
-    # DEFAULT params, but a live design runs USER-resolved params (and, later,
-    # generated geometry), so we re-check the actually-exported mesh here and
-    # refuse to return files for a non-printable design. Fail closed: delete the
-    # half-baked export directory so no unbuildable STL/STEP can be downloaded.
-    if not mesh_is_watertight(files["stl"]):
+    # DEFAULT params, but a live design runs USER-resolved params (and generated
+    # geometry), so we re-check the actually-exported mesh here and refuse to
+    # return files for a non-printable design. `heal_mesh_file` first tries a
+    # light, print-safe repair (and re-exports the healed STL) so a valid solid
+    # with tessellation artifacts isn't wrongly rejected; a genuinely broken mesh
+    # still fails. Fail closed: delete the half-baked export directory so no
+    # unbuildable STL/STEP can be downloaded.
+    if not heal_mesh_file(files["stl"]):
         shutil.rmtree(design_dir, ignore_errors=True)
         raise HTTPException(
             status_code=500,

@@ -8,8 +8,6 @@
 
 const photoInput = document.getElementById("photo-input");
 const annotateWrap = document.getElementById("annotate-wrap");
-const annotateImg = document.getElementById("annotate-img");
-const annotateCanvas = document.getElementById("annotate-canvas");
 const clearAnnotationBtn = document.getElementById("clear-annotation-btn");
 const intentText = document.getElementById("intent-text");
 const submitIntentBtn = document.getElementById("submit-intent-btn");
@@ -17,8 +15,10 @@ const intentStatusEl = document.getElementById("intent-status");
 
 const questionsPanel = document.getElementById("questions-panel");
 const intentDescriptionEl = document.getElementById("intent-description");
+const overlayWrap = document.getElementById("overlay-wrap");
 const overlayImg = document.getElementById("overlay-img");
 const overlaySvg = document.getElementById("overlay-svg");
+const questionUnits = document.getElementById("question-units");
 const questionsList = document.getElementById("questions-list");
 const submitAnswersBtn = document.getElementById("submit-answers-btn");
 const answersStatusEl = document.getElementById("answers-status");
@@ -62,8 +62,9 @@ const freeformOverrideStatus = document.getElementById("freeform-override-status
 const freeformRecommendNote = document.getElementById("freeform-recommend-note");
 
 let selectedPhotos = [];
-let annotationPoints = []; // normalized [x, y] pairs on photo 0
-let drawing = false;
+let annItems = []; // one per uploaded photo: { index, canvas, img, url, points }
+let firstPhotoUrl = null; // object URL of photo 0 (drives the overlay/composite)
+let drawing = null; // the annotate record currently being drawn on
 let currentIntent = null;
 
 function setIntentStatus(message, isError) {
@@ -81,11 +82,21 @@ function setGenerateStatus(message, isError) {
   generateStatusEl.classList.toggle("error", Boolean(isError));
 }
 
-// --- Photo upload + freehand annotation on photo 0 --------------------
+// --- Photo upload + freehand annotation on ANY photo -------------------
+// Every uploaded photo is shown and drawable; each keeps its own strokes. The
+// part is only placed into the FIRST photo (the composite), but drawing on the
+// others still gives the vision model context about what you mean.
+
+function revokePhotoUrls() {
+  for (const it of annItems) if (it.url) URL.revokeObjectURL(it.url);
+}
 
 photoInput.addEventListener("change", () => {
+  revokePhotoUrls();
   selectedPhotos = Array.from(photoInput.files || []).slice(0, 3);
-  annotationPoints = [];
+  annItems = [];
+  firstPhotoUrl = null;
+  annotateWrap.innerHTML = "";
   questionsPanel.hidden = true;
   resultPanel.hidden = true;
 
@@ -95,61 +106,202 @@ photoInput.addEventListener("change", () => {
     return;
   }
 
-  annotateImg.src = URL.createObjectURL(selectedPhotos[0]);
-  annotateImg.onload = () => {
-    annotateCanvas.width = annotateImg.clientWidth;
-    annotateCanvas.height = annotateImg.clientHeight;
-    clearCanvas();
-  };
+  selectedPhotos.forEach((photo, index) => {
+    const url = URL.createObjectURL(photo);
+    if (index === 0) firstPhotoUrl = url;
+
+    const item = document.createElement("div");
+    item.className = "annotate-item";
+    const badge = document.createElement("span");
+    badge.className = "annotate-badge";
+    badge.textContent = index === 0 ? "① part goes here" : `photo ${index + 1}`;
+    const img = document.createElement("img");
+    img.className = "annotate-photo";
+    img.alt = `Uploaded photo ${index + 1}`;
+    const canvas = document.createElement("canvas");
+    canvas.className = "annotate-canvas";
+
+    const rec = { index, canvas, img, url, points: [] };
+    img.onload = () => {
+      canvas.width = img.clientWidth;
+      canvas.height = img.clientHeight;
+      drawStroke(rec);
+    };
+    img.src = url;
+    attachDrawing(rec);
+    item.append(badge, img, canvas);
+    annotateWrap.appendChild(item);
+    annItems.push(rec);
+  });
   annotateWrap.hidden = false;
   clearAnnotationBtn.hidden = false;
 });
 
-function clearCanvas() {
-  const ctx = annotateCanvas.getContext("2d");
-  ctx.clearRect(0, 0, annotateCanvas.width, annotateCanvas.height);
-}
-
-function canvasPoint(event) {
-  const rect = annotateCanvas.getBoundingClientRect();
-  const x = (event.clientX - rect.left) / rect.width;
-  const y = (event.clientY - rect.top) / rect.height;
-  return [Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))];
-}
-
-function drawStroke() {
-  const ctx = annotateCanvas.getContext("2d");
-  clearCanvas();
-  ctx.strokeStyle = "#2f5fdb";
-  ctx.lineWidth = 2;
+function drawStroke(rec) {
+  if (!rec.canvas.width || !rec.canvas.height) return; // not sized (pre-load) yet
+  const ctx = rec.canvas.getContext("2d");
+  ctx.clearRect(0, 0, rec.canvas.width, rec.canvas.height);
+  if (!rec.points.length) return;
+  ctx.strokeStyle = "#ff8b34";
+  ctx.lineWidth = 2.5;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.shadowColor = "rgba(255, 106, 26, 0.9)";
+  ctx.shadowBlur = 6;
   ctx.beginPath();
-  annotationPoints.forEach(([nx, ny], i) => {
-    const x = nx * annotateCanvas.width;
-    const y = ny * annotateCanvas.height;
+  rec.points.forEach(([nx, ny], i) => {
+    const x = nx * rec.canvas.width;
+    const y = ny * rec.canvas.height;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
 }
 
-annotateCanvas.addEventListener("pointerdown", (event) => {
-  drawing = true;
-  annotationPoints = [canvasPoint(event)];
-  drawStroke();
-});
-annotateCanvas.addEventListener("pointermove", (event) => {
-  if (!drawing) return;
-  annotationPoints.push(canvasPoint(event));
-  drawStroke();
-});
+function attachDrawing(rec) {
+  // Normalized [0,1] point, or null if the canvas isn't laid out yet (before the
+  // image loads its box has zero size — dividing by it would give NaN/Infinity).
+  const pt = (e) => {
+    const r = rec.canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    return [
+      Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+      Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
+    ];
+  };
+  rec.canvas.addEventListener("pointerdown", (e) => {
+    const p = pt(e);
+    if (!p) return;
+    drawing = rec;
+    rec.pointerId = e.pointerId;
+    rec.points = [p];
+    drawStroke(rec);
+    rec.canvas.setPointerCapture && rec.canvas.setPointerCapture(e.pointerId);
+  });
+  rec.canvas.addEventListener("pointermove", (e) => {
+    if (drawing !== rec) return;
+    const p = pt(e);
+    if (!p) return;
+    rec.points.push(p);
+    drawStroke(rec);
+  });
+}
 window.addEventListener("pointerup", () => {
-  drawing = false;
+  if (drawing && drawing.pointerId != null && drawing.canvas.releasePointerCapture) {
+    try {
+      drawing.canvas.releasePointerCapture(drawing.pointerId);
+    } catch (e) {
+      /* already released */
+    }
+  }
+  drawing = null;
 });
 
 clearAnnotationBtn.addEventListener("click", () => {
-  annotationPoints = [];
-  clearCanvas();
+  for (const it of annItems) {
+    it.points = [];
+    drawStroke(it);
+  }
 });
+
+// --- Global unit toggle (mm / cm / in) for the whole question set ------
+function syncUnitToggle() {
+  if (!questionUnits) return;
+  for (const b of questionUnits.querySelectorAll("[data-unit]")) {
+    b.classList.toggle("active", b.dataset.unit === getSessionUnit());
+  }
+}
+function applySessionUnit(u) {
+  setSessionUnit(u);
+  for (const sel of document.querySelectorAll(".unit-select")) {
+    sel.value = getSessionUnit();
+    sel.dispatchEvent(new Event("refresh-dual"));
+  }
+  syncUnitToggle();
+}
+if (questionUnits) {
+  questionUnits.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-unit]");
+    if (b) applySessionUnit(b.dataset.unit);
+  });
+}
+
+// --- Zoom + pan for an image (wheel to zoom toward the cursor, drag to pan
+// when zoomed, double-click to reset). Transforms every passed element so an
+// image + its SVG overlay stay locked together. ---
+function makeZoomable(container, elements) {
+  if (!container || container._zoomable) return;
+  container._zoomable = true;
+  const els = (Array.isArray(elements) ? elements : [elements]).filter(Boolean);
+  let scale = 1;
+  let tx = 0;
+  let ty = 0;
+  let drag = null;
+  container.classList.add("zoomable");
+  const apply = () => {
+    const t = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    for (const e of els) {
+      e.style.transformOrigin = "0 0";
+      e.style.transform = t;
+    }
+    container.classList.toggle("zoomed", scale > 1.01);
+  };
+  const clamp = () => {
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    tx = Math.min(0, Math.max(w - w * scale, tx));
+    ty = Math.min(0, Math.max(h - h * scale, ty));
+  };
+  container.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const r = container.getBoundingClientRect();
+      const px = e.clientX - r.left;
+      const py = e.clientY - r.top;
+      const ns = Math.min(6, Math.max(1, scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+      tx = px - (px - tx) * (ns / scale);
+      ty = py - (py - ty) * (ns / scale);
+      scale = ns;
+      if (scale <= 1.01) {
+        scale = 1;
+        tx = 0;
+        ty = 0;
+      }
+      clamp();
+      apply();
+    },
+    { passive: false },
+  );
+  container.addEventListener("pointerdown", (e) => {
+    if (scale <= 1.01) return; // let clicks (e.g. chips) through at 1x
+    drag = { x: e.clientX - tx, y: e.clientY - ty };
+    container.setPointerCapture && container.setPointerCapture(e.pointerId);
+  });
+  container.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    tx = e.clientX - drag.x;
+    ty = e.clientY - drag.y;
+    clamp();
+    apply();
+  });
+  container.addEventListener("pointerup", (e) => {
+    if (container.releasePointerCapture) {
+      try {
+        container.releasePointerCapture(e.pointerId);
+      } catch (err) {
+        /* already released */
+      }
+    }
+    drag = null;
+  });
+  container.addEventListener("dblclick", () => {
+    scale = 1;
+    tx = 0;
+    ty = 0;
+    apply();
+  });
+}
 
 // --- Submit photo(s) + text -> POST /intents ---------------------------
 
@@ -171,9 +323,10 @@ submitIntentBtn.addEventListener("click", async () => {
   const formData = new FormData();
   for (const photo of selectedPhotos) formData.append("photos", photo);
   formData.append("text", intentText.value.trim());
-  if (annotationPoints.length > 1) {
-    formData.append("annotation", JSON.stringify([{ photo_index: 0, points: annotationPoints }]));
-  }
+  const annotation = annItems
+    .map((it) => ({ photo_index: it.index, points: it.points }))
+    .filter((a) => a.points.length > 1);
+  if (annotation.length) formData.append("annotation", JSON.stringify(annotation));
 
   try {
     const response = await VulcanAPI.createIntent(formData);
@@ -208,10 +361,16 @@ function renderQuestions() {
   intentDescriptionEl.textContent = currentIntent.description || "";
   renderFreeformOptions();
 
-  overlayImg.src = annotateImg.src || "";
+  overlayImg.src = firstPhotoUrl || "";
   questionsList.innerHTML = "";
   overlaySvg.innerHTML = "";
   dimChips = {};
+
+  // Show the global unit toggle when there's at least one measurement to enter,
+  // reflecting the remembered session unit.
+  const hasMeasure = (currentIntent.questions || []).some((q) => q.kind === "measure_mm");
+  questionUnits.hidden = !hasMeasure;
+  syncUnitToggle();
 
   const dimsByName = Object.fromEntries((currentIntent.dimensions || []).map((d) => [d.name, d]));
   const questions = currentIntent.questions || [];
@@ -243,6 +402,7 @@ function renderQuestions() {
     overlayDrawList.push({ q, dim: dimsByName[q.dim_name] });
   }
   scheduleOverlayDraw();
+  makeZoomable(overlayWrap, [overlayImg, overlaySvg]);
 
   const renderedDims = new Set();
   for (const question of questions) {
@@ -629,13 +789,9 @@ function appendMeasureField(parent, questionId, placeholder, bounds) {
 
   input.addEventListener("input", refresh);
   unit.addEventListener("refresh-dual", refresh);
-  unit.addEventListener("change", () => {
-    setSessionUnit(unit.value);
-    for (const sel of document.querySelectorAll(".unit-select")) {
-      sel.value = getSessionUnit();
-      sel.dispatchEvent(new Event("refresh-dual"));
-    }
-  });
+  // Changing any field's unit changes the session unit for ALL fields (and the
+  // global toggle), so the whole question set stays in one unit.
+  unit.addEventListener("change", () => applySessionUnit(unit.value));
 
   wrap.appendChild(input);
   wrap.appendChild(unit);
@@ -820,6 +976,21 @@ submitAnswersBtn.addEventListener("click", () => {
 
 // --- Result panel: "Generate my part" -> the join endpoint --------------
 
+// Delivery choice (files vs shipped), captured when the user submits — before
+// review/fulfillment. Defaults to "files".
+let fulfillment = "files";
+const fulfillmentChoice = document.getElementById("fulfillment-choice");
+if (fulfillmentChoice) {
+  fulfillmentChoice.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-fulfillment]");
+    if (!b) return;
+    fulfillment = b.dataset.fulfillment;
+    for (const seg of fulfillmentChoice.querySelectorAll("[data-fulfillment]")) {
+      seg.classList.toggle("active", seg === b);
+    }
+  });
+}
+
 function renderResult() {
   resultPanel.hidden = false;
   resultStatusLine.textContent =
@@ -995,6 +1166,7 @@ function renderDesign(design) {
     };
     setCompositeView("with");
     compositeFigure.hidden = false;
+    makeZoomable(designCompositeImg.parentElement, designCompositeImg); // scroll to zoom in
     document.getElementById("composite-toggle-without").hidden = !photoUrl;
   } else {
     compositeSources = { with: null, without: null };
@@ -1054,11 +1226,15 @@ generatePartBtn.addEventListener("click", async () => {
   generatePartBtn.disabled = true;
   setGenerateStatus("Forging your part…", false);
   try {
-    const response = await VulcanAPI.joinDesign(currentIntent.intent_id);
+    const response = await VulcanAPI.joinDesign(currentIntent.intent_id, { fulfillment });
     if (!response.ok) throw new Error(await describeFetchError(response));
     const design = await response.json();
     renderDesign(design);
-    setGenerateStatus(`Design ${design.design_id} ready — download below.`, false);
+    const how =
+      (design.fulfillment || fulfillment) === "ship"
+        ? "we'll print and ship it to you"
+        : "download your files below";
+    setGenerateStatus(`Design ${design.design_id} ready — ${how}.`, false);
   } catch (err) {
     setGenerateStatus(`Error: ${errorText(err)}`, true);
   } finally {

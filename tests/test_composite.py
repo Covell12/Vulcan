@@ -204,3 +204,24 @@ def test_render_composite_actually_draws_the_ghost(tmp_path: Path):
     )
     changed = np.abs(original - composited).sum(axis=2) > 10
     assert changed.mean() > 0.01, "ghost overlay barely changed the photo"
+
+
+def test_render_composite_is_opaque_ember(tmp_path: Path):
+    """The part is drawn OPAQUE in the ember family (not a translucent blue
+    smear): the photo has meaningful solid orange/ember pixels, and there's a
+    glowing border of intermediate orange around it."""
+    stl = _bracket_stl(tmp_path)
+    out = tmp_path / "composite.png"
+    # A flat gray photo so any orange comes only from the part + its glow.
+    photo = io.BytesIO()
+    Image.new("RGB", (600, 450), (70, 70, 74)).save(photo, "JPEG")
+    ann = [{"photo_index": 0, "points": [[0.35, 0.4], [0.65, 0.62]]}]
+    C.render_composite(photo.getvalue(), stl, out, category="bracket", annotation=ann)
+    arr = np.asarray(Image.open(out).convert("RGB"), dtype=int)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    # Opaque ember body: strong red, mid green, low blue (unlike the old blue ghost).
+    ember = (r > 170) & (g > 55) & (g < 175) & (b < 110)
+    assert ember.sum() > 400, "expected an opaque ember-coloured part"
+    # A glow halo: orange-ish pixels that are NOT the flat gray background.
+    glow = (r > 110) & (r - b > 40) & ~ember
+    assert glow.sum() > 200, "expected a glowing orange border around the part"

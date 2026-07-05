@@ -782,7 +782,6 @@ label.checkbox-field {
 }
 
 /* Annotation + overlay canvases */
-#annotate-wrap,
 #overlay-wrap {
   position: relative;
   width: 100%;
@@ -793,18 +792,9 @@ label.checkbox-field {
   background: #000;
   margin: 4px 0 10px;
 }
-#annotate-img,
 #overlay-img {
   width: 100%;
   display: block;
-}
-#annotate-canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  cursor: crosshair;
-  touch-action: none;
 }
 #overlay-svg {
   position: absolute;
@@ -815,6 +805,85 @@ label.checkbox-field {
 }
 #overlay-svg .dim-chip {
   pointer-events: auto;
+}
+
+/* Multi-photo annotation: every uploaded photo shown + drawable. */
+#annotate-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 6px 0 10px;
+}
+.annotate-item {
+  position: relative;
+  flex: 1 1 220px;
+  max-width: 340px;
+  line-height: 0;
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid var(--line-2);
+  background: #000;
+}
+.annotate-photo {
+  width: 100%;
+  display: block;
+}
+.annotate-item .annotate-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  touch-action: none;
+}
+.annotate-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  border-radius: 999px;
+  line-height: 1.4;
+  color: var(--molten);
+  background: rgba(8, 7, 11, 0.78);
+  border: 1px solid var(--line-2);
+}
+
+/* Global unit toggle above the questions + delivery choice on the result. */
+.unit-toggle,
+.fulfillment-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.fulfillment-choice {
+  flex-wrap: wrap;
+}
+.review-fulfillment {
+  font-size: 13.5px;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+.review-fulfillment strong {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* Zoom + pan: wheel to zoom, drag to pan. */
+.zoomable {
+  touch-action: none;
+}
+.zoomable.zoomed {
+  cursor: grab;
+}
+.zoomable.zoomed :is(img, svg) {
+  will-change: transform;
 }
 
 /* Questions */

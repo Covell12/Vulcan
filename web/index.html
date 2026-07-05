@@ -103,14 +103,12 @@
             <input type="file" id="photo-input" accept="image/*" multiple />
           </label>
           <p class="hint">
-            Only the first photo is annotatable in this build. Drag on it to circle
-            or trace the area you need a part for (optional but recommended).
+            Drag on any photo to circle or trace the area you need a part for
+            (optional but recommended). The part is placed into the
+            <strong>first</strong> photo.
           </p>
-          <div id="annotate-wrap" hidden>
-            <img id="annotate-img" alt="First uploaded photo" />
-            <canvas id="annotate-canvas"></canvas>
-          </div>
-          <button id="clear-annotation-btn" type="button" hidden>Clear annotation</button>
+          <div id="annotate-wrap" hidden></div>
+          <button id="clear-annotation-btn" type="button" hidden>Clear drawings</button>
           <label>
             What do you need?
             <textarea id="intent-text" rows="3" placeholder="e.g. a bracket to hold a shelf under my desk"></textarea>
@@ -149,6 +147,12 @@
                  dimension lines, ellipses and label chips render 1:1 and undistorted. -->
             <svg id="overlay-svg" preserveAspectRatio="none"></svg>
           </div>
+          <div id="question-units" class="unit-toggle" hidden>
+            <span>Units</span>
+            <button type="button" class="seg" data-unit="mm">mm</button>
+            <button type="button" class="seg" data-unit="cm">cm</button>
+            <button type="button" class="seg" data-unit="in">in</button>
+          </div>
           <div id="questions-list"></div>
           <button id="submit-answers-btn" type="button">Submit answers</button>
           <p id="answers-status"></p>
@@ -157,6 +161,13 @@
         <section class="panel" id="result-panel" hidden>
           <h2>3 · Your part</h2>
           <p id="result-status-line"></p>
+
+          <div id="fulfillment-choice" class="fulfillment-choice">
+            <span>Deliver by</span>
+            <button type="button" class="seg active" data-fulfillment="files">Send me the files</button>
+            <button type="button" class="seg" data-fulfillment="ship">Ship it to me</button>
+          </div>
+
           <button id="generate-part-btn" disabled>Forge my part</button>
           <p id="generate-status"></p>
 

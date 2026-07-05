@@ -182,6 +182,12 @@ function renderCard(record) {
 
   card.append(el("p", { className: "review-request" }, [el("strong", {}, "Request: "), record.request || "(none)"]));
 
+  // How the customer wants it delivered (chosen at submit, before this review).
+  const deliver = record.fulfillment === "ship" ? "🚚 Ship it to the customer" : "⬇ Send the files";
+  card.append(
+    el("p", { className: "review-fulfillment" }, [el("strong", {}, "Deliver: "), deliver]),
+  );
+
   if (record.assumptions && record.assumptions.length) {
     card.append(
       el("p", { className: "review-assumptions" }, [

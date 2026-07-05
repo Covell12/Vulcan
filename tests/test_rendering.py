@@ -12,8 +12,46 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from cadquery import exporters
 
-from api.rendering import export_design, mesh_is_watertight, render_preview
+import trimesh
+
+from api.rendering import (
+    export_design,
+    heal_mesh_file,
+    mesh_is_watertight,
+    render_preview,
+)
 from templates_lib.registry import get_template
+
+
+def test_heal_mesh_is_noop_for_watertight(tmp_path: Path):
+    stl = _bracket_stl(tmp_path)
+    before = stl.read_bytes()
+    assert heal_mesh_file(stl) is True
+    assert stl.read_bytes() == before  # unchanged — a valid mesh is not rewritten
+
+
+def test_heal_mesh_repairs_a_holed_mesh(tmp_path: Path):
+    # A box missing one face is not watertight; healing (merge + fill_holes)
+    # should recover it AND rewrite the STL so the shipped mesh is manifold.
+    box = trimesh.creation.box(extents=(10, 10, 10))
+    holed = trimesh.Trimesh(
+        vertices=box.vertices.copy(), faces=box.faces[:-1].copy(), process=False
+    )
+    stl = tmp_path / "holed.stl"
+    holed.export(str(stl))
+    assert mesh_is_watertight(stl) is False
+    assert heal_mesh_file(stl) is True
+    assert mesh_is_watertight(stl) is True  # the rewritten file is watertight
+
+
+def test_heal_mesh_rejects_a_single_open_face(tmp_path: Path):
+    # A lone triangle has an open boundary healing can't close into a solid.
+    tri = trimesh.Trimesh(
+        vertices=[[0, 0, 0], [10, 0, 0], [0, 10, 0]], faces=[[0, 1, 2]], process=False
+    )
+    stl = tmp_path / "tri.stl"
+    tri.export(str(stl))
+    assert heal_mesh_file(stl) is False
 
 
 def _bracket_stl(tmp_path: Path) -> Path:

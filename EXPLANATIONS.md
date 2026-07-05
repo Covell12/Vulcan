@@ -99,10 +99,14 @@ non-expert can follow: what it does, why it exists, what talks to it).
   and its half-baked export directory is deleted, so no unbuildable STL/STEP can ever be
   downloaded. The per-template pytest suite proves watertightness for DEFAULT params; this
   guards the live path where user-resolved (and, later, generated) params run.
-- **api/composite.py** (M5.5) — The in-photo "ghost" preview: renders the ACTUAL generated
-  geometry back into the user's own photo, scale- and position-true but deliberately
-  synthetic (flat translucent blue, no lighting/shadows), so they can sanity-check size and
-  placement before paying. Pure numpy + Pillow + trimesh — NO OpenGL/GPU — so it runs in the
+- **api/composite.py** (M5.5) — The in-photo preview: renders the ACTUAL generated
+  geometry back into the user's own photo, scale- and position-true. **M9:** the part is now
+  drawn as an OPAQUE, flat-shaded ember solid (`_face_shades` gives simple normal-based
+  brightness so it reads as a 3D object) with a GLOWING ORANGE BORDER (`_rasterize` blurs the
+  silhouette alpha and colours the spill) — not the old translucent-blue smear. A fixed ember
+  colour keeps it honestly a preview, not a photo. Occlusion (part hidden behind foreground
+  objects) needs a whole-scene depth map — the provider only returns depth at the one circled
+  point today — so it's a documented next step. Pure numpy + Pillow + trimesh — NO OpenGL/GPU — so it runs in the
   same headless API process as everything else. It loads the exported STL, poses it with a
   textbook pinhole camera (focal length from the photo's EXIF 35mm-equivalent when present,
   else an assumed 60° field of view), and paints the triangles back-to-front (painter's
@@ -251,7 +255,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `cross_check.depth_value_mm`, so a corrected re-answer is checked against the same prior.
   A `confirm` answer is routed through the SAME cross-check (and refuses to touch a dim
   currently flagged as a mismatch), so it can't become a back door that commits a
-  disputed value without the re-ask. **M5 addition:** `POST /intents/{id}/design` is the
+  disputed value without the re-ask. **M9:** the join takes an optional body
+  `DesignJoinRequest{fulfillment: "files"|"ship"}` (default "files", bad value → 422) — how the
+  customer wants it delivered, chosen at submit BEFORE review; it's persisted on the intent, put
+  on the freeform review record, and returned so the founder dashboard can show it. **M5
+  addition:** `POST /intents/{id}/design` is the
   intent→design join — the endpoint that closes the loop. It refuses with a 409 unless the
   intent is `ready_for_design` (so the critical-dim gate holds end to end), then
   `_resolve_design_params` maps the IntentSpec onto the template's FULL param set:
@@ -311,7 +319,14 @@ non-expert can follow: what it does, why it exists, what talks to it).
   manifold gate (`api/designs.build_design`), and (later) DFM validation all rely on — it
   loads with `force="mesh"` and treats empty geometry as not-watertight, so a pathological
   export can't load as a `Scene` (no `.is_watertight`) and throw past the gate's cleanup
-  (M5.5 review hardening); it stays fail-closed.
+  (M5.5 review hardening); it stays fail-closed. **M9:** adds `heal_mesh_file` — the manifold
+  gate WITH auto-repair. If the exported mesh isn't watertight it tries a light, print-safe
+  fix (merge coincident vertices, fix winding + normals, `fill_holes` via networkx) and, if
+  that makes it watertight, OVERWRITES the STL with the healed mesh so the shipped part is
+  manifold; a genuinely broken mesh (real holes/open faces) still returns False and is
+  rejected. `api/designs.build_design` and `api/freeform.dfm_check` both call it, so a valid
+  generated solid whose tessellation had hairline gaps is no longer wrongly rejected as
+  "not manifold". A no-op for already-watertight meshes (every template default).
   **M5.5:** `render_preview` now pads any zero-thickness bounding-box axis before setting the
   3D limits, so a degenerate/flat mesh (e.g. a broken template producing a single planar
   face) renders instead of crashing matplotlib's projection — the manifold gate is what then
@@ -665,6 +680,13 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   (`dim-cast`), `drawDimLine` adds foreshortened ticks + pin `drawNub` ends + outward arrows, and
   `drawDimRing` wraps a diameter around the round feature like a band on a cylinder (bright near
   arc + faint dashed far arc + the measured-diameter tube).
+  **M9:** (a) MULTI-PHOTO — every uploaded photo is shown and drawable (`annItems`, one canvas
+  each, `attachDrawing`); the composite/overlay still key off the FIRST photo (`firstPhotoUrl`),
+  and the submit sends one annotation entry per photo with strokes. (b) A global `#question-units`
+  mm/cm/in toggle (`applySessionUnit`) drives ALL measurement fields at once, and a per-field
+  change updates the toggle. (c) `makeZoomable` gives the composite + the question overlay
+  scroll-to-zoom / drag-to-pan (double-click resets; clicks pass through at 1×). (d) A
+  `#fulfillment-choice` (files vs ship) is captured at generate and sent to `joinDesign`.
 - **web/style.css** — Styling for the test UI. **M3:** tab styling, the photo/canvas/SVG
   overlay layout, question rows, the IntentSpec JSON display. **M4:** the `.mismatch-card`
   / `.reconfirm-btn` cross-check styles. **M5:** the `.measure-field` (input + unit

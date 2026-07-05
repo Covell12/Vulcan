@@ -139,3 +139,50 @@ def mesh_is_watertight(stl_path: Path) -> bool:
     fail-closed rather than throwing past its cleanup on a pathological mesh."""
     mesh = trimesh.load(str(stl_path), force="mesh")
     return bool(getattr(mesh, "is_watertight", False)) and len(mesh.faces) > 0
+
+
+def heal_mesh_file(stl_path: Path) -> bool:
+    """Manifold gate WITH automatic repair. Checks the exported mesh; if it isn't
+    watertight, attempts a light, print-safe repair (merge coincident vertices,
+    fix face winding + normals, fill small holes) and — if that makes it
+    watertight — OVERWRITES the STL with the healed mesh so the part we ship is
+    manifold. Returns the FINAL watertight status.
+
+    This matters most for generated (freeform) geometry: CadQuery/OCC tessellation
+    of a valid solid, or a slightly-imperfect boolean, can produce a mesh that is
+    manifold in intent but has hairline gaps / inconsistent winding that make
+    trimesh report it as not watertight. Healing recovers those without hiding a
+    genuinely broken solid (a mesh with real holes/non-manifold edges stays
+    non-watertight and is still rejected). A no-op for an already-watertight mesh
+    (every template's default export), so it never changes those files."""
+    mesh = trimesh.load(str(stl_path), force="mesh")
+    if (
+        bool(getattr(mesh, "is_watertight", False))
+        and len(getattr(mesh, "faces", [])) > 0
+    ):
+        return True
+    try:
+        mesh.merge_vertices()
+        trimesh.repair.fix_winding(mesh)
+        trimesh.repair.fix_normals(mesh)
+        try:
+            trimesh.repair.fill_holes(mesh)  # needs networkx; best-effort
+        except Exception:
+            pass
+    except Exception:
+        return False
+    healed = (
+        bool(getattr(mesh, "is_watertight", False))
+        and len(getattr(mesh, "faces", [])) > 0
+    )
+    if healed:
+        original = stl_path.read_bytes()  # so a failed export can't corrupt the file
+        try:
+            mesh.export(str(stl_path))  # ship the repaired, watertight mesh
+        except Exception:
+            try:
+                stl_path.write_bytes(original)  # restore the valid original
+            except Exception:
+                pass
+            return False
+    return healed

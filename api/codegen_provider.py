@@ -103,7 +103,13 @@ subprocess, requests, importlib, etc.; any other import will be rejected and you
 discarded);
   * defines a top-level function `build(params)` where `params` is a plain dict keyed by \
 your parameter names (e.g. params["width_mm"]); read values with float(...)/int(...);
-  * returns a single manifold cadquery Workplane solid (one connected watertight body);
+  * returns a single manifold cadquery Workplane solid (ONE connected, watertight, closed \
+body). This is the #1 cause of rejection, so: UNION every piece into one solid (never return \
+loose/overlapping separate bodies or a bare sketch/wire); make booleans actually OVERLAP in \
+volume (not merely touch at a face or edge — a face- or edge-only contact leaves a \
+non-manifold seam); avoid self-intersecting sweeps/lofts and zero-thickness walls. Safest \
+pattern: build the outer solid, `.cut()` the holes/pockets, `.union()` any add-ons, and \
+return that single Workplane.
   * uses NO file/network/system access, NO eval/exec, NO dunder-attribute tricks — pure \
 geometry only. It runs in a locked-down sandbox that forbids all of that.
 - param_schema: one entry per parameter, using EXACTLY these fields: name (snake_case, \

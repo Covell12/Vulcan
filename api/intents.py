@@ -28,7 +28,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import jsonschema
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -84,6 +84,14 @@ class AnswerInput(BaseModel):
 
 class AnswersRequest(BaseModel):
     answers: list[AnswerInput]
+
+
+class DesignJoinRequest(BaseModel):
+    # How the customer wants the finished part delivered — chosen when they
+    # submit, BEFORE founder review/fulfillment. "files" = just the CAD to
+    # download; "ship" = print it and mail it. (Phase 0 records the preference;
+    # payment/address come with the order system in a later milestone.)
+    fulfillment: Literal["files", "ship"] = "files"
 
 
 # ---------------------------------------------------------------------------
@@ -988,8 +996,11 @@ def _render_ghost_composite(
 
 
 @router.post("/intents/{intent_id}/design")
-def create_design_from_intent(intent_id: str) -> dict[str, Any]:
+def create_design_from_intent(
+    intent_id: str, payload: DesignJoinRequest | None = None
+) -> dict[str, Any]:
     intent = _load_intent(intent_id)
+    fulfillment = payload.fulfillment if payload else "files"
 
     if intent.get("status") != "ready_for_design":
         raise HTTPException(
@@ -1038,14 +1049,16 @@ def create_design_from_intent(intent_id: str) -> dict[str, Any]:
                 "assumptions": intent.get("freeform_assumptions", []),
                 "dfm": intent.get("freeform_dfm"),
                 "files": files,
+                "fulfillment": fulfillment,
                 "created_at": freeform._now(),
             }
         )
 
-    # Persist the intent -> design link.
+    # Persist the intent -> design link + how they want it delivered.
     intent["design_id"] = design_id
     intent["design_files"] = files
     intent["design_params"] = summary
+    intent["fulfillment"] = fulfillment
     _save_intent(intent)
 
     response: dict[str, Any] = {
@@ -1053,6 +1066,7 @@ def create_design_from_intent(intent_id: str) -> dict[str, Any]:
         "template_id": template_id,
         "files": files,
         "params": summary,
+        "fulfillment": fulfillment,
     }
     if is_freeform:
         response["freeform"] = True

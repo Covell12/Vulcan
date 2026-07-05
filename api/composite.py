@@ -5,8 +5,10 @@ semi-transparent "ghost" of the part where it will go.
 Why this exists: the callout render (api/rendering.py) shows the part in the
 abstract; this shows it *in situ*, at roughly the right size and place, so the
 user can sanity-check "yes, that bracket is about that big, right there" before
-paying. It is honestly synthetic — flat translucent blue, no lighting, no
-shadows — so it can never be mistaken for a real photo of a finished part.
+paying. The part is drawn as an OPAQUE, flat-shaded solid in the Vulcan ember
+colour with a glowing orange border, so it reads as a real object dropped into
+the scene (not a translucent smear) — while the fixed colour + synthetic shading
+still keep it clearly a preview, not a photo of a finished part.
 
 Deliberately dependency-light: pure numpy + Pillow + trimesh, NO OpenGL /
 pyrender / GPU. It runs in the same headless API process as everything else.
@@ -22,8 +24,12 @@ HONESTY / v0 LIMITATIONS (surfaced to the user in the UI copy):
     depth it is inferred from the part's own size vs. how big the user's
     annotation is, and with neither it falls back to a fixed fraction of frame.
   - PLACEMENT anchors the part's centroid at the annotation centroid (or the
-    photo center). No occlusion, no contact/gravity solve.
-Treat the ghost as "about this big, about here", not a measurement.
+    photo center). No contact/gravity solve.
+  - OCCLUSION (part hidden behind foreground objects) needs a metric depth map of
+    the WHOLE scene, which requires a depth model; the current depth provider only
+    returns depth at the single circled point (for scale), so occlusion is not yet
+    applied — the part is drawn fully in front. A documented next step.
+Treat the preview as "about this big, about here", not a measurement.
 """
 
 from __future__ import annotations
@@ -56,9 +62,16 @@ _MAX_DIM_PX = 1280
 # fraction of the frame width. A documented last-resort guess.
 _FALLBACK_FRAME_FRACTION = 0.35
 
-# Ghost styling: clearly synthetic, translucent blue over the photo.
-_FILL_RGBA = (80, 140, 225, 55)
-_EDGE_RGBA = (20, 45, 95, 150)
+# Part styling: an OPAQUE, flat-shaded solid in the Vulcan ember family with a
+# glowing orange border around its silhouette — reads as a real object dropped
+# into the scene, not a translucent smear. `_PART_RGB` is the lit base color;
+# per-face shading darkens it toward `_PART_SHADOW_RGB` on faces turned away from
+# the camera/light so the form is legible.
+_PART_RGB = (255, 122, 40)
+_PART_SHADOW_RGB = (92, 34, 8)
+_EDGE_RGBA = (40, 16, 4, 180)
+_GLOW_RGB = (255, 140, 32)
+_GLOW_RADIUS_PX = 7  # how far the orange halo spreads beyond the silhouette
 
 # Which canonical mounting each template category gets. Wall-mounted parts stand
 # against a vertical plane facing the camera; everything else sits on a surface.
@@ -269,6 +282,24 @@ def _load_photo(photo_bytes: bytes) -> tuple[Image.Image, float | None]:
     return img, exif_focal
 
 
+def _face_shades(verts_cam: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """A 0..1 brightness per face from simple flat shading: normals oriented
+    toward the camera, lit from the upper-left-front, so the solid reads as a 3D
+    object rather than a flat blob. Pure numpy — no lighting model dependency."""
+    tris = verts_cam[faces]  # (F,3,3)
+    n = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    nl = np.linalg.norm(n, axis=1, keepdims=True)
+    nl[nl == 0] = 1.0
+    n = n / nl
+    centers = tris.mean(axis=1)
+    # Flip normals that point away from the camera (origin), so all face the viewer.
+    away = np.sum(n * centers, axis=1) > 0
+    n[away] = -n[away]
+    facing = np.clip(-n[:, 2], 0.0, 1.0)  # 1 = square to camera
+    left_light = np.clip(-n[:, 0], 0.0, 1.0)  # a touch brighter on left-facing
+    return np.clip(0.42 + 0.5 * facing + 0.14 * left_light, 0.0, 1.0)
+
+
 def _rasterize(
     base: Image.Image,
     verts_cam: np.ndarray,
@@ -278,25 +309,41 @@ def _rasterize(
     cx: float,
     cy: float,
 ) -> Image.Image:
-    """Paint the mesh's triangles onto a copy of `base`, back-to-front, as
-    translucent filled polygons with darker edges. Faces with any vertex at or
-    behind the camera are skipped."""
+    """Paint the mesh as an OPAQUE, flat-shaded solid onto `base`, back-to-front
+    (so nearer faces cover farther ones), then add a glowing orange halo around
+    its silhouette. Faces with any vertex at or behind the camera are skipped."""
+    from PIL import ImageFilter
+
     verts_2d = pinhole_project(verts_cam, fx, fy, cx, cy)
     face_z = verts_cam[faces][:, :, 2]  # (F,3) camera depth per face vertex
 
-    # Cull faces that touch/cross the image plane, then paint far faces first.
     keep = np.all(face_z > 1e-6, axis=1)
     order = np.argsort(-face_z.mean(axis=1))
     order = order[keep[order]]
 
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    shades = _face_shades(verts_cam, faces)
+    part = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(part)
+    lit = np.array(_PART_RGB, dtype=float)
+    shadow = np.array(_PART_SHADOW_RGB, dtype=float)
     for fi in order:
         tri = verts_2d[faces[fi]]
         poly = [(float(p[0]), float(p[1])) for p in tri]
-        draw.polygon(poly, fill=_FILL_RGBA, outline=_EDGE_RGBA)
+        s = float(shades[fi])
+        col = tuple(int(round(shadow[i] + (lit[i] - shadow[i]) * s)) for i in range(3))
+        draw.polygon(poly, fill=col + (255,), outline=_EDGE_RGBA)
 
-    return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+    # Glowing orange border: blur the part's silhouette and colour the spill.
+    alpha = part.split()[3]
+    halo = alpha.filter(ImageFilter.GaussianBlur(_GLOW_RADIUS_PX))
+    glow = Image.new("RGBA", base.size, _GLOW_RGB + (0,))
+    glow.putalpha(halo)
+
+    out = base.convert("RGBA")
+    out = Image.alpha_composite(out, glow)  # halo sits under the part
+    out = Image.alpha_composite(out, glow)  # doubled → a brighter, real "glow"
+    out = Image.alpha_composite(out, part)  # opaque part on top
+    return out.convert("RGB")
 
 
 # ---------------------------------------------------------------------------
