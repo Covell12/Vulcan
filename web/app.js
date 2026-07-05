@@ -21,37 +21,7 @@ const downloadsEl = document.getElementById("downloads");
 let templates = [];
 let currentFields = [];
 
-// Shared, defensive error rendering for failed fetches. Works whether the
-// server sent a JSON body ({detail: ...}), plain text, or nothing at all, and
-// always includes the HTTP status. Guarantees a non-empty string so an empty
-// "Error:" can never be shown. Used by both app.js and intents.js.
-async function describeFetchError(response) {
-  const statusPart = `HTTP ${response.status}${response.statusText ? " " + response.statusText : ""}`;
-  let detail = "";
-  const raw = await response.text().catch(() => "");
-  if (raw) {
-    try {
-      const body = JSON.parse(raw);
-      if (body && body.detail !== undefined && body.detail !== null) {
-        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
-      } else {
-        detail = raw;
-      }
-    } catch {
-      detail = raw; // not JSON — show the raw text
-    }
-  }
-  detail = (detail || "").toString().trim();
-  if (detail.length > 600) detail = detail.slice(0, 600) + "…";
-  return detail ? `${statusPart}: ${detail}` : statusPart;
-}
-
-// Never let a caught error render as an empty string.
-function errorText(err) {
-  if (err && err.message) return err.message;
-  const s = String(err || "");
-  return s || "request failed";
-}
+// describeFetchError() and errorText() now live in api.js (shared by both flows).
 
 function setStatus(message, isError) {
   statusEl.textContent = message;
@@ -140,7 +110,7 @@ function renderDownloads(files) {
   for (const { label, href } of links) {
     const li = document.createElement("li");
     const a = document.createElement("a");
-    a.href = href;
+    a.href = VulcanAPI.asset(href);
     a.download = "";
     a.textContent = `Download ${label}`;
     li.appendChild(a);
@@ -166,7 +136,7 @@ function onTemplateChange() {
 async function loadTemplates() {
   setStatus("Loading templates…", false);
   try {
-    const response = await fetch("/templates");
+    const response = await VulcanAPI.getTemplates();
     if (!response.ok) throw new Error(await describeFetchError(response));
     templates = await response.json();
   } catch (err) {
@@ -197,19 +167,15 @@ form.addEventListener("submit", async (event) => {
   downloadsEl.innerHTML = "";
 
   try {
-    const response = await fetch("/designs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        template_id: templateSelect.value,
-        params: paramsFromFields(),
-      }),
+    const response = await VulcanAPI.createDesign({
+      template_id: templateSelect.value,
+      params: paramsFromFields(),
     });
 
     if (!response.ok) throw new Error(await describeFetchError(response));
 
     const design = await response.json();
-    previewImg.src = `${design.files.preview_png}?t=${Date.now()}`;
+    previewImg.src = `${VulcanAPI.asset(design.files.preview_png)}?t=${Date.now()}`;
     previewImg.classList.add("visible");
     renderDownloads(design.files);
     setStatus(`Design ${design.design_id} ready.`, false);

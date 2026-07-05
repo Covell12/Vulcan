@@ -66,7 +66,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   way of tests that mock the providers and don't have real keys. **M-B:** includes the
   `review` router BEFORE the `/exports` mount (so its gated download route takes precedence
   over the static files), and imports `api.freeform` for its side effect (registering the
-  ephemeral-template rehydration loader on `templates_lib.registry`).
+  ephemeral-template rehydration loader on `templates_lib.registry`). **Production UI:**
+  adds `CORSMiddleware` so the `web/` site can be hosted on a different origin and still
+  call the API — the allowlist is `VULCAN_CORS_ORIGINS` (comma-separated, default `*`), with
+  `allow_credentials=False` because the founder token is a request header, not a cookie
+  (that's what makes a `*` allowlist safe). CORS does not weaken the `/exports` download gate.
 - **api/photo.py** (M4) — The tiny `PhotoInput` container (bytes + mime type) shared by
   both provider seams. Lives in its own neutral module so `api/vision_provider.py` and
   `api/depth_provider.py` can both accept the same type without importing each other;
@@ -455,7 +459,39 @@ sandbox; every freeform design requires founder review before its files can ship
   "shaft_depth_mm")`, per this milestone's instructions. **M5:** `knob_callouts` declares
   the knob-diameter, shaft-diameter, and shaft-depth preview arrows.
 
-## web/ (M1, rebuilt M2, extended M3, M4, M5, M5.5, and M-B)
+## web/ (M1, rebuilt M2, extended M3, M4, M5, M5.5, M-B, and Production UI)
+
+**Production UI (dark "forge" theme + standalone client).** The site is no longer a "test
+UI": it's a dark, black-canvas production site themed off the fire-V logo (ember/molten
+accents, vendored Anton + Space Grotesk fonts, ambient embers, glow, a hero + "how it works"
++ studio + footer), and it's a **standalone client** — it shares no code with the API and
+talks to it purely over HTTP through one module (`web/api.js`), so it can be hosted anywhere.
+The rewrite preserved every DOM id, runtime-toggled class, and endpoint the app JS depends on;
+only the chrome around them and the network seam changed. See `web/README.md`.
+
+- **web/config.js** (Production UI) — Sets `window.VULCAN_CONFIG.apiBase`: `""` = same origin
+  (FastAPI serves the site in dev), or an API origin for a separately-hosted frontend. Resolved
+  from `window.VULCAN_API_BASE`, a `<meta name="vulcan-api-base">`, or the fallback string.
+  Loaded before `api.js`.
+- **web/api.js** (Production UI) — `window.VulcanAPI`, the ONE place the site talks to the API.
+  Every request AND every API-served asset URL goes through it: `getTemplates/createDesign/
+  createIntent/submitAnswers/freeform/joinDesign/reviewQueue/submitVerdict/fetchFile`, plus
+  `url()`/`asset()` which resolve a `files.*` path (or any API path) against `apiBase`
+  (absolute/`blob:`/`data:` pass through; same-origin is a no-op). Also home to the shared
+  `describeFetchError`/`errorText` globals (moved here from app.js). Change `apiBase` and the
+  whole site follows the API to a new origin — no other edits.
+- **web/site.js** (Production UI) — Presentation-only chrome: nav solidify-on-scroll, mobile
+  menu toggle, and reveal-on-scroll via IntersectionObserver. Fully progressive — the app flow
+  never depends on it; every hook is guarded so a missing element is a no-op.
+- **web/assets/** (Production UI) — The logo (`logo.png`, the fire-V) and favicons
+  (`favicon.ico`, `favicon-32.png`, `apple-touch-icon.png`, `icon-192/512.png`). The logo is
+  black-backed and glowing; the CSS uses `mix-blend-mode: screen` so the black square vanishes
+  and only the glowing V shows on the dark page.
+- **web/vendor/fonts/** (Production UI) — Vendored, offline (no CDN, per CLAUDE.md): `anton-400`
+  (the VULCAN wordmark + hero display) and `space-grotesk-var` (UI/body, variable 300–700).
+- **web/README.md** (Production UI) — Documents the standalone-frontend contract: how `api.js`
+  is the only API seam, how to point `apiBase` at an API origin, the `VULCAN_CORS_ORIGINS`
+  env, the file map, and the script load order.
 
 - **web/review.html + web/review.js** (M-B) — The founder review page (served at
   `/review.html`, distinct from the `GET /review` API). Lists freeform design records with a
@@ -498,6 +534,10 @@ sandbox; every freeform design requires founder review before its files can ship
   though its downloads are gated; at most one inline viewer + one modal viewer exist at a time
   (each mount disposes the previous, and a list reload disposes the inline one) to stay well
   under the browser's WebGL-context limit.
+  **Production UI:** the page is dark-themed and gets the shared nav + logo; all of `review.js`'s
+  network calls and asset URLs now route through `VulcanAPI` (`reviewQueue`/`submitVerdict`/
+  `fetchFile`, and `asset()` on the card image/STL URLs) — so the dashboard is a standalone
+  client too. Loads `config.js` + `api.js` before `review.js`.
 
 
 - **web/index.html** — **M3:** now two tabs. "Start with a photo" (the new default) is
@@ -515,6 +555,12 @@ sandbox; every freeform design requires founder review before its files can ship
   static render for a live `#viewer3d-part` (drag-orbit / scroll-zoom / right-drag-pan) with
   a "3D / Dimensions" toggle and an "⛶ Expand" button; a shared `#viewer-modal` provides the
   fullscreen viewer. It loads the vendored Three.js stack + `viewer3d.js` before the app JS.
+  **Production UI:** `index.html` is now a real product page — dark theme, sticky nav with the
+  fire-V logo, a hero ("Describe it. Hold it."), a five-step "how it works", the studio (the two
+  tabs become a segmented control), and a footer — all wrapping the SAME functional ids so the
+  flow is unchanged. It loads `config.js` + `api.js` before `app.js`/`intents.js` (which now call
+  `VulcanAPI`), and `site.js` last. A few labels moved to production copy ("Analyze my photo",
+  "Forge my part").
 - **web/viewer3d.js + web/vendor/{three.min.js,STLLoader.js,OrbitControls.js}** — The
   interactive 3D model viewer and its vendored dependencies (Three.js r128 UMD + the matching
   STLLoader/OrbitControls, which attach to the global `THREE`). Vendored, not CDN-loaded, so
@@ -541,7 +587,10 @@ sandbox; every freeform design requires founder review before its files can ship
   turns any failed response into a useful, always-non-empty message that includes the
   HTTP status, whether the body was JSON `{detail}`, plain text, or empty; `errorText`
   guarantees a caught error never renders as an empty string. Together they make an empty
-  "Error:" impossible.
+  "Error:" impossible. **Production UI:** `describeFetchError`/`errorText` MOVED to `api.js`
+  (shared by both flows); app.js's `GET /templates`/`POST /designs` now go through
+  `VulcanAPI.getTemplates()`/`createDesign()`, and preview/download URLs through
+  `VulcanAPI.asset()`.
 - **web/intents.js** (M3) — The "Start with a photo" flow. Lets the user upload up to 3
   photos (only the first is annotatable in this test UI — a documented v0 UI
   simplification, not a backend one) and draw a freehand polyline on it via canvas
@@ -577,6 +626,10 @@ sandbox; every freeform design requires founder review before its files can ship
   mounts the interactive model via `showPartView`/`mountPartViewer` (`Vulcan3D.create`), with
   the "3D / Dimensions" toggle, the "⛶ Expand" modal, and Escape-to-close; switching away from
   3D or re-rendering disposes the prior viewer so only one WebGL context is live at a time.
+  **Production UI:** all four endpoints go through `VulcanAPI` (`createIntent`/`submitAnswers`/
+  `freeform`/`joinDesign`), and every `design.files.*` URL used as an `<img src>`, download
+  `href`, or the 3D viewer's STL is wrapped in `VulcanAPI.asset()` — so the whole flow works
+  from a separately-hosted site.
 - **web/style.css** — Styling for the test UI. **M3:** tab styling, the photo/canvas/SVG
   overlay layout, question rows, the IntentSpec JSON display. **M4:** the `.mismatch-card`
   / `.reconfirm-btn` cross-check styles. **M5:** the `.measure-field` (input + unit
@@ -587,9 +640,23 @@ sandbox; every freeform design requires founder review before its files can ship
   canvas box (gradient bg, grab cursor), the `.view-toggle` segmented control (`.seg`/`.seg.active`,
   `.expand-btn`), the fullscreen `#viewer-modal` + `.viewer-modal-bar`, the `.viewer-fallback`
   image/message, and the dashboard `.review-view` / `.review-view-box`.
+  **Production UI:** fully rewritten as the dark "forge" theme — molten palette tokens
+  (`--bg` near-black, `--ember`/`--molten`/`--flame` accents), vendored Anton + Space Grotesk
+  `@font-face`, the ambient `.bg-embers` layer + `.ember` particles, the `.site-nav`/`.hero`/
+  `.how-steps`/`.studio`/`.site-foot` chrome, and restyled versions of every functional class
+  (panels, segmented `.tabs`/`.seg`, `.viewer3d`, dim-overlay chips as a glowing ruler, param
+  badges, review dashboard). A global `[hidden]{display:none!important}` guarantees the JS's
+  `.hidden` toggles win over any display rule; `prefers-reduced-motion` disables the animations;
+  colors were tuned to clear WCAG AA. All ids/classes the JS drives are preserved.
 
-## tests/ (M1, extended M2, M3, M4, M5, M5.5, and M-B)
+## tests/ (M1, extended M2, M3, M4, M5, M5.5, M-B, and Production UI)
 
+- **tests/test_cors_and_static.py** (Production UI) — Locks in the standalone-frontend
+  contract: a cross-origin GET gets an `Access-Control-Allow-Origin` header; a preflight
+  OPTIONS for the token-bearing verdict POST is allowed (methods + `X-Review-Token`); the
+  new `config.js`/`api.js` client seam is actually served as JS; and `index.html` loads
+  `config.js`+`api.js` before `app.js`/`intents.js` (or the shared globals + `VulcanAPI`
+  wouldn't exist when the flow scripts run).
 - **tests/test_code_verifier.py** (M-B) — Security tests for the AST safety gate: legitimate
   CadQuery code passes; every escape shape is rejected — disallowed imports (os/sys/subprocess/
   socket/relative), banned names (open/eval/exec/`__import__`/getattr/…), dunder-attribute

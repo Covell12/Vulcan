@@ -30,7 +30,7 @@ function setStatus(message, isError) {
 async function downloadFile(url, filename) {
   setStatus(`Downloading ${filename}…`, false);
   try {
-    const resp = await fetch(url, { headers: { "X-Review-Token": founderToken() } });
+    const resp = await VulcanAPI.fetchFile(url, founderToken());
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const blob = await resp.blob();
     const a = document.createElement("a");
@@ -61,10 +61,12 @@ function buildCardView(record) {
   box.append(img, viewer);
   const bar = el("div", { className: "view-toggle" });
 
+  // Image srcs are used directly (not via fetchFile), so resolve them against
+  // the configured API origin with VulcanAPI.asset().
   const sources = [];
-  if (f.composite) sources.push(["With part", `${f.composite}?t=${Date.now()}`]);
-  if (f.photo) sources.push(["Photo only", `${f.photo}?t=${Date.now()}`]);
-  if (f.preview_png) sources.push(["Dimensions", `${f.preview_png}?t=${Date.now()}`]);
+  if (f.composite) sources.push(["With part", `${VulcanAPI.asset(f.composite)}?t=${Date.now()}`]);
+  if (f.photo) sources.push(["Photo only", `${VulcanAPI.asset(f.photo)}?t=${Date.now()}`]);
+  if (f.preview_png) sources.push(["Dimensions", `${VulcanAPI.asset(f.preview_png)}?t=${Date.now()}`]);
   img.src = (sources[0] || [null, ""])[1];
 
   const clearActive = () => [...bar.querySelectorAll(".seg")].forEach((b) => b.classList.remove("active"));
@@ -91,11 +93,14 @@ function buildCardView(record) {
       viewer.style.display = "";
       clearActive();
       b3d.classList.add("active");
-      Vulcan3D.create(viewer, f.stl, { token: founderToken(), fallbackImg: f.preview_png }).then((v) => (dashViewer = v));
+      Vulcan3D.create(viewer, VulcanAPI.asset(f.stl), {
+        token: founderToken(),
+        fallbackImg: VulcanAPI.asset(f.preview_png),
+      }).then((v) => (dashViewer = v));
     });
     bar.append(b3d);
     const exp = el("button", { type: "button", className: "expand-btn", textContent: "⛶ Expand" });
-    exp.addEventListener("click", () => openCardModal(f.stl));
+    exp.addEventListener("click", () => openCardModal(VulcanAPI.asset(f.stl)));
     bar.append(exp);
   }
 
@@ -252,11 +257,7 @@ function renderCard(record) {
 async function submitVerdict(designId, verdict, note) {
   setStatus(`Recording ${verdict}…`, false);
   try {
-    const resp = await fetch(`/review/${designId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Review-Token": founderToken() },
-      body: JSON.stringify({ verdict, note: note || null }),
-    });
+    const resp = await VulcanAPI.submitVerdict(designId, { verdict, note: note || null }, founderToken());
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     setStatus(`${verdict === "approve" ? "Approved" : "Rejected"} ${designId}.`, false);
     load();
@@ -268,7 +269,7 @@ async function submitVerdict(designId, verdict, note) {
 async function load() {
   setStatus("Loading…", false);
   try {
-    const resp = await fetch(`/review?status=${filterEl.value}`);
+    const resp = await VulcanAPI.reviewQueue(filterEl.value);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const records = await resp.json();
     if (dashViewer) { dashViewer.dispose(); dashViewer = null; } // cards are about to be replaced

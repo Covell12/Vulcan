@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from api import (
@@ -41,6 +43,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Vulcan Core API", lifespan=lifespan)
+
+# CORS. The web/ frontend is a standalone static client that may be hosted on a
+# different origin than this API (see web/README.md — it talks to the API purely
+# over HTTP via web/api.js). This lets a browser on the configured origins call
+# the API. VULCAN_CORS_ORIGINS is a comma-separated allowlist; the default "*"
+# is fine for local dev and same-origin deploys. No cookies are used (the founder
+# review token is a request header), so credentials stay OFF — which is exactly
+# what makes a "*" allowlist safe here.
+_cors_origins = [
+    o.strip() for o in os.getenv("VULCAN_CORS_ORIGINS", "*").split(",") if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
 
 
 @app.get("/health")

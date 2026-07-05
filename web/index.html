@@ -2,162 +2,260 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Vulcan — Test UI</title>
+  <title>Vulcan — Describe it. Hold it.</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Vulcan turns a photo and a sentence into a custom physical part — designed, checked for printability, and delivered." />
+  <meta name="theme-color" content="#08070b" />
+  <!-- To host this site separately from the API, set the API origin here:
+       <meta name="vulcan-api-base" content="https://api.vulcan.example" /> -->
+  <link rel="icon" href="/assets/favicon.ico" sizes="any" />
+  <link rel="icon" type="image/png" href="/assets/favicon-32.png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <header>
-    <h1>Vulcan</h1>
-    <p class="tagline">Describe it. Hold it. — M3 test UI: photo → questions → part</p>
+  <a class="skip-link" href="#studio">Skip to the forge</a>
+
+  <div class="bg-embers" aria-hidden="true">
+    <span class="ember"></span><span class="ember"></span><span class="ember"></span>
+    <span class="ember"></span><span class="ember"></span><span class="ember"></span>
+    <span class="ember"></span><span class="ember"></span><span class="ember"></span>
+    <span class="ember"></span><span class="ember"></span><span class="ember"></span>
+  </div>
+
+  <header class="site-nav" id="site-nav">
+    <a class="nav-brand" href="#top">
+      <img class="nav-logo" src="/assets/logo.png" alt="" />
+      <span class="nav-word">VULCAN</span>
+    </a>
+    <nav class="nav-links" id="nav-links">
+      <a href="#how">How it works</a>
+      <a href="#studio">Create</a>
+      <a href="/review.html">Founder</a>
+    </nav>
+    <div class="nav-right">
+      <a class="btn btn-fire btn-sm" href="#studio">Start forging</a>
+      <button class="nav-toggle" id="nav-toggle" type="button" aria-label="Menu" aria-expanded="false">☰</button>
+    </div>
   </header>
 
-  <nav class="tabs">
-    <button class="tab-btn active" data-tab="photo" type="button">Start with a photo</button>
-    <button class="tab-btn" data-tab="direct" type="button">Direct template params</button>
-  </nav>
-
-  <main id="tab-photo" class="tab-panel active">
-    <section class="panel">
-      <h2>1. Photo + description</h2>
-      <label>
-        Photo(s) — up to 3
-        <input type="file" id="photo-input" accept="image/*" multiple />
-      </label>
-      <p class="hint">
-        Only the first photo can be annotated in this test UI. Drag on it to circle or
-        trace the area you need a part for (optional).
-      </p>
-      <div id="annotate-wrap" hidden>
-        <img id="annotate-img" alt="First uploaded photo" />
-        <canvas id="annotate-canvas"></canvas>
-      </div>
-      <button id="clear-annotation-btn" type="button" hidden>Clear annotation</button>
-      <label>
-        What do you need?
-        <textarea id="intent-text" rows="3" placeholder="e.g. a bracket to hold a shelf under my desk"></textarea>
-      </label>
-      <button id="submit-intent-btn" type="button">Analyze photo</button>
-      <p id="intent-status"></p>
-    </section>
-
-    <section class="panel" id="freeform-panel" hidden>
-      <h2>Custom design</h2>
-      <p class="freeform-note">
-        No standard template fits this one — but Vulcan can design a
-        <strong>custom part</strong> for it. Heads up: custom designs are
-        machine-generated and <strong>need a human check before they ship</strong>.
-        We'll design it now, then you'll confirm the key measurements.
-      </p>
-      <button id="freeform-btn" type="button">Design it for me</button>
-      <p id="freeform-status"></p>
-    </section>
-
-    <section class="panel" id="questions-panel" hidden>
-      <h2>2. Questions</h2>
-      <p id="intent-description" class="template-description"></p>
-
-      <div id="freeform-override" hidden>
-        <p id="freeform-recommend-note" class="freeform-recommend" hidden></p>
-        <button id="freeform-override-btn" type="button" class="override-btn">
-          Design this custom instead
-        </button>
-        <p id="freeform-override-status"></p>
-      </div>
-
-      <div id="overlay-wrap">
-        <img id="overlay-img" alt="Uploaded photo with dimension overlays" />
-        <!-- viewBox is set to the rendered image pixel size at draw time so the
-             dimension lines, ellipses and label chips render 1:1 and undistorted. -->
-        <svg id="overlay-svg" preserveAspectRatio="none"></svg>
-      </div>
-      <div id="questions-list"></div>
-      <button id="submit-answers-btn" type="button">Submit answers</button>
-      <p id="answers-status"></p>
-    </section>
-
-    <section class="panel" id="result-panel" hidden>
-      <h2>3. Your part</h2>
-      <p id="result-status-line"></p>
-      <button id="generate-part-btn" disabled>Generate my part</button>
-      <p id="generate-status"></p>
-
-      <div id="review-banner" hidden>
-        <strong>Custom design — pending review.</strong>
-        <span id="review-banner-text"></span>
-        <p class="review-banner-action">
-          <a id="review-banner-link" href="/review.html" target="_blank" rel="noopener">
-            Open the founder review queue to approve it →
-          </a>
-          <span class="review-banner-hint">(once approved, the downloads unlock here and on the review page.)</span>
+  <main id="top">
+    <!-- ============================ HERO ============================ -->
+    <section class="hero">
+      <div class="hero-copy">
+        <span class="eyebrow">Custom parts, forged on demand</span>
+        <h1 class="hero-title">Describe&nbsp;it.<br /><span class="molten-text">Hold&nbsp;it.</span></h1>
+        <p class="hero-sub">
+          Snap a photo of where the part goes and write one sentence. Vulcan
+          designs a custom part, checks it for printability, shows you a render,
+          and ships it to your door.
         </p>
-      </div>
-
-      <div id="design-result" hidden>
-        <div id="design-views">
-          <figure id="composite-figure" class="design-view" hidden>
-            <div class="view-toggle">
-              <button type="button" id="composite-toggle-with" class="seg active">With part</button>
-              <button type="button" id="composite-toggle-without" class="seg">Photo only</button>
-            </div>
-            <div class="design-view-box">
-              <img id="design-composite-img" alt="Your part shown to scale in your photo" />
-            </div>
-            <figcaption>
-              <strong>In your photo</strong> — a to-scale ghost of the part where it
-              goes. Placement and size are approximate; orientation is a canonical
-              pose, not measured from your photo.
-            </figcaption>
-          </figure>
-          <figure id="preview-figure" class="design-view">
-            <div class="view-toggle">
-              <button type="button" id="part-toggle-3d" class="seg active">3D</button>
-              <button type="button" id="part-toggle-dims" class="seg">Dimensions</button>
-              <button type="button" id="part-expand" class="expand-btn" title="Expand">⛶ Expand</button>
-            </div>
-            <div class="design-view-box">
-              <div id="viewer3d-part" class="viewer3d"></div>
-              <img id="design-preview-img" alt="Annotated preview of your part" hidden />
-            </div>
-            <figcaption><strong>The part</strong> — drag to orbit, scroll to zoom, right-drag to pan.</figcaption>
-          </figure>
+        <div class="hero-cta">
+          <a class="btn btn-fire btn-lg" href="#studio">Forge my part →</a>
+          <a class="btn btn-ghost btn-lg" href="#how">See how it works</a>
         </div>
-        <table id="design-params-table"></table>
-        <ul id="design-downloads"></ul>
+        <ul class="hero-trust">
+          <li>Deterministic CAD</li>
+          <li>Human-checked before it ships</li>
+          <li>PETG-strong prints</li>
+        </ul>
+      </div>
+      <div class="hero-art">
+        <img class="hero-logo" src="/assets/logo.png" alt="Vulcan — a letter V forged from fire" />
+      </div>
+    </section>
+
+    <!-- ========================= HOW IT WORKS ========================= -->
+    <section id="how" class="section reveal">
+      <div class="section-head">
+        <span class="section-kicker">The process</span>
+        <h2 class="section-title">From photo to part in five steps</h2>
+        <p class="section-sub">No CAD skills, no calipers-and-guesswork. Just show us the spot and confirm a few measurements.</p>
+      </div>
+      <ol class="how-steps">
+        <li class="how-step"><span class="step-ico">📸</span><h3>Snap</h3><p>Photograph where the part needs to go — the bracket wall, the broken knob, the gap.</p></li>
+        <li class="how-step"><span class="step-ico">✎</span><h3>Trace</h3><p>Circle or trace the area right on the photo so we know exactly what you mean.</p></li>
+        <li class="how-step"><span class="step-ico">📏</span><h3>Measure</h3><p>Answer a couple of measurement questions. Fit-critical dims are always confirmed by you.</p></li>
+        <li class="how-step"><span class="step-ico">🧊</span><h3>Preview</h3><p>Spin the real 3D model, see it ghosted to scale in your own photo, approve the render.</p></li>
+        <li class="how-step"><span class="step-ico">🔥</span><h3>Forge</h3><p>We print it on demand and ship it. STEP / 3MF / STL are yours too.</p></li>
+      </ol>
+    </section>
+
+    <!-- ============================ STUDIO ============================ -->
+    <section id="studio" class="section studio reveal">
+      <div class="studio-head">
+        <div class="section-head" style="margin-bottom: 0">
+          <span class="section-kicker">The forge</span>
+          <h2 class="section-title">Make your part</h2>
+        </div>
+        <nav class="tabs" aria-label="Design mode">
+          <button class="tab-btn active" data-tab="photo" type="button">Start with a photo</button>
+          <button class="tab-btn" data-tab="direct" type="button">Template studio</button>
+        </nav>
       </div>
 
-      <details id="intent-json-details">
-        <summary>Raw IntentSpec (debug)</summary>
-        <pre id="intent-json"></pre>
-      </details>
+      <!-- ---------------- Photo-first flow ---------------- -->
+      <div id="tab-photo" class="tab-panel active">
+        <section class="panel">
+          <h2>1 · Photo + description</h2>
+          <label>
+            Photo(s) — up to 3
+            <input type="file" id="photo-input" accept="image/*" multiple />
+          </label>
+          <p class="hint">
+            Only the first photo is annotatable in this build. Drag on it to circle
+            or trace the area you need a part for (optional but recommended).
+          </p>
+          <div id="annotate-wrap" hidden>
+            <img id="annotate-img" alt="First uploaded photo" />
+            <canvas id="annotate-canvas"></canvas>
+          </div>
+          <button id="clear-annotation-btn" type="button" hidden>Clear annotation</button>
+          <label>
+            What do you need?
+            <textarea id="intent-text" rows="3" placeholder="e.g. a bracket to hold a shelf under my desk"></textarea>
+          </label>
+          <button id="submit-intent-btn" type="button">Analyze my photo</button>
+          <p id="intent-status"></p>
+        </section>
+
+        <section class="panel" id="freeform-panel" hidden>
+          <h2>Custom design</h2>
+          <p class="freeform-note">
+            No standard template fits this one — but Vulcan can design a
+            <strong>custom part</strong> for it. Heads up: custom designs are
+            machine-generated and <strong>need a human check before they ship</strong>.
+            We'll design it now, then you'll confirm the key measurements.
+          </p>
+          <button id="freeform-btn" type="button">Design it for me</button>
+          <p id="freeform-status"></p>
+        </section>
+
+        <section class="panel" id="questions-panel" hidden>
+          <h2>2 · Confirm the measurements</h2>
+          <p id="intent-description" class="template-description"></p>
+
+          <div id="freeform-override" hidden>
+            <p id="freeform-recommend-note" class="freeform-recommend" hidden></p>
+            <button id="freeform-override-btn" type="button" class="override-btn">
+              Design this custom instead
+            </button>
+            <p id="freeform-override-status"></p>
+          </div>
+
+          <div id="overlay-wrap">
+            <img id="overlay-img" alt="Uploaded photo with dimension overlays" />
+            <!-- viewBox is set to the rendered image pixel size at draw time so the
+                 dimension lines, ellipses and label chips render 1:1 and undistorted. -->
+            <svg id="overlay-svg" preserveAspectRatio="none"></svg>
+          </div>
+          <div id="questions-list"></div>
+          <button id="submit-answers-btn" type="button">Submit answers</button>
+          <p id="answers-status"></p>
+        </section>
+
+        <section class="panel" id="result-panel" hidden>
+          <h2>3 · Your part</h2>
+          <p id="result-status-line"></p>
+          <button id="generate-part-btn" disabled>Forge my part</button>
+          <p id="generate-status"></p>
+
+          <div id="review-banner" hidden>
+            <strong>Custom design — pending review.</strong>
+            <span id="review-banner-text"></span>
+            <p class="review-banner-action">
+              <a id="review-banner-link" href="/review.html" target="_blank" rel="noopener">
+                Open the founder review queue to approve it →
+              </a>
+              <span class="review-banner-hint">(once approved, the downloads unlock here and on the review page.)</span>
+            </p>
+          </div>
+
+          <div id="design-result" hidden>
+            <div id="design-views">
+              <figure id="composite-figure" class="design-view" hidden>
+                <div class="view-toggle">
+                  <button type="button" id="composite-toggle-with" class="seg active">With part</button>
+                  <button type="button" id="composite-toggle-without" class="seg">Photo only</button>
+                </div>
+                <div class="design-view-box">
+                  <img id="design-composite-img" alt="Your part shown to scale in your photo" />
+                </div>
+                <figcaption>
+                  <strong>In your photo</strong> — a to-scale ghost of the part where it
+                  goes. Placement and size are approximate; orientation is a canonical
+                  pose, not measured from your photo.
+                </figcaption>
+              </figure>
+              <figure id="preview-figure" class="design-view">
+                <div class="view-toggle">
+                  <button type="button" id="part-toggle-3d" class="seg active">3D</button>
+                  <button type="button" id="part-toggle-dims" class="seg">Dimensions</button>
+                  <button type="button" id="part-expand" class="expand-btn" title="Expand">⛶ Expand</button>
+                </div>
+                <div class="design-view-box">
+                  <div id="viewer3d-part" class="viewer3d"></div>
+                  <img id="design-preview-img" alt="Annotated preview of your part" hidden />
+                </div>
+                <figcaption><strong>The part</strong> — drag to orbit, scroll to zoom, right-drag to pan.</figcaption>
+              </figure>
+            </div>
+            <table id="design-params-table"></table>
+            <ul id="design-downloads"></ul>
+          </div>
+
+          <details id="intent-json-details">
+            <summary>Raw IntentSpec (debug)</summary>
+            <pre id="intent-json"></pre>
+          </details>
+        </section>
+      </div>
+
+      <!-- ---------------- Template studio (direct params) ---------------- -->
+      <div id="tab-direct" class="tab-panel">
+        <div class="studio-2col">
+          <section class="panel">
+            <h2>Template</h2>
+            <label>
+              Part template
+              <select id="template-select"></select>
+            </label>
+            <p id="template-description" class="template-description"></p>
+
+            <h2 style="margin-top: 22px">Parameters</h2>
+            <form id="design-form">
+              <div id="param-fields"></div>
+              <button type="submit">Generate</button>
+            </form>
+            <p id="status"></p>
+          </section>
+
+          <section class="panel">
+            <h2>Preview</h2>
+            <div id="preview-box">
+              <img id="preview-img" alt="Part preview will appear here after you generate a design." />
+            </div>
+            <ul id="downloads"></ul>
+          </section>
+        </div>
+      </div>
     </section>
   </main>
 
-  <main id="tab-direct" class="tab-panel">
-    <section class="panel">
-      <h2>Template</h2>
-      <label>
-        Part template
-        <select id="template-select"></select>
-      </label>
-      <p id="template-description" class="template-description"></p>
-
-      <h2>Parameters</h2>
-      <form id="design-form">
-        <div id="param-fields"></div>
-        <button type="submit">Generate</button>
-      </form>
-      <p id="status"></p>
-    </section>
-
-    <section class="panel">
-      <h2>Preview</h2>
-      <div id="preview-box">
-        <img id="preview-img" alt="Part preview will appear here after you generate a design." />
+  <footer class="site-foot">
+    <div class="foot-inner">
+      <div class="foot-brand">
+        <img src="/assets/logo.png" alt="" />
+        <span class="nav-word">VULCAN</span>
       </div>
-      <ul id="downloads"></ul>
-    </section>
-  </main>
+      <span class="foot-tag">Describe it. Hold it. — custom parts, forged on demand.</span>
+      <nav class="foot-links">
+        <a href="#how">How it works</a>
+        <a href="#studio">Create</a>
+        <a href="/review.html">Founder review</a>
+      </nav>
+    </div>
+  </footer>
 
   <div id="viewer-modal" hidden>
     <div class="viewer-modal-bar">
@@ -171,8 +269,11 @@
   <script src="/vendor/STLLoader.js"></script>
   <script src="/vendor/OrbitControls.js"></script>
   <script src="/viewer3d.js"></script>
+  <script src="/config.js"></script>
+  <script src="/api.js"></script>
   <script src="/app.js"></script>
   <script src="/units.js"></script>
   <script src="/intents.js"></script>
+  <script src="/site.js"></script>
 </body>
 </html>

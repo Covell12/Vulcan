@@ -176,7 +176,7 @@ submitIntentBtn.addEventListener("click", async () => {
   }
 
   try {
-    const response = await fetch("/intents", { method: "POST", body: formData });
+    const response = await VulcanAPI.createIntent(formData);
     if (!response.ok) throw new Error(await describeFetchError(response));
     currentIntent = await response.json();
     if (currentIntent.freeform_available && !currentIntent.template_id) {
@@ -636,11 +636,7 @@ async function submitAnswers(answers) {
   submitAnswersBtn.disabled = true;
   setAnswersStatus("Submitting…", false);
   try {
-    const response = await fetch(`/intents/${currentIntent.intent_id}/answers`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ answers }),
-    });
+    const response = await VulcanAPI.submitAnswers(currentIntent.intent_id, { answers });
     if (!response.ok) throw new Error(await describeFetchError(response));
     currentIntent = await response.json();
     renderQuestions();
@@ -747,7 +743,7 @@ async function runFreeform(statusEl, btn) {
   btn.disabled = true;
   setStatusText(statusEl, "Designing your custom part… this can take a moment (generating code, building, and safety-checking it).", false);
   try {
-    const response = await fetch(`/intents/${currentIntent.intent_id}/freeform`, { method: "POST" });
+    const response = await VulcanAPI.freeform(currentIntent.intent_id);
     if (!response.ok) throw new Error(await describeFetchError(response));
     currentIntent = await response.json();
     if (currentIntent.template_id) {
@@ -856,12 +852,14 @@ function renderDesign(design) {
   // API produced both the composite and the plain photo. Cache-buster avoids a
   // stale image after a re-generate.
   const t = Date.now();
+  // Files come back as API paths; VulcanAPI.asset() resolves them against the
+  // configured API origin (a no-op when the site is served same-origin).
   const compositeUrl = design.files.composite;
   const photoUrl = design.files.photo;
   if (compositeUrl) {
     compositeSources = {
-      with: `${compositeUrl}?t=${t}`,
-      without: photoUrl ? `${photoUrl}?t=${t}` : null,
+      with: `${VulcanAPI.asset(compositeUrl)}?t=${t}`,
+      without: photoUrl ? `${VulcanAPI.asset(photoUrl)}?t=${t}` : null,
     };
     setCompositeView("with");
     compositeFigure.hidden = false;
@@ -873,8 +871,8 @@ function renderDesign(design) {
   }
 
   // "The part": interactive 3D model (orbit/zoom/pan) + a dimensioned image.
-  designPreviewImg.src = `${design.files.preview_png}?t=${t}`;
-  currentStlUrl = design.files.stl;
+  designPreviewImg.src = `${VulcanAPI.asset(design.files.preview_png)}?t=${t}`;
+  currentStlUrl = VulcanAPI.asset(design.files.stl);
   showPartView("3d");
 
   // Param summary table (value + source), built with DOM nodes.
@@ -910,7 +908,7 @@ function renderDesign(design) {
       li.className = "download-locked";
     } else {
       const a = document.createElement("a");
-      a.href = design.files[key];
+      a.href = VulcanAPI.asset(design.files[key]);
       a.download = "";
       a.textContent = `Download ${label}`;
       li.appendChild(a);
@@ -922,9 +920,9 @@ function renderDesign(design) {
 generatePartBtn.addEventListener("click", async () => {
   if (!currentIntent) return;
   generatePartBtn.disabled = true;
-  setGenerateStatus("Generating your part…", false);
+  setGenerateStatus("Forging your part…", false);
   try {
-    const response = await fetch(`/intents/${currentIntent.intent_id}/design`, { method: "POST" });
+    const response = await VulcanAPI.joinDesign(currentIntent.intent_id);
     if (!response.ok) throw new Error(await describeFetchError(response));
     const design = await response.json();
     renderDesign(design);

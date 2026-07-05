@@ -4,17 +4,44 @@
   <meta charset="utf-8" />
   <title>Vulcan — Founder review</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#08070b" />
+  <!-- Point at a separately-hosted API here if needed:
+       <meta name="vulcan-api-base" content="https://api.vulcan.example" /> -->
+  <link rel="icon" href="/assets/favicon.ico" sizes="any" />
+  <link rel="icon" type="image/png" href="/assets/favicon-32.png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <header>
-    <h1>Vulcan — Founder review</h1>
-    <p class="tagline">
-      Every custom (freeform) design lands here. Downloads stay locked until you approve.
-    </p>
+  <div class="bg-embers" aria-hidden="true">
+    <span class="ember"></span><span class="ember"></span><span class="ember"></span>
+    <span class="ember"></span><span class="ember"></span><span class="ember"></span>
+    <span class="ember"></span><span class="ember"></span><span class="ember"></span>
+    <span class="ember"></span><span class="ember"></span><span class="ember"></span>
+  </div>
+
+  <header class="site-nav">
+    <a class="nav-brand" href="/">
+      <img class="nav-logo" src="/assets/logo.png" alt="" />
+      <span class="nav-word">VULCAN</span>
+    </a>
+    <nav class="nav-links">
+      <a href="/">Home</a>
+      <a href="/#studio">Create</a>
+    </nav>
+    <div class="nav-right">
+      <a class="btn btn-ghost btn-sm" href="/">← Back to site</a>
+    </div>
   </header>
 
   <main class="review-main">
+    <header style="margin-bottom: 20px">
+      <h1 class="section-title" style="font-size: clamp(26px, 4vw, 40px)">Founder review</h1>
+      <p class="tagline">
+        Every custom (freeform) design lands here. Downloads stay locked until you approve.
+      </p>
+    </header>
+
     <div class="review-toolbar">
       <label>
         Show
@@ -46,6 +73,8 @@
   <script src="/vendor/STLLoader.js"></script>
   <script src="/vendor/OrbitControls.js"></script>
   <script src="/viewer3d.js"></script>
+  <script src="/config.js"></script>
+  <script src="/api.js"></script>
   <script src="/review.js"></script>
 </body>
 </html>
