@@ -39,24 +39,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # `with TestClient(app) as c`), never a plain `TestClient(app)` — so it never
     # gets in the way of tests that mock the providers and don't need real keys.
 
-    # Say which vision provider is actually in effect, and shout if a shell env
-    # var is silently shadowing a different VISION_PROVIDER in .env (load_dotenv
-    # does NOT override an OS env var — the classic "I set .env but it's ignored"
-    # trap). This runs BEFORE the credential check on purpose: if the shell forces
-    # a provider whose key is missing, the check below raises naming that provider,
-    # so the founder needs this explanation first.
-    _log.info("Vision provider: %s", vision_provider.get_provider_name())
-    shadow = vision_provider.env_shadowing("VISION_PROVIDER")
-    if shadow:
-        os_val, file_val = shadow
-        _log.warning(
-            "VISION_PROVIDER=%r from your shell environment is OVERRIDING "
-            "VISION_PROVIDER=%r in .env — a shell variable beats .env, so your "
-            ".env edit has no effect. Run `unset VISION_PROVIDER` (and remove any "
-            "`export VISION_PROVIDER=...` from your shell profile) to use .env.",
-            os_val,
-            file_val,
-        )
+    # Say which vision provider is actually in effect. The providers load .env
+    # with override=True, so the .env value wins over any shell/OS variable — a
+    # stale `export VISION_PROVIDER=...` can no longer silently shadow it.
+    _log.info("Vision provider: %s (from .env)", vision_provider.get_provider_name())
 
     # Fails fast, with a clear message, if a selected provider's credentials
     # aren't configured — better than a confusing error the first time someone

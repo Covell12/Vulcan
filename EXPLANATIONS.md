@@ -71,11 +71,12 @@ non-expert can follow: what it does, why it exists, what talks to it).
   call the API — the allowlist is `VULCAN_CORS_ORIGINS` (comma-separated, default `*`), with
   `allow_credentials=False` because the founder token is a request header, not a cookie
   (that's what makes a `*` allowlist safe). CORS does not weaken the `/exports` download gate.
-  The lifespan hook now also LOGS the effective vision provider and, using
-  `vision_provider.env_shadowing`, WARNS (before the credential check, so the reason shows even
-  when the check then fails) when a shell `VISION_PROVIDER` is shadowing a different value in
-  `.env` — the classic "I set .env=openai but it still uses anthropic" trap (`load_dotenv` never
-  overrides an OS env var). Logs go to the `uvicorn.error` logger so they appear in the console.
+  The lifespan hook also LOGS the effective vision provider (to `uvicorn.error`, so it shows in
+  the console). **The recurring "I set .env=openai but it still uses anthropic" trap is now fixed
+  at the source:** the provider modules load `.env` with `override=True` (see
+  `api/vision_provider.py`), so `.env` is AUTHORITATIVE — its value wins over a stale/exported
+  shell variable. (`env_shadowing` remains as a tested diagnostic but is no longer needed at
+  startup.)
 - **api/photo.py** (M4) — The tiny `PhotoInput` container (bytes + mime type) shared by
   both provider seams. Lives in its own neutral module so `api/vision_provider.py` and
   `api/depth_provider.py` can both accept the same type without importing each other;
@@ -180,12 +181,15 @@ non-expert can follow: what it does, why it exists, what talks to it).
   human-readable cause (auth / quota / rate-limit / model-not-found / bad-image /
   network — mapped from the exception's `status_code` + message by `_humanize_provider_error`
   without importing any SDK's error classes). That guarantees `api/intents.py` can always
-  turn a provider failure into a clean 502, never a bare 500. **env_shadowing():** a small
-  diagnostic — compares the effective `VISION_PROVIDER` (post-`load_dotenv`) against the value
-  written in `.env` and, when they differ, returns `(os_value, dotenv_value)` (else None). Since
-  `load_dotenv` never overrides an OS env var, a `export VISION_PROVIDER=…` in the shell silently
-  wins over `.env`; `api/main.py`'s startup hook uses this to warn the founder. Covered by
-  `tests/test_vision_provider.py` (shell-shadows-.env, agree, no-shell-var, key-absent, case/
+  turn a provider failure into a clean 502, never a bare 500. **`.env` is authoritative:** this
+  module (and depth/codegen) call `load_dotenv(override=True)`, so the value in `.env` wins over
+  a stale/exported shell `VISION_PROVIDER` — the fix for the recurring "my .env says openai but
+  it keeps using anthropic" trap. It's safe: tests set env vars via monkeypatch AFTER import (so
+  they still win), `.env` doesn't set `DEPTH_PROVIDER`/`CODEGEN_PROVIDER` (so the test CLI
+  overrides stand), and a deployment with no `.env` is a no-op (OS env wins). **env_shadowing():**
+  a now-diagnostic-only helper — compares the effective `VISION_PROVIDER` against the `.env` value
+  and returns `(os_value, dotenv_value)` when they differ (else None). Covered by
+  `tests/test_vision_provider.py` (override-wins, shell-shadows-.env, agree, no-shell-var, key-absent, case/
   whitespace).
 - **api/depth_provider.py** (M4) — The depth analogue of `api/vision_provider.py`, and
   the one file allowed to import `replicate` (enforced by

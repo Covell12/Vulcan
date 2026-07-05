@@ -33,7 +33,10 @@ from dotenv import load_dotenv
 
 from api.photo import PhotoInput
 
-load_dotenv()
+# override=True: .env is authoritative over shell/OS env — see the note in
+# api/vision_provider.py. Safe for tests (monkeypatch runs post-import) and
+# deployments (no .env -> no-op).
+load_dotenv(override=True)
 
 _DEFAULT_MODELS = {
     "openai": "gpt-5",

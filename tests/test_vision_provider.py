@@ -449,3 +449,15 @@ def test_env_shadowing_ignores_case_and_whitespace(tmp_path, monkeypatch):
     env = _write_env(tmp_path, "VISION_PROVIDER=OpenAI\n")
     monkeypatch.setenv("VISION_PROVIDER", "  openai  ")
     assert env_shadowing("VISION_PROVIDER", env) is None
+
+
+def test_dotenv_override_makes_env_win_over_shell(tmp_path, monkeypatch):
+    """The fix that stops a stale shell var from shadowing .env: loading .env with
+    override=True (as api/vision_provider.py now does) makes the FILE value win
+    over an already-set OS/shell variable."""
+    from dotenv import load_dotenv
+
+    env = _write_env(tmp_path, "VISION_PROVIDER=openai\n")
+    monkeypatch.setenv("VISION_PROVIDER", "anthropic")  # a stale shell export
+    load_dotenv(env, override=True)
+    assert get_provider_name() == "openai"  # .env won, shell ignored

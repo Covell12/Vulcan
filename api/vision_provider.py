@@ -28,10 +28,15 @@ from dotenv import dotenv_values, load_dotenv
 
 from api.photo import PhotoInput  # re-exported; shared with api/depth_provider.py
 
-load_dotenv()
+# `override=True` makes .env the AUTHORITATIVE source: what you put in .env wins
+# over a stale/exported shell variable (the classic "I set .env=openai but it
+# still uses anthropic" trap — a shell `VISION_PROVIDER` otherwise silently
+# shadows the file, because plain load_dotenv() never overrides an existing OS
+# var). Safe for tests (they set env vars via monkeypatch AFTER this import) and
+# for deployments (no .env file → this is a no-op and the OS environment wins).
+load_dotenv(override=True)
 
-# The .env this repo ships with. Used to detect a shell env var silently
-# shadowing a different value in .env (see env_shadowing()).
+# The .env this repo ships with (still used by env_shadowing()).
 _DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 _SCHEMA_PATH = (
