@@ -1,0 +1,21 @@
+# Optional heavy dependencies for DEPTH_PROVIDER=local — Apple's open-source
+# Depth Pro (metric monocular depth + focal length) running IN-PROCESS.
+#
+# Kept OUT of the base requirements so a normal install / CI stays light (torch is
+# ~hundreds of MB and the model weights ~1.9 GB). Install only on the machine that
+# will run local depth:
+#
+#     pip install -r requirements-local.txt
+#
+# Then set DEPTH_PROVIDER=local in .env. Weights auto-download from Hugging Face
+# (apple/DepthPro) on first use, cached under ~/.cache/huggingface — see
+# api/depth_provider._run_local_model. Smoke test: python scripts/depth_smoke.py <photo>.
+# depth_pro pins `numpy<2` in its metadata, but it uses no numpy-2-removed APIs and
+# runs fine under numpy 2 — which the rest of Vulcan's stack (scipy/cadquery) needs.
+# Keep numpy 2 explicitly; the pip resolver prints a harmless conflict note for the
+# stale depth_pro pin.
+numpy>=2,<3
+torch>=2.2
+torchvision>=0.17
+huggingface_hub>=0.24
+depth_pro @ git+https://github.com/apple/ml-depth-pro.git

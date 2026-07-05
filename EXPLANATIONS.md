@@ -204,21 +204,31 @@ non-expert can follow: what it does, why it exists, what talks to it).
   and returns `(os_value, dotenv_value)` when they differ (else None). Covered by
   `tests/test_vision_provider.py` (override-wins, shell-shadows-.env, agree, no-shell-var, key-absent, case/
   whitespace).
-- **api/depth_provider.py** (M4) — The depth analogue of `api/vision_provider.py`, and
-  the one file allowed to import `replicate` (enforced by
-  `tests/test_depth_provider.py::test_only_depth_provider_imports_replicate`). Exposes one
+- **api/depth_provider.py** (M4; M10c local) — The depth analogue of `api/vision_provider.py`,
+  and the one file allowed to import a depth backend — `replicate`, or (M10c) `torch`/
+  `depth_pro` for local — enforced by
+  `tests/test_depth_provider.py::test_only_depth_provider_imports_depth_backends`. Exposes one
   function, `estimate_scale(photo, regions) -> list[ScaleEstimate]`, that turns
   overlay regions (an arrow/line on the photo) into real-world sizes in mm. Backend is
   chosen by `DEPTH_PROVIDER`: `none` (default) returns nothing — the whole product works
-  fully without depth — and `replicate` runs a metric monocular-depth model. The metric
-  geometry (`_region_size_mm`: pinhole back-projection of the two endpoints using the
-  depth map + focal length) is a pure, unit-tested function, so it's correct independent
-  of which model supplies the depth. **Key limitation, documented in the module:** no
-  public Replicate wrapper currently returns raw metric depth — the popular Depth Pro
-  wrapper discards the meters + focal length and returns only a colorized visualization —
-  so this module defines the output *contract* it needs (per-pixel metric depth + focal
-  length) and raises a clear `DepthProviderError` rather than inventing numbers if a model
-  returns a plain visualization image. Every SDK/network/decode failure is wrapped as
+  fully without depth. **M10c — `local`:** Apple's open-source Depth Pro running IN-PROCESS
+  (`_run_local_model` → `_load_local_model`): torch + depth_pro are imported ONLY here and
+  ONLY lazily (so the base install stays light and the seam holds), the model loads once and
+  is cached for the process, its ~1.9 GB weights auto-download from Hugging Face
+  (`apple/DepthPro`) on first use with one clear log line, and it estimates the focal length
+  itself. Device is auto-picked (Apple-Silicon MPS > CUDA > CPU, override `DEPTH_LOCAL_DEVICE`).
+  `local` and `replicate` satisfy the SAME contract — `_run_depth_model` dispatches to either
+  and returns `(depth_map_meters, fx, fy)` — so `estimate_scale`, `depth_mm_at`, and
+  `depth_map_mm` all work identically for both. The metric geometry (`_region_size_mm`:
+  pinhole back-projection of the two endpoints using the depth map + focal length) is a pure,
+  unit-tested function, so it's correct independent of which model supplies the depth.
+  **Replicate caveat, documented in the module:** no public Replicate wrapper currently returns
+  raw metric depth — the popular Depth Pro wrapper discards the meters + focal length and
+  returns only a colorized visualization — so the replicate path defines the output *contract*
+  it needs (per-pixel metric depth + focal length) and raises a clear `DepthProviderError`
+  rather than inventing numbers if a model returns a plain visualization image; `local`
+  sidesteps this by reading Depth Pro's raw metric output directly. Every SDK/network/decode
+  failure is wrapped as
   `DepthProviderError`. **M5.5:** adds `depth_mm_at(photo, x, y)`, a best-effort metric
   depth (mm) at a single normalized image point, used by the ghost composite to place the
   part at the true distance of the circled surface. Unlike the rest of the module it NEVER
@@ -227,7 +237,20 @@ non-expert can follow: what it does, why it exists, what talks to it).
   **M10b:** adds `depth_map_mm(photo)`, the best-effort FULL-scene depth map (HxW, mm) the
   composite z-tests the part against for occlusion; invalid/background pixels come back as
   `+inf` (never occlude), and like `depth_mm_at` it returns `None` (never raises) when depth
-  is unavailable — so occlusion degrades gracefully to drawing the part in front.
+  is unavailable — so occlusion degrades gracefully to drawing the part in front. **M10c:**
+  `check_provider_configured` fails fast for `local` too — it requires torch + depth_pro to be
+  importable (`_local_available`), so a misconfigured server says so at startup instead of at
+  first depth call.
+- **requirements-local.txt** (M10c) — The OPTIONAL heavy deps for `DEPTH_PROVIDER=local`
+  (torch, torchvision, huggingface_hub, and Apple's `depth_pro` from git), kept OUT of the base
+  requirements so a normal install/CI stays light. Pins `numpy>=2` to override depth_pro's stale
+  `numpy<2` metadata (it runs fine on numpy 2, which the rest of the stack needs). Install with
+  `pip install -r requirements-local.txt`, then set `DEPTH_PROVIDER=local`.
+- **scripts/depth_smoke.py** (M10c) — A one-photo smoke test for the local provider:
+  `DEPTH_PROVIDER=local python scripts/depth_smoke.py <photo>` runs Depth Pro through the
+  api.depth_provider seam (it never touches torch/depth_pro directly) and prints the
+  center-pixel depth + scene range. First run downloads the weights; a clear non-zero exit if
+  the local stack isn't installed.
 - **api/intents.py** (M3) — `POST /intents` and `POST /intents/{id}/answers`: the
   photo(s)+annotation+text → IntentSpec → answered-dimensions pipeline. Builds a
   `template_catalog` from the live template registry (id, category, critical_dims,
@@ -996,9 +1019,14 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   return `None`; confidence stays modest and capped), the Replicate decode path with
   `replicate` mocked (a visualization PNG is rejected, a metric `.npz` + focal length
   decodes to the right size, an API error is wrapped), and the grep test that only
-  `depth_provider.py` imports `replicate`. **M10b:** `depth_map_mm` returns `None` without a
+  `depth_provider.py` imports a depth backend. **M10b:** `depth_map_mm` returns `None` without a
   provider, converts a mocked meters map to mm marking invalid pixels `+inf`, and swallows a
-  model failure to `None` (occlusion never breaks the join).
+  model failure to `None` (occlusion never breaks the join). **M10c (local):** provider
+  selection; `_local_available` detects a missing package; the fail-fast check fires when the
+  local stack is absent and passes when present; and — with the model runner MOCKED (no torch,
+  no weights) — `estimate_scale`/`depth_map_mm`/`depth_mm_at` all route through the same metric
+  geometry for `local`. The isolation grep now also forbids `torch`/`torchvision`/`depth_pro`
+  imports outside the seam.
 - **tests/test_intents.py** (M3, extended M4 and M5) — Tests `api/intents.py` with
   `api.intents.parse_intent` (and, for M4, `api.intents.estimate_scale`) mocked — no
   network. Covers the create → answer → `ready_for_design` round-trip; the

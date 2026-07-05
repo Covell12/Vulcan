@@ -20,12 +20,14 @@ from api.depth_provider import (
     ScaleRegion,
     _decode_metric_depth,
     _focal_from_fov,
+    _local_available,
     _looks_like_plain_image,
     _region_confidence,
     _region_size_mm,
     _sample_depth,
     check_provider_configured,
     depth_map_mm,
+    depth_mm_at,
     estimate_scale,
     get_model_name,
     get_provider_name,
@@ -121,6 +123,76 @@ def test_check_unknown_provider_raises(monkeypatch):
     monkeypatch.setenv("DEPTH_PROVIDER", "bogus")
     with pytest.raises(DepthProviderError):
         check_provider_configured()
+
+
+# ---------------------------------------------------------------------------
+# The "local" path — Apple Depth Pro in-process (backend mocked; no torch needed
+# for these tests, no weights download)
+# ---------------------------------------------------------------------------
+
+
+def test_local_provider_selected(monkeypatch):
+    monkeypatch.setenv("DEPTH_PROVIDER", "  Local ")
+    assert get_provider_name() == "local"
+
+
+def test_local_available_detects_missing_package(monkeypatch):
+    import importlib.util as u
+
+    real = u.find_spec
+    monkeypatch.setattr(u, "find_spec", lambda n: None if n == "torch" else real(n))
+    ok, reason = _local_available()
+    assert ok is False and "torch" in reason
+
+
+def test_check_local_missing_package_raises(monkeypatch):
+    monkeypatch.setenv("DEPTH_PROVIDER", "local")
+    monkeypatch.setattr(
+        "api.depth_provider._local_available", lambda: (False, "install me")
+    )
+    with pytest.raises(DepthProviderError, match="install me"):
+        check_provider_configured()
+
+
+def test_check_local_ok_when_available(monkeypatch):
+    monkeypatch.setenv("DEPTH_PROVIDER", "local")
+    monkeypatch.setattr("api.depth_provider._local_available", lambda: (True, ""))
+    check_provider_configured()  # must not raise
+
+
+def test_local_estimate_routes_through_metric(monkeypatch):
+    """DEPTH_PROVIDER=local runs `estimate_scale` through the same metric geometry
+    as replicate — proven by mocking the model runner (no torch, no weights)."""
+    monkeypatch.setenv("DEPTH_PROVIDER", "local")
+    h, w = 480, 640
+    depth = np.full((h, w), 0.5)  # 0.5 m everywhere
+    with patch(
+        "api.depth_provider._run_depth_model", return_value=(depth, 800.0, 800.0)
+    ):
+        est = estimate_scale(
+            PhotoInput(b"jpeg"),
+            [ScaleRegion("span_mm", "arrow", [[0.2, 0.5], [0.8, 0.5]])],
+        )
+    assert len(est) == 1
+    expected = (0.8 - 0.2) * (w - 1) / 800.0 * 0.5 * 1000.0
+    assert est[0].value_mm == pytest.approx(expected, rel=1e-3)
+
+
+def test_local_depth_map_and_point_route(monkeypatch):
+    """local wires BOTH the occlusion map and the point-depth helpers."""
+    monkeypatch.setenv("DEPTH_PROVIDER", "local")
+    meters = np.full((10, 10), 2.0)  # 2 m everywhere…
+    meters[0, 5] = 0.0  # …with a couple of invalid pixels
+    meters[5, 0] = np.nan
+    with patch(
+        "api.depth_provider._run_depth_model", return_value=(meters, 800.0, 800.0)
+    ):
+        m = depth_map_mm(_photo())
+        pt = depth_mm_at(_photo(), 0.5, 0.5)  # center → 2 m
+    assert m is not None
+    assert m[2, 2] == 2000.0  # meters → mm
+    assert np.isinf(m[0, 5]) and np.isinf(m[5, 0])  # invalid → +inf
+    assert pt == pytest.approx(2000.0)
 
 
 # ---------------------------------------------------------------------------
@@ -314,16 +386,20 @@ def test_check_ignores_inline_comment_token(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Provider isolation: only api/depth_provider.py may import `replicate`.
+# Provider isolation: only api/depth_provider.py may import the depth backends
+# (replicate for the hosted path; torch/torchvision/depth_pro for local Depth
+# Pro). This keeps the seam intact and the base install light.
 # ---------------------------------------------------------------------------
 
 
-def test_only_depth_provider_imports_replicate():
+def test_only_depth_provider_imports_depth_backends():
     import pathlib
     import re
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
-    pattern = re.compile(r"^\s*(import replicate\b|from replicate\b)")
+    pattern = re.compile(
+        r"^\s*(import|from)\s+(replicate|torch|torchvision|depth_pro)\b"
+    )
     offenders = []
     for path in repo_root.rglob("*.py"):
         if ".venv" in path.parts:
@@ -335,6 +411,7 @@ def test_only_depth_provider_imports_replicate():
                 offenders.append(
                     f"{path.relative_to(repo_root)}:{lineno}: {line.strip()}"
                 )
-    assert (
-        not offenders
-    ), "only api/depth_provider.py may import replicate:\n" + "\n".join(offenders)
+    assert not offenders, (
+        "only api/depth_provider.py may import a depth backend "
+        "(replicate/torch/torchvision/depth_pro):\n" + "\n".join(offenders)
+    )

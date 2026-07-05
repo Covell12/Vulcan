@@ -11,28 +11,37 @@ Providers:
                  still require a user measurement, cross-check just reports
                  "unavailable". Depth is an optional convenience prior, never a
                  dependency.
-  - "replicate" — a metric monocular-depth model (Depth Pro-class) via
-                 REPLICATE_API_TOKEN.
+  - "local"     — Apple's open-source Depth Pro running IN-PROCESS (metric depth
+                 + estimated focal length, no network at inference). Needs the
+                 optional heavy deps in requirements-local.txt (torch + the
+                 depth_pro package); the model loads lazily on first use and its
+                 weights auto-download from Hugging Face (apple/DepthPro) once,
+                 cached under ~/.cache/huggingface.
+  - "replicate" — the same class of model via REPLICATE_API_TOKEN (a hosted cog
+                 that must return per-pixel metric depth + focal length).
 
-DESIGN NOTE / KNOWN LIMITATION (verified July 2026): to turn a photo into a
-real-world size in mm you need *metric* depth (meters per pixel) plus the
-camera focal length. As of this writing, no public Replicate wrapper returns
-that — the popular `garg-aayush/ml-depth-pro` computes metric depth + focal
-length internally but *discards* them, returning only a colorized
-visualization PNG (useless for absolute measurement). So this module defines
-the CONTRACT it needs (see `_run_depth_model`): the configured DEPTH_MODEL
-must return per-pixel metric depth and a focal length. Point DEPTH_MODEL at a
-cog that returns that shape (e.g. your own Depth Pro deployment emitting a
-`.npz`/16-bit `.tiff` depth file + `focallength_px`). If the model returns a
-plain visualization image instead, this module raises a clear
-DepthProviderError rather than inventing numbers — honesty over a fake prior.
-The metric geometry itself (`_region_size_mm`) is a pure function and is
-unit-tested against synthetic depth maps, so it's correct independent of which
-model supplies the depth.
+Both metric providers satisfy the SAME contract (`_run_depth_model` →
+(depth_map_meters, fx, fy)); the pure metric geometry downstream
+(`_region_size_mm`, occlusion) is identical regardless of which supplies the
+depth, and is unit-tested against synthetic depth maps.
+
+DESIGN NOTE (replicate caveat, verified July 2026): no public Replicate wrapper
+returns raw metric depth — the popular `garg-aayush/ml-depth-pro` computes metric
+depth + focal internally but *discards* them, returning only a colorized
+visualization PNG. So the replicate path requires a cog that returns the metric
+shape and raises a clear DepthProviderError on a plain visualization image rather
+than inventing numbers. `local` sidesteps this entirely by running Depth Pro
+here and reading its raw metric output directly — which is why it's the
+recommended way to actually turn photos into sizes/occlusion.
+
+ISOLATION: torch and depth_pro are imported ONLY inside this module and ONLY
+lazily (when local depth actually runs), so the base install stays light and the
+seam holds — enforced by the grep test in tests/test_depth_provider.py.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -41,6 +50,8 @@ from typing import Any
 from dotenv import load_dotenv
 
 from api.photo import PhotoInput
+
+logger = logging.getLogger("vulcan.depth")
 
 # override=True: .env is authoritative over shell/OS env — see the note in
 # api/vision_provider.py. Safe for tests (monkeypatch runs post-import) and
@@ -102,11 +113,20 @@ def get_model_name() -> str:
     return os.getenv("DEPTH_MODEL") or _DEFAULT_MODEL
 
 
+_SUPPORTED_PROVIDERS = ("none", "local", "replicate")
+
+
 def check_provider_configured(provider: str | None = None) -> None:
-    """Fail fast (at server startup) only when DEPTH_PROVIDER=replicate and its
-    token is missing. The default provider ("none") never needs anything."""
+    """Fail fast (at server startup) when the selected provider isn't ready: a
+    missing REPLICATE_API_TOKEN for 'replicate', or the un-installed local depth
+    stack for 'local'. The default provider ("none") never needs anything."""
     provider = provider or get_provider_name()
     if provider == "none":
+        return
+    if provider == "local":
+        ok, reason = _local_available()
+        if not ok:
+            raise DepthProviderError(reason)
         return
     if provider == "replicate":
         if not _env_value_set("REPLICATE_API_TOKEN"):
@@ -117,7 +137,7 @@ def check_provider_configured(provider: str | None = None) -> None:
             )
         return
     raise DepthProviderError(
-        f"Unknown DEPTH_PROVIDER '{provider}'. Supported: ['none', 'replicate']"
+        f"Unknown DEPTH_PROVIDER '{provider}'. Supported: {list(_SUPPORTED_PROVIDERS)}"
     )
 
 
@@ -132,12 +152,12 @@ def estimate_scale(
     provider = get_provider_name()
     if provider == "none":
         return []
-    if provider == "replicate":
+    if provider in ("local", "replicate"):
         if not regions:
             return []
-        return _estimate_replicate(photo, regions)
+        return _estimate_metric(photo, regions)
     raise DepthProviderError(
-        f"Unknown DEPTH_PROVIDER '{provider}'. Supported: ['none', 'replicate']"
+        f"Unknown DEPTH_PROVIDER '{provider}'. Supported: {list(_SUPPORTED_PROVIDERS)}"
     )
 
 
@@ -151,7 +171,7 @@ def depth_mm_at(photo: PhotoInput, x_norm: float, y_norm: float) -> float | None
     non-depth scale. Unlike the rest of this module it NEVER raises: depth here
     is a pure convenience, and a preview must not be able to break because a
     depth backend hiccuped."""
-    if get_provider_name() != "replicate":
+    if get_provider_name() not in ("local", "replicate"):
         return None
     try:
         depth_map, _fx, _fy = _run_depth_model(photo)
@@ -171,7 +191,7 @@ def depth_map_mm(photo: PhotoInput):
     (they never occlude). Returns None whenever a depth map is unavailable
     (DEPTH_PROVIDER=none or any model failure); like depth_mm_at it NEVER raises,
     because occlusion is a pure preview nicety that must never break the join."""
-    if get_provider_name() != "replicate":
+    if get_provider_name() not in ("local", "replicate"):
         return None
     try:
         import numpy as np
@@ -270,18 +290,29 @@ def _region_confidence(depth_map: Any, region: ScaleRegion) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Replicate adapter (the only place a depth SDK is imported)
+# Metric-depth dispatch (local OR replicate) + the two adapters. torch/depth_pro
+# and replicate are imported ONLY here, lazily.
 # ---------------------------------------------------------------------------
 
 
-def _estimate_replicate(
+def _run_depth_model(photo: PhotoInput):
+    """Dispatch to the configured metric-depth backend and return the SAME shape
+    for both: (depth_map, fx, fy) where depth_map is an HxW float array of METERS
+    and fx/fy are focal lengths in pixels. Raises DepthProviderError on failure."""
+    provider = get_provider_name()
+    if provider == "local":
+        return _run_local_model(photo)
+    return _run_replicate_model(photo)
+
+
+def _estimate_metric(
     photo: PhotoInput, regions: list[ScaleRegion]
 ) -> list[ScaleEstimate]:
     # Wrap the WHOLE path so the module's contract holds: only DepthProviderError
-    # may escape. This also catches an ImportError from a missing/broken
-    # `replicate`, `numpy`, `pillow`, or `httpx` install (their imports are
-    # deferred into the functions below), which would otherwise leak raw and
-    # break the graceful-degradation path in api/intents.py.
+    # may escape. This also catches an ImportError from a missing/broken backend
+    # dependency (`replicate`/`torch`/`depth_pro`/`numpy`/`pillow`/`httpx` — their
+    # imports are deferred into the functions below), which would otherwise leak
+    # raw and break the graceful-degradation path in api/intents.py.
     try:
         depth_map, fx, fy = _run_depth_model(photo)
         estimates: list[ScaleEstimate] = []
@@ -305,7 +336,103 @@ def _estimate_replicate(
         ) from e
 
 
-def _run_depth_model(photo: PhotoInput):
+# ---------------------------------------------------------------------------
+# Local adapter — Apple Depth Pro, IN-PROCESS. torch + depth_pro are imported
+# ONLY here and ONLY lazily, so the base install stays light and the seam holds.
+# ---------------------------------------------------------------------------
+
+# Loaded once per process and cached (weights are ~1.9 GB; re-loading per request
+# would be absurd). A tuple (model, transform, device) or None.
+_LOCAL_MODEL: Any = None
+
+
+def _local_available() -> tuple[bool, str]:
+    """Is the local Depth Pro stack importable? Returns (ok, reason). Uses
+    importlib so we don't actually import (and pay for) torch just to check."""
+    import importlib.util
+
+    for pkg in ("torch", "depth_pro"):
+        if importlib.util.find_spec(pkg) is None:
+            return False, (
+                f"DEPTH_PROVIDER is 'local' but the '{pkg}' package isn't installed. "
+                "Install the local depth stack with "
+                "`pip install -r requirements-local.txt`, or set DEPTH_PROVIDER=none."
+            )
+    return True, ""
+
+
+def _local_device(torch):
+    """Best available torch device, overridable with DEPTH_LOCAL_DEVICE
+    (auto|cpu|mps|cuda). Apple Silicon MPS > CUDA > CPU."""
+    want = os.getenv("DEPTH_LOCAL_DEVICE", "auto").strip().lower()
+    if want in ("cpu", "mps", "cuda"):
+        return torch.device(want)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _load_local_model():
+    """Lazily load Depth Pro once, caching it for the process. Auto-downloads the
+    weights from Hugging Face (apple/DepthPro) on first use if they're not already
+    on disk, with a clear log line so a first-run pause is explained."""
+    global _LOCAL_MODEL
+    if _LOCAL_MODEL is not None:
+        return _LOCAL_MODEL
+
+    import dataclasses
+
+    import depth_pro
+    import torch
+    from depth_pro.depth_pro import DEFAULT_MONODEPTH_CONFIG_DICT
+
+    device = _local_device(torch)
+    ckpt = getattr(DEFAULT_MONODEPTH_CONFIG_DICT, "checkpoint_uri", None)
+    if not (ckpt and os.path.exists(ckpt)):
+        from huggingface_hub import hf_hub_download
+
+        logger.info(
+            "Depth Pro (local): downloading weights apple/DepthPro (~1.9 GB) on "
+            "first use; cached under ~/.cache/huggingface…"
+        )
+        ckpt = hf_hub_download("apple/DepthPro", "depth_pro.pt")
+    config = dataclasses.replace(DEFAULT_MONODEPTH_CONFIG_DICT, checkpoint_uri=ckpt)
+    logger.info("Depth Pro (local): loading model on %s…", device)
+    model, transform = depth_pro.create_model_and_transforms(
+        config=config, device=device, precision=torch.float32
+    )
+    model.eval()
+    _LOCAL_MODEL = (model, transform, device)
+    return _LOCAL_MODEL
+
+
+def _run_local_model(photo: PhotoInput):
+    """Run Apple Depth Pro in-process on the photo → (depth_map_meters HxW, fx, fy).
+    Focal length is estimated by the model itself (the uncalibrated path)."""
+    import io
+
+    import numpy as np
+    import torch
+    from PIL import Image, ImageOps
+
+    model, transform, _device = _load_local_model()
+    img = Image.open(io.BytesIO(photo.content))
+    img = ImageOps.exif_transpose(img).convert("RGB")  # match the composite frame
+    # np.array (a writable copy, not np.asarray's read-only view) — torchvision's
+    # ToTensor warns on a non-writable array.
+    tensor = transform(np.array(img))
+    with torch.no_grad():
+        pred = model.infer(tensor, f_px=None)
+    depth = np.asarray(pred["depth"].detach().to("cpu"), dtype=float)  # meters, HxW
+    fpx = pred.get("focallength_px")
+    fx = float(fpx) if fpx is not None else _focal_from_fov(img.width)
+    return depth, fx, fx  # square pixels (fy == fx)
+
+
+def _run_replicate_model(photo: PhotoInput):
     """Call the configured Replicate model and return (depth_map, fx, fy) where
     depth_map is an HxW float array of METERS and fx/fy are focal lengths in
     pixels. Encapsulates ALL model-specific decoding.
