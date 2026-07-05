@@ -882,6 +882,32 @@ label.checkbox-field {
   filter: none;
   box-shadow: none;
 }
+/* Per-part downloads (multi-part assembly). */
+.download-part {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.download-part strong {
+  min-width: 90px;
+  color: var(--molten);
+  font-size: 13px;
+}
+.download-part a {
+  font-size: 13px;
+  padding: 2px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+}
+.review-part-name {
+  color: var(--molten);
+  font-weight: 700;
+  font-size: 12.5px;
+  margin-right: 4px;
+  flex-basis: 100%;
+}
 .review-fulfillment {
   font-size: 13.5px;
   color: var(--ink);

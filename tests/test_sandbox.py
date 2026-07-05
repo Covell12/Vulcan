@@ -24,9 +24,50 @@ def build(params):
 def test_valid_build_exports_all_three_formats(tmp_path: Path):
     r = run_generated_build(GOOD, {"w": 40, "d": 30, "h": 20}, tmp_path / "out")
     assert r.ok and r.stage == "ok", r.error
-    assert set(r.files) == {"step", "stl", "threemf"}
-    for p in r.files.values():
+    # A single-solid build is one part named "part" with step/stl/3mf.
+    assert len(r.parts) == 1 and r.parts[0]["name"] == "part"
+    for key in ("step", "stl", "threemf"):
+        p = r.parts[0][key]
         assert p.exists() and p.stat().st_size > 0
+
+
+def test_multi_part_build_exports_each_piece(tmp_path: Path):
+    """A dict return exports one STEP/STL/3MF set per named piece."""
+    code = (
+        "import cadquery as cq\n"
+        "def build(params):\n"
+        "    peg = cq.Workplane('XY').cylinder(20, 4)\n"
+        "    base = cq.Workplane('XY').box(20, 20, 6).translate((0, 0, -13))\n"
+        "    return {'peg': peg, 'base': base}\n"
+    )
+    r = run_generated_build(code, {}, tmp_path / "out")
+    assert r.ok and r.stage == "ok", r.error
+    assert [p["name"] for p in r.parts] == ["peg", "base"]
+    for part in r.parts:
+        for key in ("step", "stl", "threemf"):
+            assert part[key].exists() and part[key].stat().st_size > 0
+
+
+def test_multi_part_sanitizes_dangerous_names(tmp_path: Path):
+    """Part names become filenames, so a malicious/odd name must be neutralized —
+    no path traversal, no special characters, and files stay inside out_dir."""
+    import re
+
+    out_dir = tmp_path / "out"
+    code = (
+        "import cadquery as cq\n"
+        "def build(params):\n"
+        "    a = cq.Workplane('XY').box(5, 5, 5)\n"
+        "    b = cq.Workplane('XY').box(5, 5, 5).translate((10, 0, 0))\n"
+        "    return {'../../evil': a, 'weird name!.stl': b}\n"
+    )
+    r = run_generated_build(code, {}, out_dir)
+    assert r.ok, r.error
+    for part in r.parts:
+        assert re.match(r"^[a-zA-Z0-9_]+$", part["name"]), part["name"]
+        for key in ("step", "stl", "threemf"):
+            # Every exported file resolves INSIDE out_dir (no escape).
+            assert out_dir.resolve() == part[key].resolve().parent
 
 
 def test_os_import_rejected_at_verify_and_never_runs(tmp_path: Path):

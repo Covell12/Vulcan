@@ -850,7 +850,14 @@ def test_design_join_precedence_end_to_end(cleanup_intents: list[str]):
     assert r.status_code == 200, r.text
     body = r.json()
 
-    assert set(body["files"]) == {"step", "threemf", "stl", "preview_png", "view_stl"}
+    assert set(body["files"]) == {
+        "step",
+        "threemf",
+        "stl",
+        "preview_png",
+        "view_stl",
+        "parts",
+    }
     by_name = {p["name"]: p for p in body["params"]}
 
     assert (by_name["span_mm"]["value"], by_name["span_mm"]["source"]) == (
@@ -894,9 +901,16 @@ def test_design_downloads_are_fetchable(cleanup_intents: list[str]):
     iid = _join_intent(cleanup_intents)
     _confirm_all_critical(iid)
     body = client.post(f"/intents/{iid}/design").json()
-    for url in body["files"].values():
-        resp = client.get(url)
-        assert resp.status_code == 200, url
+    for key, value in body["files"].items():
+        if key == "parts":
+            for part in value:
+                for pk, purl in part.items():
+                    if pk in ("name", "color_index") or not purl:
+                        continue
+                    assert client.get(purl).status_code == 200, purl
+            continue
+        resp = client.get(value)
+        assert resp.status_code == 200, value
         assert len(resp.content) > 0
     # cleanup the exported files for this design
     shutil.rmtree(
@@ -1194,6 +1208,7 @@ def test_join_without_photo_has_no_composite(cleanup_intents: list[str]):
             "stl",
             "preview_png",
             "view_stl",
+            "parts",
         }
     finally:
         shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)

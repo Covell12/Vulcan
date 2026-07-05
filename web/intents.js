@@ -40,6 +40,7 @@ const viewer3dPart = document.getElementById("viewer3d-part");
 const partToggle3d = document.getElementById("part-toggle-3d");
 const partToggleDims = document.getElementById("part-toggle-dims");
 const partExpandBtn = document.getElementById("part-expand");
+const partReplayBtn = document.getElementById("part-replay");
 const compositeToggleWith = document.getElementById("composite-toggle-with");
 const compositeToggleWithout = document.getElementById("composite-toggle-without");
 const viewerModal = document.getElementById("viewer-modal");
@@ -49,6 +50,7 @@ const viewerModalClose = document.getElementById("viewer-modal-close");
 let partViewer = null; // the inline 3D viewer handle (disposed on re-render)
 let modalViewer = null; // the expanded 3D viewer handle
 let currentStlUrl = null; // STL url for the current design (for the 3D viewer)
+let currentParts = null; // [{url,colorIndex,name}] for a multi-part assembly, else null
 let compositeSources = { with: null, without: null }; // composite vs plain photo
 
 const freeformPanel = document.getElementById("freeform-panel");
@@ -1086,17 +1088,29 @@ function setCompositeView(which) {
   compositeToggleWithout.classList.toggle("active", which === "without");
 }
 
+// Mount the 3D view of the current design in `target`, returning the viewer
+// handle. A multi-part assembly gets each piece a distinct colour + an
+// explode→assemble animation; a single part is one mesh.
+function mountViewer(target) {
+  if (!window.Vulcan3D) return Promise.resolve(null);
+  const fallbackImg = designPreviewImg.src; // gated STL -> show the render
+  if (currentParts && currentParts.length > 1) {
+    return Vulcan3D.createAssembly(target, currentParts, { fallbackImg });
+  }
+  if (!currentStlUrl) return Promise.resolve(null);
+  return Vulcan3D.create(target, currentStlUrl, { fallbackImg });
+}
+
 function mountPartViewer() {
   if (partViewer) {
     partViewer.dispose();
     partViewer = null;
   }
-  if (!currentStlUrl || !window.Vulcan3D) return;
-  Vulcan3D.create(viewer3dPart, currentStlUrl, {
-    fallbackImg: designPreviewImg.src, // pending freeform STL is gated -> show the render
-  }).then((v) => {
+  mountViewer(viewer3dPart).then((v) => {
     partViewer = v;
   });
+  // A replay control only makes sense for an animated assembly.
+  if (partReplayBtn) partReplayBtn.hidden = !(currentParts && currentParts.length > 1);
 }
 
 function showPartView(which) {
@@ -1106,6 +1120,7 @@ function showPartView(which) {
   partToggle3d.classList.toggle("active", is3d);
   partToggleDims.classList.toggle("active", !is3d);
   partExpandBtn.hidden = !is3d;
+  if (partReplayBtn) partReplayBtn.hidden = !(is3d && currentParts && currentParts.length > 1);
   if (is3d) mountPartViewer();
   else if (partViewer) {
     partViewer.dispose();
@@ -1119,13 +1134,18 @@ partToggle3d.addEventListener("click", () => showPartView("3d"));
 partToggleDims.addEventListener("click", () => showPartView("dims"));
 
 partExpandBtn.addEventListener("click", () => {
-  if (!currentStlUrl) return;
+  if (!currentStlUrl && !currentParts) return;
   viewerModal.hidden = false;
   if (modalViewer) modalViewer.dispose();
-  Vulcan3D.create(viewerModalStage, currentStlUrl, { fallbackImg: designPreviewImg.src }).then((v) => {
+  mountViewer(viewerModalStage).then((v) => {
     modalViewer = v;
   });
 });
+if (partReplayBtn) {
+  partReplayBtn.addEventListener("click", () => {
+    if (partViewer && partViewer.replay) partViewer.replay();
+  });
+}
 function closeModalViewer() {
   viewerModal.hidden = true;
   if (modalViewer) {
@@ -1180,6 +1200,17 @@ function renderDesign(design) {
   // Prefer the ungated coarse preview mesh so 3D works even for a pending
   // freeform part (whose real STL is download-gated → would 403 in the viewer).
   currentStlUrl = VulcanAPI.asset(design.files.view_stl || design.files.stl);
+  // A multi-part assembly: each piece its own colour, animated together. Use the
+  // ungated per-part view meshes so it works while pending review.
+  const parts = design.files.parts || [];
+  currentParts =
+    parts.length > 1
+      ? parts.map((p, i) => ({
+          url: VulcanAPI.asset(p.view_stl || p.stl),
+          colorIndex: p.color_index != null ? p.color_index : i,
+          name: p.name,
+        }))
+      : null;
   showPartView("3d");
 
   // Param summary table (value + source), built with DOM nodes.
@@ -1205,22 +1236,50 @@ function renderDesign(design) {
   }
 
   // Download links — locked (server returns 403) while a freeform design is
-  // pending review, so present them as locked rather than dead links.
+  // pending review, so present them as locked rather than dead links. A
+  // multi-part assembly lists each piece's own STEP/3MF/STL.
   const locked = design.review_status === "pending_review";
   designDownloads.innerHTML = "";
-  for (const [label, key] of [["STEP", "step"], ["3MF", "threemf"], ["STL", "stl"]]) {
-    const li = document.createElement("li");
-    if (locked) {
-      li.textContent = `${label} — 🔒 locked until approved`;
-      li.className = "download-locked";
-    } else {
-      const a = document.createElement("a");
-      a.href = VulcanAPI.asset(design.files[key]);
-      a.download = "";
-      a.textContent = `Download ${label}`;
-      li.appendChild(a);
+  const fmts = [
+    ["STEP", "step"],
+    ["3MF", "threemf"],
+    ["STL", "stl"],
+  ];
+  if (parts.length > 1) {
+    for (const part of parts) {
+      const li = document.createElement("li");
+      li.className = "download-part";
+      const name = document.createElement("strong");
+      name.textContent = part.name;
+      li.appendChild(name);
+      if (locked) {
+        li.appendChild(document.createTextNode(" — 🔒 locked until approved"));
+      } else {
+        for (const [label, key] of fmts) {
+          const a = document.createElement("a");
+          a.href = VulcanAPI.asset(part[key]);
+          a.download = "";
+          a.textContent = label;
+          li.appendChild(a);
+        }
+      }
+      designDownloads.appendChild(li);
     }
-    designDownloads.appendChild(li);
+  } else {
+    for (const [label, key] of fmts) {
+      const li = document.createElement("li");
+      if (locked) {
+        li.textContent = `${label} — 🔒 locked until approved`;
+        li.className = "download-locked";
+      } else {
+        const a = document.createElement("a");
+        a.href = VulcanAPI.asset(design.files[key]);
+        a.download = "";
+        a.textContent = `Download ${label}`;
+        li.appendChild(a);
+      }
+      designDownloads.appendChild(li);
+    }
   }
 }
 

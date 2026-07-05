@@ -1,13 +1,20 @@
-// Interactive 3D STL viewer (M7 follow-up). Uses the vendored Three.js (global
-// THREE) + STLLoader + OrbitControls — no build step, works offline. Given a
-// container and an STL URL, it fetches the mesh (optionally with the founder
-// review token, so a pending design's STL can be viewed on the dashboard),
-// frames it, and lets you orbit (drag), zoom (wheel) and pan (right-drag).
+// Interactive 3D STL viewer. Uses the vendored Three.js (global THREE) +
+// STLLoader + OrbitControls — no build step, works offline. Orbit (drag), zoom
+// (wheel), pan (right-drag).
 //
-// Vulcan3D.create(container, stlUrl, { token, fallbackImg, onReady }) -> handle
-//   handle.dispose()   tears down the renderer/animation
-//   handle.resetView() re-frames the camera
+// Vulcan3D.create(container, stlUrl, { token, fallbackImg }) -> handle
+//   single mesh (a one-piece design).
+// Vulcan3D.createAssembly(container, parts, { token, fallbackImg }) -> handle
+//   parts = [{ url, colorIndex, name }] — each piece a distinct colour, and on
+//   load they animate from an exploded layout INTO their assembled positions.
+//   handle.dispose() / handle.resetView() / handle.replay()
 window.Vulcan3D = (function () {
+  // Distinct part colours, roughly matching api/rendering.PART_PALETTE so the PNG
+  // preview and the 3D viewer agree on which piece is which.
+  const PART_COLORS = [
+    0xfa6b1c, 0x4a9ef0, 0x6bcc5c, 0xf2c73f, 0xb873eb, 0x40ccc7, 0xf272b3, 0x99a6b8,
+  ];
+
   function frame(camera, controls, object) {
     const box = new THREE.Box3().setFromObject(object);
     if (box.isEmpty()) return;
@@ -40,24 +47,9 @@ window.Vulcan3D = (function () {
     }
   }
 
-  async function create(container, stlUrl, opts = {}) {
-    container.innerHTML = "";
-    if (typeof THREE === "undefined" || !THREE.STLLoader || !THREE.OrbitControls) {
-      showFallback(container, opts, "3D library failed to load.");
-      return { dispose() {}, resetView() {} };
-    }
-
-    let geometry;
-    try {
-      const headers = opts.token ? { "X-Review-Token": opts.token } : {};
-      const resp = await fetch(stlUrl, { headers });
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      geometry = new THREE.STLLoader().parse(await resp.arrayBuffer());
-    } catch (err) {
-      showFallback(container, opts, `3D preview unavailable (${err.message}).`);
-      return { dispose() {}, resetView() {} };
-    }
-
+  // Shared WebGL scene: renderer + camera + lights + a Z-up→Y-up group + orbit
+  // controls + a render loop that also calls each registered per-frame hook.
+  function initScene(container) {
     const W = container.clientWidth || 480;
     const H = container.clientHeight || 360;
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -75,28 +67,20 @@ window.Vulcan3D = (function () {
     fill.position.set(-1, -0.4, -0.8);
     scene.add(fill);
 
-    geometry.computeVertexNormals();
-    const material = new THREE.MeshPhongMaterial({
-      color: 0x9fb0d8,
-      specular: 0x333333,
-      shininess: 24,
-    });
-    const mesh = new THREE.Mesh(geometry, material);
-    // CAD STLs are Z-up; stand the part up so Y is up (Three.js convention).
     const group = new THREE.Group();
-    group.rotation.x = -Math.PI / 2;
-    group.add(mesh);
+    group.rotation.x = -Math.PI / 2; // CAD is Z-up; stand it up so Y is up
     scene.add(group);
 
     const controls = new THREE.OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
-    controls.screenSpacePanning = true; // right-drag pans in the view plane
-    frame(camera, controls, group);
+    controls.screenSpacePanning = true;
 
+    const hooks = [];
     let raf = 0;
     function animate() {
       raf = requestAnimationFrame(animate);
+      for (const h of hooks) h();
       controls.update();
       renderer.render(scene, camera);
     }
@@ -112,25 +96,162 @@ window.Vulcan3D = (function () {
     });
     ro.observe(container);
 
-    if (opts.onReady) opts.onReady();
-
     return {
-      dispose() {
+      renderer,
+      scene,
+      camera,
+      controls,
+      group,
+      hooks,
+      teardown(disposables) {
         cancelAnimationFrame(raf);
         ro.disconnect();
         controls.dispose();
-        geometry.dispose();
-        material.dispose();
+        for (const d of disposables || []) {
+          try {
+            d.dispose();
+          } catch (e) {
+            /* ignore */
+          }
+        }
         renderer.dispose();
         if (renderer.domElement.parentNode) {
           renderer.domElement.parentNode.removeChild(renderer.domElement);
         }
       },
+    };
+  }
+
+  async function fetchGeometry(url, token) {
+    const headers = token ? { "X-Review-Token": token } : {};
+    const resp = await fetch(url, { headers });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const geom = new THREE.STLLoader().parse(await resp.arrayBuffer());
+    geom.computeVertexNormals();
+    return geom;
+  }
+
+  async function create(container, stlUrl, opts = {}) {
+    container.innerHTML = "";
+    if (typeof THREE === "undefined" || !THREE.STLLoader || !THREE.OrbitControls) {
+      showFallback(container, opts, "3D library failed to load.");
+      return { dispose() {}, resetView() {}, replay() {} };
+    }
+    let geometry;
+    try {
+      geometry = await fetchGeometry(stlUrl, opts.token);
+    } catch (err) {
+      showFallback(container, opts, `3D preview unavailable (${err.message}).`);
+      return { dispose() {}, resetView() {}, replay() {} };
+    }
+
+    const s = initScene(container);
+    const material = new THREE.MeshPhongMaterial({
+      color: 0x9fb0d8,
+      specular: 0x333333,
+      shininess: 24,
+    });
+    s.group.add(new THREE.Mesh(geometry, material));
+    frame(s.camera, s.controls, s.group);
+    if (opts.onReady) opts.onReady();
+
+    return {
+      dispose() {
+        s.teardown([geometry, material]);
+      },
       resetView() {
-        frame(camera, controls, group);
+        frame(s.camera, s.controls, s.group);
+      },
+      replay() {},
+    };
+  }
+
+  async function createAssembly(container, parts, opts = {}) {
+    container.innerHTML = "";
+    if (typeof THREE === "undefined" || !THREE.STLLoader || !THREE.OrbitControls) {
+      showFallback(container, opts, "3D library failed to load.");
+      return { dispose() {}, resetView() {}, replay() {} };
+    }
+
+    // Load every part; skip any that fail (e.g. one gated file).
+    const loaded = [];
+    for (let i = 0; i < parts.length; i++) {
+      try {
+        const geom = await fetchGeometry(parts[i].url, opts.token);
+        loaded.push({ geom, colorIndex: parts[i].colorIndex != null ? parts[i].colorIndex : i });
+      } catch (e) {
+        /* skip this part */
+      }
+    }
+    if (!loaded.length) {
+      showFallback(container, opts, "3D preview unavailable.");
+      return { dispose() {}, resetView() {}, replay() {} };
+    }
+
+    const s = initScene(container);
+    const disposables = [];
+
+    // Assembly centre (in group-local coords) so we can push each part outward
+    // along its direction from the centre for the "exploded" start state.
+    const asmBox = new THREE.Box3();
+    const partData = [];
+    for (const item of loaded) {
+      const mat = new THREE.MeshPhongMaterial({
+        color: PART_COLORS[item.colorIndex % PART_COLORS.length],
+        specular: 0x222222,
+        shininess: 26,
+      });
+      const mesh = new THREE.Mesh(item.geom, mat);
+      const holder = new THREE.Group(); // moved during the explode animation
+      holder.add(mesh);
+      s.group.add(holder);
+      disposables.push(item.geom, mat);
+
+      const box = new THREE.Box3().setFromObject(mesh);
+      const c = box.getCenter(new THREE.Vector3());
+      partData.push({ holder, center: c });
+      asmBox.union(box);
+    }
+
+    const asmCenter = asmBox.getCenter(new THREE.Vector3());
+    const asmSize = asmBox.getSize(new THREE.Vector3());
+    const spread = (Math.max(asmSize.x, asmSize.y, asmSize.z) || 1) * 0.9;
+    for (const pd of partData) {
+      const dir = pd.center.clone().sub(asmCenter);
+      if (dir.lengthSq() < 1e-6) dir.set(0, 0, 1); // a centred part pops "up"
+      pd.dir = dir.normalize().multiplyScalar(spread);
+    }
+
+    // Frame to the EXPLODED extent so nothing leaves the view mid-animation.
+    for (const pd of partData) pd.holder.position.copy(pd.dir);
+    frame(s.camera, s.controls, s.group);
+
+    // Explode animation: t goes 1 (apart) -> 0 (assembled) with an ease-out.
+    const DURATION = 1500;
+    let start = performance.now();
+    const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+    s.hooks.push(() => {
+      const p = Math.min(1, (performance.now() - start) / DURATION);
+      const t = 1 - easeOut(p); // 1 -> 0
+      for (const pd of partData) {
+        pd.holder.position.copy(pd.dir).multiplyScalar(t);
+      }
+    });
+
+    if (opts.onReady) opts.onReady();
+
+    return {
+      dispose() {
+        s.teardown(disposables);
+      },
+      resetView() {
+        frame(s.camera, s.controls, s.group);
+      },
+      replay() {
+        start = performance.now();
       },
     };
   }
 
-  return { create };
+  return { create, createAssembly };
 })();

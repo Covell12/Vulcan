@@ -222,7 +222,51 @@ def dfm_check(stl_path: Path) -> tuple[bool, dict[str, Any]]:
     return (manifold and connected and within), results
 
 
+def dfm_check_parts(parts: list[dict]) -> tuple[bool, dict[str, Any]]:
+    """Run the DFM gate on EVERY part of an assembly (each must be its own single
+    connected manifold solid within the size ceiling). Returns (all_ok, report)
+    where the report aggregates the per-part results plus a `parts` list."""
+    if not parts:
+        return False, {"part_count": 0, "parts": []}
+    per: list[dict[str, Any]] = []
+    all_ok = True
+    for p in parts:
+        ok, d = dfm_check(p["stl"])
+        all_ok = all_ok and ok
+        per.append({"name": p.get("name", "part"), **d})
+    agg: dict[str, Any] = {"part_count": len(parts), "parts": per}
+    # Roll per-part flags up so existing single-part consumers (and the review
+    # dashboard's one-line summary) still see meaningful top-level values.
+    agg["manifold"] = all(p["manifold"] for p in per)
+    agg["connected"] = all(p.get("connected", True) for p in per)
+    agg["body_count"] = sum(p.get("body_count", 1) for p in per)
+    agg["within_size"] = all(p["within_size"] for p in per)
+    agg["max_extent_mm"] = max(p["max_extent_mm"] for p in per)
+    agg["size_ceiling_mm"] = per[0]["size_ceiling_mm"]
+    return all_ok, agg
+
+
 def _dfm_feedback(dfm: dict[str, Any]) -> str:
+    # Multi-part assembly: point the model at the specific parts that failed.
+    if dfm.get("parts") and dfm.get("part_count", 1) > 1:
+        problems = []
+        for p in dfm["parts"]:
+            issues = []
+            if not p["manifold"]:
+                issues.append("not watertight/manifold")
+            if not p.get("connected", True):
+                issues.append(f"{p.get('body_count', '?')} disconnected pieces")
+            if not p["within_size"]:
+                issues.append(f"too big ({p['max_extent_mm']}mm)")
+            if issues:
+                problems.append(f"part '{p['name']}': " + ", ".join(issues))
+        base = "; ".join(problems) or "unknown DFM failure"
+        return (
+            base
+            + ". Each part must be ONE connected, watertight solid within the size "
+            "ceiling; keep the pieces as SEPARATE parts that fit together (don't fuse "
+            "them into one), positioned where they mate."
+        )
     problems = []
     if not dfm["manifold"]:
         problems.append(
@@ -417,7 +461,7 @@ def generate_and_register(
                 feedback = f"The generated code failed to build ({result.stage}): {result.error}"
                 continue
 
-            dfm_ok, dfm = dfm_check(result.files["stl"])
+            dfm_ok, dfm = dfm_check_parts(result.parts or [])
 
         if not dfm_ok:
             attempts.append({"attempt": attempt, "stage": "dfm", "dfm": dfm})

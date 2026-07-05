@@ -20,25 +20,66 @@ exec'd generated code sees the restricted namespace.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import traceback
 from pathlib import Path
+
+# A design may be a SINGLE solid or an ASSEMBLY of several parts that fit
+# together. build(params) may return a cadquery Workplane (one part), a dict
+# {"part_name": Workplane, ...}, or a list/tuple of Workplanes. Each part is
+# exported to its OWN <name>.step/.stl/.3mf. Capped so a runaway can't write
+# thousands of files.
+_MAX_PARTS = 8
+_PART_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
 
 # Errors from the exec'd code that carry a build failure the self-repair loop
 # can learn from are written to result.json; the process still exits 0 (the
 # parent reads result.json, not the exit code).
 
 
-def _write_result(workdir: Path, ok: bool, error: str | None = None) -> None:
+def _safe_part_name(name: object, i: int) -> str:
+    """Turn a model-supplied part name into a safe filename stem — alnum/underscore
+    only, capped, never empty and never path-traversal (names become filenames)."""
+    stem = _PART_NAME_RE.sub("_", str(name)).strip("_")[:40]
+    return stem or f"part{i + 1}"
+
+
+def _normalize_parts(result: object) -> list[tuple[str, object]]:
+    """Normalize build()'s return into an ordered [(unique_safe_name, solid)]."""
+    if isinstance(result, dict):
+        raw = list(result.items())
+    elif isinstance(result, (list, tuple)):
+        raw = [(f"part{i + 1}", v) for i, v in enumerate(result)]
+    else:
+        raw = [("part", result)]
+    seen: set[str] = set()
+    parts: list[tuple[str, object]] = []
+    for i, (k, v) in enumerate(raw):
+        name = _safe_part_name(k, i)
+        while name in seen:
+            name = f"{name}_{i + 1}"
+        seen.add(name)
+        parts.append((name, v))
+    return parts
+
+
+def _write_result(
+    workdir: Path,
+    ok: bool,
+    error: str | None = None,
+    parts: list[str] | None = None,
+) -> None:
     try:
         (workdir / "result.json").write_text(
-            json.dumps({"ok": ok, "error": error}), encoding="utf-8"
+            json.dumps({"ok": ok, "error": error, "parts": parts or []}),
+            encoding="utf-8",
         )
     except Exception:
         pass
 
 
-def _run(workdir: Path, repo_root: str) -> None:
+def _run(workdir: Path, repo_root: str) -> list[str]:
     sys.path.insert(0, repo_root)
     from api.code_verifier import ALLOWED_IMPORT_ROOTS, ENTRYPOINT, verify_code
 
@@ -84,15 +125,25 @@ def _run(workdir: Path, repo_root: str) -> None:
         build = ns.get(ENTRYPOINT)
         if not callable(build):
             raise RuntimeError(f"generated code defines no callable {ENTRYPOINT}()")
-        solid = build(params)
+        parts = _normalize_parts(build(params))
+        if not parts:
+            raise RuntimeError("build() returned no geometry")
+        if len(parts) > _MAX_PARTS:
+            raise RuntimeError(
+                f"build() returned {len(parts)} parts; the maximum is {_MAX_PARTS}"
+            )
 
         from cadquery import exporters
 
         out = workdir / "out"
         out.mkdir(exist_ok=True)
-        exporters.export(solid, str(out / "part.step"))
-        exporters.export(solid, str(out / "part.stl"))
-        exporters.export(solid, str(out / "part.3mf"))
+        names: list[str] = []
+        for name, solid in parts:
+            exporters.export(solid, str(out / f"{name}.step"))
+            exporters.export(solid, str(out / f"{name}.stl"))
+            exporters.export(solid, str(out / f"{name}.3mf"))
+            names.append(name)
+        return names
     finally:
         sys.stdout, sys.stderr = saved_out, saved_err
         devnull.close()
@@ -102,8 +153,8 @@ def main() -> None:
     workdir = Path(sys.argv[1])
     repo_root = sys.argv[2]
     try:
-        _run(workdir, repo_root)
-        _write_result(workdir, True)
+        names = _run(workdir, repo_root)
+        _write_result(workdir, True, parts=names)
     except Exception as e:  # noqa: BLE001 — any failure is a build failure
         detail = f"{type(e).__name__}: {e}"
         tb = traceback.format_exc()

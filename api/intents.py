@@ -980,10 +980,16 @@ def _render_ghost_composite(
             centroid[1],
         )
 
-        out_path = EXPORTS_DIR / design_id / "composite.png"
+        # A multi-part assembly is merged into assembly.stl; a single part is
+        # part.stl. Show the whole assembly in the photo either way.
+        design_dir = EXPORTS_DIR / design_id
+        mesh_path = design_dir / "assembly.stl"
+        if not mesh_path.exists():
+            mesh_path = design_dir / "part.stl"
+        out_path = design_dir / "composite.png"
         composite.render_composite(
             photo_bytes,
-            EXPORTS_DIR / design_id / "part.stl",
+            mesh_path,
             out_path,
             category=spec.category,
             annotation=annotation,

@@ -101,6 +101,69 @@ def render_preview(
         plt.close(fig)
 
 
+# Distinct matplotlib RGBA colors per part in an assembly preview. Kept roughly
+# in step with the client palette in web/viewer3d.js so the PNG and the 3D
+# viewer tell the same "which piece is which" story (ember first, then blue,
+# green, gold, purple, teal, pink).
+PART_PALETTE = [
+    (0.98, 0.42, 0.11, 1.0),
+    (0.29, 0.62, 0.94, 1.0),
+    (0.42, 0.80, 0.36, 1.0),
+    (0.95, 0.78, 0.25, 1.0),
+    (0.72, 0.45, 0.92, 1.0),
+    (0.25, 0.80, 0.78, 1.0),
+    (0.95, 0.45, 0.70, 1.0),
+    (0.60, 0.65, 0.72, 1.0),
+]
+
+
+def render_assembly_preview(
+    stl_paths: list[Path],
+    preview_path: Path,
+    callouts: list[dict[str, Any]] | None = None,
+) -> None:
+    """Render an assembly of parts into one PNG, each part a distinct color, so
+    the founder/customer can see how the pieces fit together. Falls back to the
+    single-part renderer when there's exactly one part."""
+    if len(stl_paths) <= 1:
+        render_preview(stl_paths[0], preview_path, callouts)
+        return
+
+    import numpy as np
+
+    meshes = [trimesh.load(str(p), force="mesh") for p in stl_paths]
+    fig = plt.figure(figsize=(6, 6))
+    try:
+        ax = fig.add_subplot(111, projection="3d")
+        for i, mesh in enumerate(meshes):
+            color = PART_PALETTE[i % len(PART_PALETTE)]
+            ax.add_collection3d(
+                Poly3DCollection(
+                    mesh.vertices[mesh.faces],
+                    facecolor=color,
+                    edgecolor=(0.1, 0.1, 0.1, 0.25),
+                    linewidths=0.2,
+                )
+            )
+        allv = np.vstack([m.vertices for m in meshes])
+        lo, hi = allv.min(axis=0), allv.max(axis=0)
+        for i in range(3):
+            if hi[i] - lo[i] <= 1e-9:
+                lo[i] -= 1.0
+                hi[i] += 1.0
+        ax.set_xlim(lo[0], hi[0])
+        ax.set_ylim(lo[1], hi[1])
+        ax.set_zlim(lo[2], hi[2])
+        ax.set_box_aspect(hi - lo)
+        ax.view_init(elev=25, azim=-60)
+        ax.axis("off")
+        if callouts:
+            _draw_callouts(ax, callouts, [lo, hi])
+        fig.savefig(str(preview_path), dpi=120, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+
+
 def _draw_callouts(ax: Any, callouts: list[dict[str, Any]], bounds: Any) -> None:
     """Draw each dimension as a colored line between its two 3D endpoints with a
     text label offset outward from the part so it stays legible."""
@@ -141,14 +204,16 @@ def mesh_is_watertight(stl_path: Path) -> bool:
     return bool(getattr(mesh, "is_watertight", False)) and len(mesh.faces) > 0
 
 
-def write_preview_mesh(stl_path: Path) -> Path | None:
-    """Write a coarse, decimated `part_preview.stl` next to the real STL for the
-    interactive 3D viewer. It's low-poly (good enough to orbit and judge the
-    shape, NOT a clean manufacturing deliverable), so it can be served UNGATED —
-    letting a customer see their part in 3D while the review gate keeps the
+def write_preview_mesh(
+    stl_path: Path, out_name: str = "part_preview.stl"
+) -> Path | None:
+    """Write a coarse, decimated preview mesh (default `part_preview.stl`) next to
+    the real STL for the interactive 3D viewer. It's low-poly (good enough to orbit
+    and judge the shape, NOT a clean manufacturing deliverable), so it can be served
+    UNGATED — letting a customer see their part in 3D while the review gate keeps the
     full-res STEP/3MF/STL locked until the founder approves. Returns the preview
     path, or None if it couldn't be produced (the viewer then falls back)."""
-    out = stl_path.with_name("part_preview.stl")
+    out = stl_path.with_name(out_name)
     try:
         mesh = trimesh.load(str(stl_path), force="mesh")
         if len(getattr(mesh, "faces", [])) == 0:

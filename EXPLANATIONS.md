@@ -340,6 +340,13 @@ non-expert can follow: what it does, why it exists, what talks to it).
   now rejects a design that isn't watertight OR isn't a single body, and emits a `view_stl`
   URL for the preview mesh; `api/freeform.dfm_check` adds `connected`/`body_count` to its
   report and its feedback so the self-repair loop is told to fuse floating pieces.
+  **M9.2 (multi-part assemblies):** a freeform design may now be an ASSEMBLY of several separate
+  parts that fit together (a lid+box, a peg+socket). `render_assembly_preview` renders them in
+  one PNG each a distinct `PART_PALETTE` colour; `write_preview_mesh(out_name=...)` makes a
+  per-part ungated view mesh. `build_design` gates EACH part (single connected manifold) and
+  returns a `parts` list `[{name, step, stl, threemf, view_stl, color_index}]`; for a multi-part
+  design it also merges the parts into `assembly.stl` (for the in-photo composite + a combined
+  view fallback). Single-part designs keep the flat top-level `step/stl/threemf/view_stl`.
   **M5.5:** `render_preview` now pads any zero-thickness bounding-box axis before setting the
   3D limits, so a degenerate/flat mesh (e.g. a broken template producing a single planar
   face) renders instead of crashing matplotlib's projection — the manifold gate is what then
@@ -366,7 +373,12 @@ sandbox; every freeform design requires founder review before its files can ship
   mode) with a hard wall-clock timeout, OS resource limits (CPU/file-size/#files/#procs via
   setrlimit), stdin/stdout/stderr on /dev/null, and an environment scrubbed of secrets. The
   subprocess exports STEP/STL/3MF into its own temp dir; only those geometry files are copied
-  back — no generated Python re-enters the API process. Build failures (bad geometry, timeout)
+  back — no generated Python re-enters the API process. **M9.2:** `build(params)` may return one
+  Workplane OR a dict/list of several parts (an assembly); each is exported to its OWN
+  `<name>.{step,stl,3mf}` and `SandboxResult.parts` carries one entry per piece. Part names come
+  from model output and BECOME filenames, so they're sanitized to `[a-zA-Z0-9_]` in the runner
+  AND re-validated against a strict allowlist in `_collect_outputs` (defense-in-depth; a
+  `../evil` name can't escape out_dir). Capped at 8 parts. Build failures (bad geometry, timeout)
   come back as `SandboxResult(ok=False, stage=...)` (never an exception) so the self-repair
   loop can learn from them. Honest limitation, documented in the module + security notes: this
   is static-analysis + process-isolation + rlimits, NOT a syscall jail (no container/seccomp);
@@ -390,6 +402,11 @@ sandbox; every freeform design requires founder review before its files can ship
   the join), and the output gained an `overlays` array — a dimension overlay (dim_line/
   dim_ellipse/dim_depth) per critical dim locating it on the photo, which `api/freeform` and
   `api/intents` carry through so freeform questions draw dimension lines like Track A ones.
+  **M9.1/M9.2:** the prompt demands each returned piece be ONE connected watertight solid (no
+  floating fragments) and function-first geometry, and allows returning a dict of SEPARATE named
+  pieces when the hardware genuinely needs an assembly (positioned where they mate, with a
+  printing clearance, NOT fused). `freeform.dfm_check_parts` runs the gate on every piece and
+  `_dfm_feedback` names the failing piece for the self-repair loop.
 - **api/freeform.py** (M-B) — Orchestrates generation: normalizes the model's param_schema and
   builds a pydantic params model from it (`create_model`, with ge/le bounds + Literal enums),
   verifies the code, TEST-BUILDS it in the sandbox with default params, and runs the DFM gate
@@ -623,7 +640,14 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   with `dispose()` (cancels the RAF, disconnects the ResizeObserver, frees the GL context and
   removes the canvas) and `resetView()`. If the library or the fetch fails (e.g. a 403 on a gated
   STL with no token), it shows `fallbackImg` (the render) instead — so the customer panel, which
-  has no token, degrades gracefully for pending freeform parts.
+  has no token, degrades gracefully for pending freeform parts. **M9.2:** adds
+  `Vulcan3D.createAssembly(container, parts, opts)` for a multi-part design — `parts` is
+  `[{url, colorIndex, name}]`; it loads each piece, colours it from `PART_COLORS` (matching the
+  server palette), and on load ANIMATES the pieces from an exploded layout into their assembled
+  positions (each piece pushed outward along its direction from the assembly centre, eased back
+  to 0); the handle gains `replay()`. `create`/`createAssembly` share one scene-setup helper.
+  `web/intents.js` and `web/review.js` use `createAssembly` (and render per-part downloads +
+  a "▶ Replay" button) when `design.files.parts` has more than one entry.
 - **web/units.js** (M5) — The ONE place lengths are converted (CLAUDE.md rule 4). Pure
   helpers: `toMm(value, unit)` (mm/cm/in → mm), `formatDual` ("8 in = 203.2 mm"), and a
   session-remembered unit (`get/setSessionUnit`). Internal units stay mm everywhere; this

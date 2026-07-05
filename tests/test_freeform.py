@@ -64,6 +64,19 @@ OVERSIZE_GEN = {
     **GOOD_GEN,
     "cadquery_code": "import cadquery as cq\ndef build(params):\n    return cq.Workplane('XY').box(400, 30, 20)\n",
 }
+# A legitimate ASSEMBLY: two SEPARATE pieces (dict return) that fit together.
+# Each is its own single manifold solid, so this PASSES (unlike FLOATING_GEN,
+# which fuses two disjoint bodies into one broken part).
+MULTI_GEN = {
+    **GOOD_GEN,
+    "cadquery_code": (
+        "import cadquery as cq\n"
+        "def build(params):\n"
+        "    peg = cq.Workplane('XY').cylinder(float(params['w_mm']), 4)\n"
+        "    base = cq.Workplane('XY').box(20, 20, 6).translate((0, 0, -14))\n"
+        "    return {'peg': peg, 'base': base}\n"
+    ),
+}
 # Two disjoint boxes: each is watertight, so the manifold check passes, but the
 # part is TWO connected bodies (floating pieces) — must be caught + rejected.
 FLOATING_GEN = {
@@ -179,6 +192,37 @@ def test_oversize_part_fails_dfm_and_is_reported(cleanup_generated):
     assert not r.ok
     assert all(a["stage"] in ("dfm",) for a in r.attempts)
     assert r.attempts[0]["dfm"]["within_size"] is False
+
+
+def test_multi_part_assembly_builds_separate_files(cleanup_generated):
+    """A dict-return assembly passes DFM (each piece a single solid) and
+    build_design emits one STEP/STL/3MF set per piece plus a merged assembly."""
+    import shutil as _shutil
+
+    from api.designs import EXPORTS_DIR, build_design
+
+    with patch(
+        "api.freeform.codegen_provider.generate_template", return_value=dict(MULTI_GEN)
+    ):
+        r = ff.generate_and_register("a peg that fits a base", [])
+    if r.template_id:
+        cleanup_generated.append(r.template_id)
+    assert r.ok
+    assert r.dfm["part_count"] == 2 and r.dfm["connected"] is True
+
+    design_id, urls = build_design(r.template_id, {"w_mm": 22})
+    try:
+        assert {p["name"] for p in urls["parts"]} == {"peg", "base"}
+        # Each part has its own three files + an ungated view mesh.
+        for p in urls["parts"]:
+            assert p["step"].endswith(".step") and p["stl"].endswith(".stl")
+            assert p["threemf"].endswith(".3mf") and p["view_stl"]
+        # A merged assembly for the composite + a combined view fallback.
+        assert urls["stl"].endswith("assembly.stl")
+        assert (EXPORTS_DIR / design_id / "peg.step").exists()
+        assert (EXPORTS_DIR / design_id / "base.step").exists()
+    finally:
+        _shutil.rmtree(EXPORTS_DIR / design_id, ignore_errors=True)
 
 
 def test_floating_pieces_fail_dfm_and_are_reported(cleanup_generated):

@@ -106,13 +106,21 @@ subprocess, requests, importlib, etc.; any other import will be rejected and you
 discarded);
   * defines a top-level function `build(params)` where `params` is a plain dict keyed by \
 your parameter names (e.g. params["width_mm"]); read values with float(...)/int(...);
-  * returns a single manifold cadquery Workplane solid (ONE connected, watertight, closed \
-body). This is the #1 cause of rejection, so: UNION every piece into one solid (never return \
-loose/overlapping separate bodies or a bare sketch/wire); make booleans actually OVERLAP in \
-volume (not merely touch at a face or edge — a face- or edge-only contact leaves a \
-non-manifold seam); avoid self-intersecting sweeps/lofts and zero-thickness walls. Safest \
-pattern: build the outer solid, `.cut()` the holes/pockets, `.union()` any add-ons, and \
-return that single Workplane.
+  * returns EITHER one cadquery Workplane (a one-piece part) OR — when the hardware genuinely \
+needs SEPARATE pieces that fit/move together (e.g. a lid + a box, a peg + a socket, a clamp's \
+two halves, a hinge's two leaves + a pin) — a dict {{"piece_name": Workplane, ...}} of the \
+distinct pieces (snake_case names; up to 8). Each piece is exported to its OWN STEP/STL/3MF \
+file and shown in a different colour. POSITION every piece where it actually sits in the \
+assembled product (in the same coordinate space) so they display correctly fitted together; \
+add a small printing clearance (~0.2-0.4mm) between mating pieces so they aren't fused.
+  * EACH returned piece must be ONE connected, watertight, closed manifold body — this is the \
+#1 cause of rejection. Within a single piece, UNION every feature into that one body (make \
+booleans actually OVERLAP in volume, not merely touch at a face/edge — a face- or edge-only \
+contact leaves a non-manifold seam or a floating fragment); never leave a loose/near-but-\
+unfused fragment, a bare sketch, or a wire. But do NOT fuse pieces that are meant to be \
+separate parts — keep those as distinct dict entries. Safest pattern per piece: build the \
+outer solid, `.cut()` the holes/pockets, `.union()` its own add-ons; avoid self-intersecting \
+sweeps/lofts and zero-thickness walls.
   * uses NO file/network/system access, NO eval/exec, NO dunder-attribute tricks — pure \
 geometry only. It runs in a locked-down sandbox that forbids all of that.
 - param_schema: one entry per parameter, using EXACTLY these fields: name (snake_case, \

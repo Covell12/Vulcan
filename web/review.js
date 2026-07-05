@@ -86,7 +86,7 @@ function buildCardView(record) {
   });
 
   const viewStl = f.view_stl || f.stl; // ungated coarse preview mesh when present
-  if (viewStl) {
+  if (viewStl || (f.parts && f.parts.length)) {
     const b3d = el("button", { type: "button", className: "seg", textContent: "3D" });
     b3d.addEventListener("click", () => {
       if (dashViewer) dashViewer.dispose();
@@ -94,14 +94,11 @@ function buildCardView(record) {
       viewer.style.display = "";
       clearActive();
       b3d.classList.add("active");
-      Vulcan3D.create(viewer, VulcanAPI.asset(viewStl), {
-        token: founderToken(),
-        fallbackImg: VulcanAPI.asset(f.preview_png),
-      }).then((v) => (dashViewer = v));
+      mountRecordViewer(viewer, f).then((v) => (dashViewer = v));
     });
     bar.append(b3d);
     const exp = el("button", { type: "button", className: "expand-btn", textContent: "⛶ Expand" });
-    exp.addEventListener("click", () => openCardModal(VulcanAPI.asset(viewStl)));
+    exp.addEventListener("click", () => openCardModal(f));
     bar.append(exp);
   }
 
@@ -109,13 +106,32 @@ function buildCardView(record) {
   return wrap;
 }
 
-function openCardModal(stlUrl) {
+// A multi-part record -> [{url,colorIndex,name}] for createAssembly, else null.
+function recordParts(f) {
+  const parts = f.parts || [];
+  if (parts.length <= 1) return null;
+  return parts.map((p, i) => ({
+    url: VulcanAPI.asset(p.view_stl || p.stl),
+    colorIndex: p.color_index != null ? p.color_index : i,
+    name: p.name,
+  }));
+}
+
+function mountRecordViewer(target, f) {
+  const opts = { token: founderToken(), fallbackImg: VulcanAPI.asset(f.preview_png) };
+  const parts = recordParts(f);
+  return parts
+    ? Vulcan3D.createAssembly(target, parts, opts)
+    : Vulcan3D.create(target, VulcanAPI.asset(f.view_stl || f.stl), opts);
+}
+
+function openCardModal(f) {
   const modal = document.getElementById("viewer-modal");
   modal.hidden = false;
   if (dashModal) dashModal.dispose();
-  Vulcan3D.create(document.getElementById("viewer-modal-stage"), stlUrl, {
-    token: founderToken(),
-  }).then((v) => (dashModal = v));
+  mountRecordViewer(document.getElementById("viewer-modal-stage"), f).then((v) => {
+    dashModal = v;
+  });
 }
 
 document.getElementById("viewer-modal-close").addEventListener("click", () => {
@@ -228,20 +244,30 @@ function renderCard(record) {
   card.append(details);
 
   // Downloads: the founder can pull the files from their dashboard for ANY
-  // freeform design — pending (to inspect before approving) or approved.
+  // freeform design — pending (to inspect before approving) or approved. A
+  // multi-part assembly offers each piece's own STEP/3MF/STL.
   if (record.files) {
-    const btns = [];
-    for (const [label, key] of [["STEP", "step"], ["3MF", "threemf"], ["STL", "stl"]]) {
-      const url = record.files[key];
-      if (!url) continue;
-      const name = `${record.design_id}-${key}${url.slice(url.lastIndexOf("."))}`;
-      btns.push(
-        el("button", { type: "button", className: "download-btn", textContent: `Download ${label}` }, []),
-      );
-      btns[btns.length - 1].addEventListener("click", () => downloadFile(url, name));
+    const f = record.files;
+    // [{name, {step,threemf,stl urls}}] — one group per part (or one for a
+    // single-part design using the flat top-level keys).
+    const groups =
+      f.parts && f.parts.length > 1
+        ? f.parts.map((p) => ({ label: p.name, files: p }))
+        : [{ label: null, files: f }];
+    const wrap = el("div", { className: "review-downloads" }, []);
+    for (const g of groups) {
+      if (g.label) wrap.append(el("span", { className: "review-part-name" }, `${g.label}: `));
+      for (const [label, key] of [["STEP", "step"], ["3MF", "threemf"], ["STL", "stl"]]) {
+        const url = g.files[key];
+        if (!url) continue;
+        const stem = g.label ? `${record.design_id}-${g.label}` : record.design_id;
+        const name = `${stem}-${key}${url.slice(url.lastIndexOf("."))}`;
+        const btn = el("button", { type: "button", className: "download-btn", textContent: label }, []);
+        btn.addEventListener("click", () => downloadFile(url, name));
+        wrap.append(btn);
+      }
     }
-    if (btns.length) {
-      const wrap = el("div", { className: "review-downloads" }, btns);
+    if (wrap.childNodes.length) {
       if (status === "pending_review") {
         wrap.prepend(el("span", { className: "review-download-note" }, "Founder preview (not yet approved): "));
       }

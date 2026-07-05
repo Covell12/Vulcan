@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -74,8 +75,6 @@ _SECRET_FRAGMENTS = (
     "STRIPE",
 )
 
-_EXPORT_NAMES = {"step": "part.step", "stl": "part.stl", "threemf": "part.3mf"}
-
 
 class SandboxError(RuntimeError):
     """A sandbox-infrastructure failure (not a build failure of the generated
@@ -87,7 +86,9 @@ class SandboxResult:
     ok: bool
     stage: str  # "verify" | "timeout" | "run" | "output" | "ok"
     error: str | None = None
-    files: dict[str, Path] | None = None
+    # One entry per exported part: {"name": str, "step"/"stl"/"threemf": Path}.
+    # A single-solid design has exactly one part named "part".
+    parts: list[dict] | None = None
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -210,30 +211,49 @@ def run_generated_build(
                 error=str(result.get("error") or "generated code failed to build"),
             )
 
-        return _collect_outputs(workdir, out_dir)
+        part_names = result.get("parts") or ["part"]
+        return _collect_outputs(workdir, out_dir, part_names)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _collect_outputs(workdir: Path, out_dir: Path) -> SandboxResult:
-    """Verify the three expected export files exist, are non-empty, and are under
-    the size cap, then copy them into out_dir."""
+_SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{1,40}$")
+
+
+def _collect_outputs(workdir: Path, out_dir: Path, part_names: list) -> SandboxResult:
+    """For EACH part, verify its three export files exist, are non-empty and under
+    the size cap, then copy them into out_dir. Re-validates each part name against
+    a strict allowlist (defense-in-depth: names came from the sandbox, but they
+    originate in model output and become filenames here)."""
     src = workdir / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
-    files: dict[str, Path] = {}
-    for key, name in _EXPORT_NAMES.items():
-        s = src / name
-        if not s.exists() or s.stat().st_size == 0:
+    parts: list[dict] = []
+    for raw in part_names:
+        name = str(raw)
+        if not _SAFE_NAME_RE.match(name):
             return SandboxResult(
-                ok=False, stage="output", error=f"expected export '{name}' is missing"
+                ok=False, stage="output", error=f"unsafe part name {name!r}"
             )
-        if s.stat().st_size > _MAX_OUTPUT_BYTES:
-            return SandboxResult(
-                ok=False,
-                stage="output",
-                error=f"export '{name}' exceeds the {_MAX_OUTPUT_BYTES}-byte cap",
-            )
-        dest = out_dir / name
-        shutil.copyfile(s, dest)
-        files[key] = dest
-    return SandboxResult(ok=True, stage="ok", files=files)
+        entry: dict = {"name": name}
+        for key, suffix in (("step", "step"), ("stl", "stl"), ("threemf", "3mf")):
+            filename = f"{name}.{suffix}"
+            s = src / filename
+            if not s.exists() or s.stat().st_size == 0:
+                return SandboxResult(
+                    ok=False,
+                    stage="output",
+                    error=f"expected export '{filename}' is missing",
+                )
+            if s.stat().st_size > _MAX_OUTPUT_BYTES:
+                return SandboxResult(
+                    ok=False,
+                    stage="output",
+                    error=f"export '{filename}' exceeds the {_MAX_OUTPUT_BYTES}-byte cap",
+                )
+            dest = out_dir / filename
+            shutil.copyfile(s, dest)
+            entry[key] = dest
+        parts.append(entry)
+    if not parts:
+        return SandboxResult(ok=False, stage="output", error="no parts were exported")
+    return SandboxResult(ok=True, stage="ok", parts=parts)

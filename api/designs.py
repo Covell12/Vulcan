@@ -24,7 +24,7 @@ from api.rendering import (
     export_design,
     heal_mesh_file,
     mesh_body_count,
-    render_preview,
+    render_assembly_preview,
     write_preview_mesh,
 )
 from templates_lib.registry import (
@@ -90,12 +90,11 @@ def _produce_files(
     params_obj: BaseModel,
     design_dir: Path,
     callouts: list[dict[str, Any]],
-) -> dict[str, Path]:
+) -> dict[str, Any]:
     """Produce STEP/STL/3MF + preview for a design. Track A templates build a
-    solid in-process and export it; freeform (ephemeral) templates build in the
-    sandbox subprocess (their generated code never runs here) and the preview is
-    rendered in-process from the sandbox's STL. Both return the same file dict,
-    so the manifold gate and URL construction downstream are identical."""
+    single solid in-process; freeform (ephemeral) templates build in the sandbox
+    subprocess and may return an ASSEMBLY of several parts. Both return the same
+    shape: {"parts": [{name, step, stl, threemf}, ...], "preview_png": Path}."""
     if isinstance(spec, EphemeralTemplateSpec):
         return _produce_files_freeform(spec, params_obj, design_dir, callouts)
 
@@ -103,7 +102,18 @@ def _produce_files(
         solid = spec.build_fn(params_obj)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    return export_design(solid, design_dir, callouts)
+    exported = export_design(solid, design_dir, callouts)
+    return {
+        "parts": [
+            {
+                "name": "part",
+                "step": exported["step"],
+                "stl": exported["stl"],
+                "threemf": exported["threemf"],
+            }
+        ],
+        "preview_png": exported["preview_png"],
+    }
 
 
 def _produce_files_freeform(
@@ -111,7 +121,7 @@ def _produce_files_freeform(
     params_obj: BaseModel,
     design_dir: Path,
     callouts: list[dict[str, Any]],
-) -> dict[str, Path]:
+) -> dict[str, Any]:
     # Local import so the (heavy, subprocess-spawning) sandbox is only loaded on
     # the freeform path, and to avoid any import cycle.
     from api import sandbox
@@ -128,14 +138,10 @@ def _produce_files_freeform(
             detail=f"freeform build failed ({result.stage}): {result.error}",
         )
 
+    parts = result.parts or []
     preview_path = design_dir / "preview.png"
-    render_preview(result.files["stl"], preview_path, callouts)
-    return {
-        "step": result.files["step"],
-        "stl": result.files["stl"],
-        "threemf": result.files["threemf"],
-        "preview_png": preview_path,
-    }
+    render_assembly_preview([p["stl"] for p in parts], preview_path, callouts)
+    return {"parts": parts, "preview_png": preview_path}
 
 
 def build_design(
@@ -165,47 +171,78 @@ def build_design(
     design_id = uuid.uuid4().hex[:12]
     design_dir = EXPORTS_DIR / design_id
     callouts = _callout_dicts(spec, params_obj, source_map)
-    files = _produce_files(spec, params_obj, design_dir, callouts)
+    produced = _produce_files(spec, params_obj, design_dir, callouts)
+    parts = produced["parts"]
 
-    # Runtime printability gate (M5.5): a part we hand to a printer must be a
-    # watertight, manifold solid that is ALSO a SINGLE connected body — no
-    # floating/disjoint pieces (two disjoint closed bodies are each watertight,
-    # so watertightness alone doesn't catch a design that left an add-on unfused).
-    # The per-template pytest suite proves this for DEFAULT params, but a live
-    # design runs USER-resolved params (and generated geometry), so we re-check
-    # the actually-exported mesh here. `heal_mesh_file` first tries a light,
-    # print-safe repair (and re-exports the healed STL) so a valid solid with
-    # tessellation artifacts isn't wrongly rejected. Fail closed: delete the
-    # half-baked export directory so no unbuildable STL/STEP can be downloaded.
-    manifold_ok = heal_mesh_file(files["stl"])
-    bodies = mesh_body_count(files["stl"])
-    if not manifold_ok or bodies != 1:
-        shutil.rmtree(design_dir, ignore_errors=True)
-        problem = (
-            "is not watertight/manifold"
-            if not manifold_ok
-            else f"has {bodies} disconnected pieces (floating parts) — it must be ONE connected solid"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"generated mesh for template '{template_id}' {problem} and "
-                "cannot be printed; design rejected."
-            ),
+    def _url(path: Path) -> str:
+        return f"/exports/{design_id}/{path.name}"
+
+    # Runtime printability gate (M5.5 / M9.1): EACH part we hand to a printer must
+    # be a watertight, manifold, SINGLE connected body (no floating pieces — two
+    # disjoint closed bodies are each watertight, so watertightness alone misses an
+    # unfused add-on). A design may legitimately be an ASSEMBLY of several such
+    # parts, but every part is gated individually. `heal_mesh_file` tries a light,
+    # print-safe repair first so a valid solid with tessellation artifacts isn't
+    # wrongly rejected. Fail closed: delete the export dir so nothing unbuildable
+    # can be downloaded.
+    part_urls: list[dict[str, Any]] = []
+    for i, p in enumerate(parts):
+        if not heal_mesh_file(p["stl"]) or mesh_body_count(p["stl"]) != 1:
+            shutil.rmtree(design_dir, ignore_errors=True)
+            label = p["name"] if len(parts) > 1 else "the part"
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"generated mesh for '{template_id}' ({label}) is not a single "
+                    "watertight/manifold solid and cannot be printed; design rejected."
+                ),
+            )
+        view = write_preview_mesh(p["stl"], out_name=f"{p['name']}_preview.stl")
+        part_urls.append(
+            {
+                "name": p["name"],
+                "step": _url(p["step"]),
+                "stl": _url(p["stl"]),
+                "threemf": _url(p["threemf"]),
+                "view_stl": _url(view) if view is not None else None,
+                "color_index": i,
+            }
         )
 
-    urls = {
-        "step": f"/exports/{design_id}/{files['step'].name}",
-        "threemf": f"/exports/{design_id}/{files['threemf'].name}",
-        "stl": f"/exports/{design_id}/{files['stl'].name}",
-        "preview_png": f"/exports/{design_id}/{files['preview_png'].name}",
+    urls: dict[str, Any] = {
+        "preview_png": _url(produced["preview_png"]),
+        "parts": part_urls,
     }
-    # A coarse, UNGATED preview mesh so the customer can view their part in 3D
-    # even while a pending freeform design's real STL/STEP/3MF stay download-gated.
-    view_mesh = write_preview_mesh(files["stl"])
-    if view_mesh is not None:
-        urls["view_stl"] = f"/exports/{design_id}/{view_mesh.name}"
+
+    if len(parts) == 1:
+        # Single part: keep the flat top-level keys existing consumers expect.
+        urls["step"] = part_urls[0]["step"]
+        urls["stl"] = part_urls[0]["stl"]
+        urls["threemf"] = part_urls[0]["threemf"]
+        urls["view_stl"] = part_urls[0]["view_stl"]
+    else:
+        # Assembly: merge all parts into one mesh for the in-photo composite + a
+        # combined ungated view-mesh fallback. (No flat top-level STEP/3MF — those
+        # are per-part downloads.)
+        assembly = _write_assembly_mesh([p["stl"] for p in parts], design_dir)
+        urls["stl"] = _url(assembly)
+        view_all = write_preview_mesh(assembly, out_name="assembly_preview.stl")
+        urls["view_stl"] = _url(view_all) if view_all is not None else None
+
     return design_id, urls
+
+
+def _write_assembly_mesh(stl_paths: list[Path], design_dir: Path) -> Path:
+    """Merge all part meshes into one `assembly.stl` (used by the in-photo
+    composite and as the single-mesh 3D fallback for a multi-part design)."""
+    import trimesh
+
+    merged = trimesh.util.concatenate(
+        [trimesh.load(str(p), force="mesh") for p in stl_paths]
+    )
+    out = design_dir / "assembly.stl"
+    merged.export(str(out))
+    return out
 
 
 @router.post("/designs", response_model=DesignResponse)
