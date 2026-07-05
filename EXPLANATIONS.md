@@ -130,7 +130,11 @@ non-expert can follow: what it does, why it exists, what talks to it).
   Extracted from `api/templates.py` once `api/intents.py` needed the exact same
   information — for the web form there and for telling the vision LLM what
   parameters/ranges each template accepts here. A template's `Field(...)` definitions
-  stay the single source of truth for both.
+  stay the single source of truth for both. **Expandable ranges:** each field now also
+  carries `recommended_min`/`recommended_max`/`hard_reason` (read from a Field's
+  `json_schema_extra`) — the softer typical range the UI shows and lets the user expand
+  past, plus a reason for a limit that genuinely can't be crossed. `minimum`/`maximum`
+  remain the HARD buildable limits (pydantic ge/le).
 - **api/vision_provider.py** (M3) — The one file in the whole codebase allowed to import
   `openai` or `anthropic` or know either provider's name (enforced by
   `tests/test_vision_provider.py::test_no_other_module_imports_provider_sdks`, which
@@ -285,10 +289,13 @@ non-expert can follow: what it does, why it exists, what talks to it).
   always-available user OVERRIDE too: it no longer 409s when a template already matched —
   instead the generated template REPLACES it, and the old template's dimensions/questions are
   cleared so the gate synthesizes a clean set for the custom design. **M7 follow-up fixes:**
-  `_attach_param_bounds` puts each numeric param's min/max (mm) on the intent as
-  `param_bounds`, so the UI shows the allowed range and rejects an out-of-range value BEFORE
-  the join (a value outside a freeform template's bounds otherwise only failed with a
-  confusing 422 at build time). And on a freeform override, `_freeform_questions` seeds the
+  `_attach_param_bounds` puts each numeric param's bounds (mm) on the intent as
+  `param_bounds`. **M8 (expandable ranges):** it now emits `{minimum, maximum, recommended_min,
+  recommended_max, hard_reason}` — the HARD buildable limits (pydantic ge/le, widened on the
+  Track-A templates), the softer RECOMMENDED range the UI lets the user expand past, and a
+  reason for a limit that can't be crossed. The UI blocks only on the hard bounds (with the
+  reason); relational rules like "the screw hole can't be bigger than the plate" stay in each
+  template's `model_validator` and surface, with their message, at generate. And on a freeform override, `_freeform_questions` seeds the
   critical-dim questions WITH the overlays the codegen model placed on the photo (via
   `outcome.overlays`), so the photo shows the dimension drawing for freeform parts too — they
   used to be synthesized overlay-less.
@@ -437,7 +444,13 @@ sandbox; every freeform design requires founder review before its files can ship
   `GET /templates` to prefill the web form. **M3:** registered with
   `category="bracket"` and `critical_dims=("span_mm", "depth_mm")`, per this
   milestone's instructions. **M5:** `bracket_callouts` declares the span + depth preview
-  arrows.
+  arrows. **M8 (expandable ranges):** the dimensional params' `ge`/`le` were widened to
+  generous HARD limits (e.g. span 20–450) and each carries a softer `recommended_min/max` in
+  `json_schema_extra` (span 40–300) plus a `hard_reason` on physical floors (thickness can't go
+  below `MIN_WALL_MM`). The relational `model_validator` rules are unchanged and remain the real
+  gate; the wider `ge`/`le` just let the user push a single dimension past the recommended range.
+  The same widening + `recommended_*` pattern was applied to `adapter_tube.py` and
+  `knob_appliance.py`.
 - **templates_lib/adapter_tube.py** (M2) — A tube/hose adapter joining two circular
   ends (`od_a_mm`/`id_a_mm` at end A, `od_b_mm`/`id_b_mm` at end B), per
   docs/vulcan-product-spec.pdf Appendix A's `adapter.tube` entry — which only sketches
@@ -640,7 +653,18 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   **Production UI:** all four endpoints go through `VulcanAPI` (`createIntent`/`submitAnswers`/
   `freeform`/`joinDesign`), and every `design.files.*` URL used as an `<img src>`, download
   `href`, or the 3D viewer's STL is wrapped in `VulcanAPI.asset()` — so the whole flow works
-  from a separately-hosted site.
+  from a separately-hosted site. **Measurement UX (M8):** (1) every measurement is labelled with
+  a NAME (`dimLabel`, prettified from `dim_name`) shown BOTH as a `.question-name` on the form
+  field and as the top line of its on-photo chip (chips are now two-line: name + live value).
+  (2) Ranges are SOFT: `appendMeasureField` shows a RECOMMENDED range you can expand past
+  (`recRange`); a value beyond it but still buildable gets a non-blocking amber nudge, and only a
+  genuinely-HARD limit/rule blocks — with its reason — via `hardBlockReason` (the relational
+  rules stay in the templates' `model_validator`s and surface at generate). (3) Overlays are
+  redrawn to look painted INTO the photo: `bowedPath`/`quadAt` bend the line with the surface,
+  `drawTube` layers a dark base + molten body + bright highlight with a blurred cast shadow
+  (`dim-cast`), `drawDimLine` adds foreshortened ticks + pin `drawNub` ends + outward arrows, and
+  `drawDimRing` wraps a diameter around the round feature like a band on a cylinder (bright near
+  arc + faint dashed far arc + the measured-diameter tube).
 - **web/style.css** — Styling for the test UI. **M3:** tab styling, the photo/canvas/SVG
   overlay layout, question rows, the IntentSpec JSON display. **M4:** the `.mismatch-card`
   / `.reconfirm-btn` cross-check styles. **M5:** the `.measure-field` (input + unit
@@ -651,6 +675,12 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   canvas box (gradient bg, grab cursor), the `.view-toggle` segmented control (`.seg`/`.seg.active`,
   `.expand-btn`), the fullscreen `#viewer-modal` + `.viewer-modal-bar`, the `.viewer-fallback`
   image/message, and the dashboard `.review-view` / `.review-view-box`.
+  **Measurement UX (M8):** the flat "ruler" overlay classes were replaced with a 3D "painted-on"
+  set — `.dim-cast` (blurred shadow), `.dim-tube-base`/`.dim-tube-body`/`.dim-tube-hi` (the
+  layered glowing tube, `.dim-depth` dashes a receding line), `.dim-tick`, `.dim-nub*` (end
+  pins), `.dim-ring-front`/`.dim-ring-back` (the diameter band), and a two-line chip
+  (`.dim-chip-name` over `.dim-chip-text`). Plus `.question-name` (the measurement's name on the
+  form field) and `.range-hint.soft` (the amber "outside the typical range" nudge).
   **Production UI:** fully rewritten as the dark "forge" theme — molten palette tokens
   (`--bg` near-black, `--ember`/`--molten`/`--flame` accents), vendored Anton + Space Grotesk
   `@font-face`, the ambient `.bg-embers` layer + `.ember` particles, the `.site-nav`/`.hero`/

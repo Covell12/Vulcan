@@ -296,15 +296,32 @@ function scheduleOverlayDraw() {
   else overlayImg.addEventListener("load", drawAllOverlays, { once: true });
 }
 
-// Arrowhead markers for the dimension lines, sized in pixels (userSpaceOnUse) so
-// they don't scale with stroke width. Both ends point OUTWARD like a real
-// engineering dimension.
+// A short human name for a measurement — the SAME label shown on the question
+// form, so an on-photo line and its form field read as the same thing. Prefers
+// a backend-supplied label, else prettifies the template param name.
+function dimLabel(question) {
+  if (question && question.label) return question.label;
+  const n = question && question.dim_name;
+  if (!n) return "";
+  return n
+    .replace(/_(mm|deg|cm|in)$/i, "")
+    .replace(/_/g, " ")
+    .trim()
+    .replace(/^\w/, (c) => c.toUpperCase());
+}
+
+// defs for the overlays: a soft Gaussian blur used for cast shadows (so a line
+// looks like it sits ON the surface), plus outward-pointing arrow caps. Markers
+// are in userSpaceOnUse px so they don't scale with stroke width.
 const OVERLAY_DEFS = `
-  <marker id="dim-arrow-end" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" refX="10" refY="7" orient="auto">
-    <path d="M2,2 L11,7 L2,12 Z" class="dim-arrowhead"/>
+  <filter id="dim-cast" x="-50%" y="-50%" width="200%" height="200%">
+    <feGaussianBlur in="SourceGraphic" stdDeviation="2.4"/>
+  </filter>
+  <marker id="dim-arrow-end" markerUnits="userSpaceOnUse" markerWidth="16" markerHeight="16" refX="11" refY="8" orient="auto">
+    <path d="M2,2 L13,8 L2,14 Z" class="dim-arrowhead"/>
   </marker>
-  <marker id="dim-arrow-start" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" refX="4" refY="7" orient="auto-start-reverse">
-    <path d="M2,2 L11,7 L2,12 Z" class="dim-arrowhead"/>
+  <marker id="dim-arrow-start" markerUnits="userSpaceOnUse" markerWidth="16" markerHeight="16" refX="5" refY="8" orient="auto-start-reverse">
+    <path d="M2,2 L13,8 L2,14 Z" class="dim-arrowhead"/>
   </marker>`;
 
 function drawAllOverlays() {
@@ -321,35 +338,85 @@ function drawAllOverlays() {
   for (const { q } of overlayDrawList) updateChipFromInput(q.question_id);
 }
 
-// Draw a dimension line between two pixel points, styled like a ruler laid on
-// the photo: a white legibility halo, evenly-spaced graduation ticks, end serifs
-// (witness marks), and outward arrowheads.
-function drawRulerLine(g, p0, p1, dashed) {
+// --- 3D-looking overlays: lines drawn INTO the photo -----------------------
+// Rather than a flat ruler, each dimension is rendered like it's painted ONTO
+// the surface: a gently bowed path (so it curves with the object), a layered
+// "tube" stroke (dark base + molten body + bright highlight) for roundness, a
+// soft cast shadow so it sits on the surface, foreshortened ticks, and pin-like
+// end nubs. Diameters wrap the round feature like a band around a cylinder.
+
+// A gently bowed quadratic path between two points, so the line reads as lying
+// on a (curved) surface instead of floating flat over the photo.
+function bowedPath(p0, p1, bow) {
   const dx = p1[0] - p0[0], dy = p1[1] - p0[1], len = Math.hypot(dx, dy) || 1;
   const nx = -dy / len, ny = dx / len; // unit perpendicular
+  const cx = (p0[0] + p1[0]) / 2 + nx * len * bow;
+  const cy = (p0[1] + p1[1]) / 2 + ny * len * bow;
+  return { d: `M ${p0[0]} ${p0[1]} Q ${cx} ${cy} ${p1[0]} ${p1[1]}`, ctrl: [cx, cy], len };
+}
 
-  g.appendChild(svgEl("line", { x1: p0[0], y1: p0[1], x2: p1[0], y2: p1[1], class: "dim-halo" }));
+// Position + unit tangent on a quadratic bezier at parameter t (for ticks).
+function quadAt(p0, c, p1, t) {
+  const u = 1 - t;
+  const x = u * u * p0[0] + 2 * u * t * c[0] + t * t * p1[0];
+  const y = u * u * p0[1] + 2 * u * t * c[1] + t * t * p1[1];
+  let tx = 2 * u * (c[0] - p0[0]) + 2 * t * (p1[0] - c[0]);
+  let ty = 2 * u * (c[1] - p0[1]) + 2 * t * (p1[1] - c[1]);
+  const tl = Math.hypot(tx, ty) || 1;
+  return { x, y, tx: tx / tl, ty: ty / tl };
+}
 
-  // Ruler graduation ticks (every 5th a little longer, like real gradations).
-  const ticks = Math.min(28, Math.max(6, Math.round(len / 20)));
-  for (let i = 1; i < ticks; i++) {
-    const px = p0[0] + dx * (i / ticks), py = p0[1] + dy * (i / ticks);
-    const h = i % 5 === 0 ? 6 : 3;
-    g.appendChild(svgEl("line", { x1: px - nx * h, y1: py - ny * h, x2: px + nx * h, y2: py + ny * h, class: "dim-grad" }));
+// Layered strokes that read as a rounded, glowing 3D tube on the surface, with
+// a soft blurred cast shadow offset down-right (as if lit from the upper left).
+function drawTube(g, d, dashed) {
+  g.appendChild(svgEl("path", { d, class: "dim-cast", filter: "url(#dim-cast)", transform: "translate(2.4 3.2)" }));
+  g.appendChild(svgEl("path", { d, class: dashed ? "dim-tube-base dim-depth" : "dim-tube-base" }));
+  g.appendChild(svgEl("path", { d, class: dashed ? "dim-tube-body dim-depth" : "dim-tube-body" }));
+  g.appendChild(svgEl("path", { d, class: "dim-tube-hi", transform: "translate(-0.6 -1)" }));
+}
+
+// A little "pin" stuck into the surface at an endpoint (shadow + bead + glint).
+function drawNub(g, p) {
+  g.appendChild(svgEl("ellipse", { cx: p[0] + 1.6, cy: p[1] + 3, rx: 4.6, ry: 2.4, class: "dim-nub-shadow", filter: "url(#dim-cast)" }));
+  g.appendChild(svgEl("circle", { cx: p[0], cy: p[1], r: 3.6, class: "dim-nub" }));
+  g.appendChild(svgEl("circle", { cx: p[0] - 0.9, cy: p[1] - 1.2, r: 1.3, class: "dim-nub-hi" }));
+}
+
+// A full dimension line between two pixel points, drawn as a 3D tube on the
+// surface with foreshortened ticks, outward arrow caps and end nubs.
+function drawDimLine(g, p0, p1, dashed) {
+  const bow = dashed ? 0.12 : 0.06; // depth lines recede harder, so bow more
+  const path = bowedPath(p0, p1, bow);
+  const n = Math.min(24, Math.max(6, Math.round(path.len / 22)));
+  for (let i = 1; i < n; i++) {
+    const t = i / n;
+    const s = quadAt(p0, path.ctrl, p1, t);
+    // ticks perpendicular to the local tangent; shrink toward the far end of a
+    // depth line so they read as receding along the surface.
+    const h = (i % 5 === 0 ? 6.5 : 3.5) * (dashed ? 1 - 0.45 * t : 1);
+    g.appendChild(svgEl("line", { x1: s.x + s.ty * h, y1: s.y - s.tx * h, x2: s.x - s.ty * h, y2: s.y + s.tx * h, class: "dim-tick" }));
   }
+  drawTube(g, path.d, dashed);
+  // Transparent stroke carrying the arrow markers (oriented along the curve).
+  g.appendChild(svgEl("path", { d: path.d, class: "dim-arrowline", "marker-start": "url(#dim-arrow-start)", "marker-end": "url(#dim-arrow-end)" }));
+  drawNub(g, p0);
+  drawNub(g, p1);
+}
 
-  const main = svgEl("line", {
-    x1: p0[0], y1: p0[1], x2: p1[0], y2: p1[1],
-    class: dashed ? "dim-line dim-depth" : "dim-line",
-    "marker-start": "url(#dim-arrow-start)",
-    "marker-end": "url(#dim-arrow-end)",
-  });
-  g.appendChild(main);
-
-  const s = 12; // end serifs (witness marks)
-  for (const p of [p0, p1]) {
-    g.appendChild(svgEl("line", { x1: p[0] - nx * s, y1: p[1] - ny * s, x2: p[0] + nx * s, y2: p[1] + ny * s, class: "dim-witness" }));
-  }
+// A diameter, drawn like a band wrapping a cylinder: a faint dashed FAR arc
+// (behind the object) + a bright NEAR arc + the measured diameter as a tube.
+function drawDimRing(g, cx, cy, rx, ry, rot) {
+  const ring = svgEl("g", { transform: `rotate(${rot} ${cx} ${cy})` });
+  const l = [cx - rx, cy], r = [cx + rx, cy];
+  const far = `M ${l[0]} ${l[1]} A ${rx} ${ry} 0 0 1 ${r[0]} ${r[1]}`; // top: behind
+  const near = `M ${l[0]} ${l[1]} A ${rx} ${ry} 0 0 0 ${r[0]} ${r[1]}`; // bottom: in front
+  ring.appendChild(svgEl("path", { d: far, class: "dim-ring-back" }));
+  ring.appendChild(svgEl("path", { d: near, class: "dim-cast", filter: "url(#dim-cast)", transform: "translate(2 3)" }));
+  ring.appendChild(svgEl("path", { d: near, class: "dim-ring-front" }));
+  g.appendChild(ring);
+  // The measured diameter across the front (endpoints rotated with the ellipse).
+  const a = (rot * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
+  drawDimLine(g, [cx - rx * ca, cy - rx * sa], [cx + rx * ca, cy + rx * sa], false);
 }
 
 function drawDimOverlay(question, dimension, W, H) {
@@ -364,35 +431,31 @@ function drawDimOverlay(question, dimension, W, H) {
     const cx = c[0] * W, cy = c[1] * H;
     const rx = (ov.rx != null ? ov.rx : 0.04) * W;
     const ry = (ov.ry != null ? ov.ry : ov.rx != null ? ov.rx : 0.04) * W;
-    const rot = ov.rotation || 0;
-    const xf = `rotate(${rot} ${cx} ${cy})`;
-    // Full circle/ellipse outline: a white halo under a crisp colored ring.
-    g.appendChild(svgEl("ellipse", { cx, cy, rx, ry, class: "dim-ellipse-halo", transform: xf }));
-    g.appendChild(svgEl("ellipse", { cx, cy, rx, ry, class: "dim-ellipse", transform: xf }));
-    // The measured diameter drawn as a ruler line across it (rotated endpoints).
-    const a = (rot * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
-    drawRulerLine(g, [cx - rx * ca, cy - rx * sa], [cx + rx * ca, cy + rx * sa], false);
-    mid = [cx, cy - ry - 15];
+    drawDimRing(g, cx, cy, rx, ry, ov.rotation || 0);
+    mid = [cx, cy - ry - 18];
     prefix = "⌀ "; // diameter symbol
   } else {
     const pts = ov.points && ov.points.length >= 2 ? ov.points : [[0.4, 0.5], [0.6, 0.5]];
     const p0 = [pts[0][0] * W, pts[0][1] * H];
     const p1 = [pts[pts.length - 1][0] * W, pts[pts.length - 1][1] * H];
-    drawRulerLine(g, p0, p1, kind === "dim_depth");
+    drawDimLine(g, p0, p1, kind === "dim_depth");
     const dx = p1[0] - p0[0], dy = p1[1] - p0[1], len = Math.hypot(dx, dy) || 1;
-    // Lift the chip slightly off the line so it doesn't cover the gradations.
-    mid = [(p0[0] + p1[0]) / 2 + (-dy / len) * 16, (p0[1] + p1[1]) / 2 + (dx / len) * 16];
+    // Lift the chip off the (bowed) line so it doesn't cover the ticks.
+    mid = [(p0[0] + p1[0]) / 2 + (-dy / len) * 22, (p0[1] + p1[1]) / 2 + (dx / len) * 22];
   }
 
+  // Two-line chip: the measurement NAME (from the form) + its live value/state.
   const chipG = svgEl("g", { class: "dim-chip" });
-  const rect = svgEl("rect", { rx: 5, ry: 5, class: "dim-chip-rect" });
-  const text = svgEl("text", { class: "dim-chip-text", "text-anchor": "middle", "dominant-baseline": "central" });
+  const rect = svgEl("rect", { rx: 6, ry: 6, class: "dim-chip-rect" });
+  const nameText = svgEl("text", { class: "dim-chip-name", "text-anchor": "middle" });
+  const valueText = svgEl("text", { class: "dim-chip-text", "text-anchor": "middle" });
   chipG.appendChild(rect);
-  chipG.appendChild(text);
+  chipG.appendChild(nameText);
+  chipG.appendChild(valueText);
   g.appendChild(chipG);
   overlaySvg.appendChild(g);
 
-  const chip = { group: chipG, rect, text, mid, dimension, prefix };
+  const chip = { group: chipG, rect, nameText, valueText, mid, dimension, prefix, name: dimLabel(question) };
   dimChips[question.question_id] = chip;
   // Click a chip to focus (edit) its input — the other half of the two-way bind.
   chipG.addEventListener("click", () => {
@@ -407,20 +470,29 @@ function drawDimOverlay(question, dimension, W, H) {
   setChip(chip, state.text, state.cls);
 }
 
-function setChip(chip, textStr, cls) {
-  chip.text.textContent = (chip.prefix || "") + (textStr || "?");
+// Size + place the two-line chip (name over value) and color it by state.
+function setChip(chip, valueStr, cls) {
+  chip.nameText.textContent = chip.name || "";
+  chip.valueText.textContent = (chip.prefix || "") + (valueStr || "?");
   chip.group.setAttribute("class", `dim-chip ${cls || ""}`);
-  const pad = 6;
-  const bb = chip.text.getBBox();
-  const w = Math.max(bb.width, 8) + pad * 2;
-  const h = bb.height + pad * 2;
+  const padX = 9, padY = 6, gap = 3;
+  const nb = chip.name ? chip.nameText.getBBox() : { width: 0, height: 0 };
+  const vb = chip.valueText.getBBox();
+  const nameH = chip.name ? nb.height : 0;
+  const w = Math.max(nb.width, vb.width, 10) + padX * 2;
+  const h = nameH + (chip.name ? gap : 0) + vb.height + padY * 2;
   const [mx, my] = chip.mid;
-  chip.text.setAttribute("x", mx);
-  chip.text.setAttribute("y", my);
+  const top = my - h / 2;
   chip.rect.setAttribute("x", mx - w / 2);
-  chip.rect.setAttribute("y", my - h / 2);
+  chip.rect.setAttribute("y", top);
   chip.rect.setAttribute("width", w);
   chip.rect.setAttribute("height", h);
+  if (chip.name) {
+    chip.nameText.setAttribute("x", mx);
+    chip.nameText.setAttribute("y", top + padY + nameH * 0.78);
+  }
+  chip.valueText.setAttribute("x", mx);
+  chip.valueText.setAttribute("y", top + padY + nameH + (chip.name ? gap : 0) + vb.height * 0.78);
 }
 
 // Live-update a chip from what's typed in its input (pending, not yet submitted).
@@ -437,16 +509,48 @@ function updateChipFromInput(questionId) {
   }
 }
 
-// The min/max (mm) the template accepts for a question's dimension, or null.
+// The bounds (hard min/max + soft recommended range + hard_reason) the template
+// exposes for a question's dimension, or null.
 function boundsFor(question) {
   if (!question || !question.dim_name) return null;
   return (currentIntent.param_bounds || {})[question.dim_name] || null;
 }
 
+// The soft "recommended" range (falls back to the hard range if none was given).
+function recRange(b) {
+  if (!b) return { lo: null, hi: null };
+  return {
+    lo: b.recommended_min != null ? b.recommended_min : b.minimum,
+    hi: b.recommended_max != null ? b.recommended_max : b.maximum,
+  };
+}
+
+// Why a value CAN'T be built (a hard limit / rule), or null if it's allowed.
+// Values merely outside the *recommended* range return null — they're allowed,
+// just nudged; only the hard min/max (with the template's reason) block.
+function hardBlockReasonForBounds(b, mm) {
+  if (mm == null) return null;
+  if (mm <= 0) return "must be greater than 0.";
+  if (!b) return null;
+  if (b.minimum != null && mm < b.minimum - 1e-9) {
+    return b.hard_reason || `can't go below ${trimNumber(b.minimum)} mm.`;
+  }
+  if (b.maximum != null && mm > b.maximum + 1e-9) {
+    return (
+      b.hard_reason ||
+      `this template builds up to ${trimNumber(b.maximum)} mm — for something bigger, use “Design this custom instead”.`
+    );
+  }
+  return null;
+}
+function hardBlockReason(question, mm) {
+  return hardBlockReasonForBounds(boundsFor(question), mm);
+}
+
 // A measurement input with a mm/cm/in unit selector (default = remembered
 // session unit), a live "8 in = 203.2 mm" dual display, and — when the template
-// constrains this dimension — the allowed range plus out-of-range flagging so a
-// too-large value is caught HERE, not with a confusing 422 at the join.
+// constrains this dimension — a RECOMMENDED range you can expand past (soft
+// nudge), while genuinely-hard limits/rules stay blocked with their reason.
 function appendMeasureField(parent, questionId, placeholder, bounds) {
   const wrap = document.createElement("div");
   wrap.className = "measure-field";
@@ -471,15 +575,18 @@ function appendMeasureField(parent, questionId, placeholder, bounds) {
   const dual = document.createElement("span");
   dual.className = "dual-display";
 
+  const rec = recRange(bounds);
+  const baseHint =
+    bounds && rec.lo != null && rec.hi != null
+      ? `recommended ${trimNumber(rec.lo)}–${trimNumber(rec.hi)} mm — you can go beyond`
+      : "";
   const hint = document.createElement("span");
   hint.className = "range-hint";
-  if (bounds) {
-    const lo = bounds.minimum != null ? trimNumber(bounds.minimum) : "…";
-    const hi = bounds.maximum != null ? trimNumber(bounds.maximum) : "…";
-    hint.textContent = `allowed range: ${lo}–${hi} mm`;
-  }
+  hint.textContent = baseHint;
 
-  // Keep the native min/max in the CURRENT unit; flag out-of-range values.
+  // Native min/max = the HARD limits (so the browser only stops truly-hard
+  // values), then classify: within recommended = quiet; past it but buildable =
+  // a soft amber nudge (still allowed); past the hard limit = red + the reason.
   const applyBounds = () => {
     if (!bounds) return;
     const u = unit.value;
@@ -487,13 +594,29 @@ function appendMeasureField(parent, questionId, placeholder, bounds) {
     else input.removeAttribute("min");
     if (bounds.maximum != null) input.max = trimNumber(fromMm(bounds.maximum, u));
     else input.removeAttribute("max");
+
     const mm = collectMm(questionId);
-    const bad =
-      mm != null &&
-      ((bounds.minimum != null && mm < bounds.minimum - 1e-9) ||
-        (bounds.maximum != null && mm > bounds.maximum + 1e-9));
-    input.classList.toggle("out-of-range", bad);
-    hint.classList.toggle("error", bad);
+    hint.classList.remove("error", "soft");
+    input.classList.remove("out-of-range");
+    if (mm == null) {
+      hint.textContent = baseHint;
+      return;
+    }
+    const hard = hardBlockReasonForBounds(bounds, mm);
+    if (hard) {
+      hint.textContent = hard;
+      hint.classList.add("error");
+      input.classList.add("out-of-range");
+      return;
+    }
+    const soft =
+      (rec.lo != null && mm < rec.lo - 1e-9) || (rec.hi != null && mm > rec.hi + 1e-9);
+    if (soft) {
+      hint.textContent = `${trimNumber(mm)} mm is outside the typical range — we'll still try to build it.`;
+      hint.classList.add("soft");
+    } else {
+      hint.textContent = baseHint;
+    }
   };
 
   // On every keystroke / unit change: dual display, the photo's dimension chip
@@ -535,6 +658,16 @@ function collectMm(questionId) {
 function renderQuestionRow(question, dimension) {
   const row = document.createElement("div");
   row.className = "question-row";
+
+  // The measurement's NAME (same label as its on-photo chip), so the form field
+  // and the line drawn into the image read as the same thing.
+  const name = dimLabel(question);
+  if (name) {
+    const nameEl = document.createElement("p");
+    nameEl.className = "question-name";
+    nameEl.textContent = name;
+    row.appendChild(nameEl);
+  }
 
   const prompt = document.createElement("p");
   prompt.className = "question-prompt";
@@ -653,7 +786,7 @@ submitAnswersBtn.addEventListener("click", () => {
   if (!currentIntent) return;
 
   const answers = [];
-  const outOfRange = [];
+  const blocked = [];
   for (const question of currentIntent.questions || []) {
     const input = document.getElementById(questionInputId(question.question_id));
     if (!input) continue; // deduped / already-confirmed questions render no input
@@ -661,10 +794,12 @@ submitAnswersBtn.addEventListener("click", () => {
     if (question.kind === "measure_mm") {
       const mm = collectMm(question.question_id); // converts cm/in -> mm
       if (mm === null) continue;
-      // Catch a value outside the template's range HERE, so the join can't 422.
-      const b = boundsFor(question);
-      if (b && ((b.minimum != null && mm < b.minimum - 1e-9) || (b.maximum != null && mm > b.maximum + 1e-9))) {
-        outOfRange.push(`${question.dim_name} (${trimNumber(mm)}mm; allowed ${b.minimum ?? "…"}–${b.maximum ?? "…"}mm)`);
+      // Only HARD limits/rules block; a value past the recommended range is
+      // allowed (the user can expand it). hardBlockReason returns null unless
+      // there's a real reason it can't build.
+      const reason = hardBlockReason(question, mm);
+      if (reason) {
+        blocked.push(`${dimLabel(question) || question.dim_name}: ${reason}`);
         continue;
       }
       answers.push({ question_id: question.question_id, measure_mm: mm });
@@ -675,11 +810,8 @@ submitAnswersBtn.addEventListener("click", () => {
     }
   }
 
-  if (outOfRange.length) {
-    setAnswersStatus(
-      `These are outside this design's allowed range — adjust them (or use "Design this custom instead" for a part that fits): ${outOfRange.join("; ")}.`,
-      true,
-    );
+  if (blocked.length) {
+    setAnswersStatus(`Can't use these values — ${blocked.join("; ")}`, true);
     return;
   }
 

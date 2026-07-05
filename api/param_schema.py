@@ -34,8 +34,15 @@ def _field_from_property(name: str, prop: dict[str, Any]) -> dict[str, Any]:
         "label": name.replace("_mm", " (mm)").replace("_", " ").strip().capitalize(),
         "type": field_type,
         "default": prop.get("default"),
+        # `minimum`/`maximum` are the HARD buildable limits (pydantic ge/le).
+        # `recommended_*` (from a Field's json_schema_extra) are the softer
+        # typical range the UI shows and lets the user expand past; `hard_reason`
+        # explains a limit that genuinely can't be crossed. All optional.
         "minimum": prop.get("minimum"),
         "maximum": prop.get("maximum"),
+        "recommended_min": prop.get("recommended_min"),
+        "recommended_max": prop.get("recommended_max"),
+        "hard_reason": prop.get("hard_reason"),
         "choices": choices,
         "description": prop.get("description", ""),
     }

@@ -244,13 +244,25 @@ def _attach_param_bounds(intent: dict[str, Any], spec: TemplateSpec) -> None:
     only fails at build time with a confusing 422."""
     bounds: dict[str, dict[str, Any]] = {}
     for field in form_fields_for(spec.params_model):
-        if field["type"] in ("number", "integer") and (
-            field.get("minimum") is not None or field.get("maximum") is not None
-        ):
-            bounds[field["name"]] = {
-                "minimum": field.get("minimum"),
-                "maximum": field.get("maximum"),
-            }
+        if field["type"] not in ("number", "integer"):
+            continue
+        has_any = any(
+            field.get(k) is not None
+            for k in ("minimum", "maximum", "recommended_min", "recommended_max")
+        )
+        if not has_any:
+            continue
+        # `minimum`/`maximum` are the HARD limits (expanding past them fails the
+        # build); `recommended_*` are the softer typical range the UI shows and
+        # lets the user push past with only a nudge; `hard_reason` explains a
+        # limit that genuinely can't be crossed (e.g. below min printable wall).
+        bounds[field["name"]] = {
+            "minimum": field.get("minimum"),
+            "maximum": field.get("maximum"),
+            "recommended_min": field.get("recommended_min"),
+            "recommended_max": field.get("recommended_max"),
+            "hard_reason": field.get("hard_reason"),
+        }
     intent["param_bounds"] = bounds
 
 

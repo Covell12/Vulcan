@@ -161,8 +161,9 @@ def cleanup_intents() -> Iterator[list[str]]:
 
 
 def test_param_bounds_attached_for_template(cleanup_intents):
-    """The intent exposes each numeric param's min/max so the UI can show the
-    allowed range and block an out-of-range value before the 422 join."""
+    """The intent exposes each numeric param's HARD min/max plus the softer
+    RECOMMENDED range, so the UI can show the typical range, let the user expand
+    past it, and only hard-block (with a reason) at the real buildable limit."""
     buf = io.BytesIO()
     Image.new("RGB", (64, 48), (200, 200, 200)).save(buf, "JPEG")
     with patch("api.intents.parse_intent", return_value=dict(OVERLAY_INTENT)):
@@ -174,8 +175,12 @@ def test_param_bounds_attached_for_template(cleanup_intents):
     body = r.json()
     cleanup_intents.append(body["intent_id"])
     bounds = body["param_bounds"]
-    # adapter_tube od_a_mm is Field(ge=6, le=120)
-    assert bounds["od_a_mm"] == {"minimum": 6, "maximum": 120}
+    # adapter_tube od_a_mm: hard ge=4/le=200, recommended 6-120 (expandable).
+    b = bounds["od_a_mm"]
+    assert b["minimum"] == 4 and b["maximum"] == 200
+    assert b["recommended_min"] == 6 and b["recommended_max"] == 120
+    # The recommended range must sit within the hard range.
+    assert b["minimum"] <= b["recommended_min"] <= b["recommended_max"] <= b["maximum"]
     assert set(bounds) >= {"od_a_mm", "id_a_mm", "od_b_mm", "id_b_mm"}
 
 

@@ -72,26 +72,47 @@ def _screw_hole_y_positions(
 class BracketShelfLParams(BaseModel):
     """Validated parameters for bracket_shelf_l. All lengths in millimeters."""
 
+    # `ge`/`le` are the HARD buildable limits; `recommended_min/max` (in
+    # json_schema_extra) are the softer typical range the UI shows and lets the
+    # user expand past. Relational rules (below) + DFM are the real gate.
     span_mm: float = Field(
         default=120,
-        ge=40,
-        le=300,
+        ge=20,
+        le=450,
         description="Length of each L leg (wall arm and shelf arm).",
+        json_schema_extra={"recommended_min": 40, "recommended_max": 300},
     )
     depth_mm: float = Field(
         default=40,
-        ge=15,
-        le=150,
+        ge=8,
+        le=300,
         description="Width of the bracket along the shelf edge (extrusion depth).",
+        json_schema_extra={"recommended_min": 15, "recommended_max": 150},
     )
     thickness_mm: float = Field(
-        default=4, ge=MIN_WALL_MM, le=12, description="Wall thickness of the L profile."
+        default=4,
+        ge=MIN_WALL_MM,
+        le=20,
+        description="Wall thickness of the L profile.",
+        json_schema_extra={
+            "recommended_min": MIN_WALL_MM,
+            "recommended_max": 12,
+            "hard_reason": f"can't go below the {MIN_WALL_MM} mm minimum printable wall.",
+        },
     )
     screw_size: Literal["#6", "#8", "#10"] = Field(
         default="#8", description="Wood screw size for wall-mounting holes."
     )
     screw_count: int = Field(
-        default=3, ge=2, le=6, description="Number of mounting holes in the wall arm."
+        default=3,
+        ge=2,
+        le=12,
+        description="Number of mounting holes in the wall arm.",
+        json_schema_extra={
+            "recommended_min": 2,
+            "recommended_max": 6,
+            "hard_reason": "need at least 2 holes for a stable wall mount.",
+        },
     )
     load_hint: Literal["light", "medium", "heavy"] = Field(
         default="medium",

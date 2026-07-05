@@ -63,17 +63,36 @@ class KnobApplianceParams(BaseModel):
         default="round",
         description="Bore shape: plain round, round-with-flat (D), or polygon-approximated spline.",
     )
+    # `ge`/`le` are the HARD buildable limits; `recommended_min/max` are the
+    # softer typical range the UI shows and lets the user expand past. The
+    # radial-wall and cap-wall rules (below) gate it against the real minimums.
     shaft_dia_mm: float = Field(
-        default=6, ge=3, le=15, description="Nominal control shaft diameter."
+        default=6,
+        ge=2,
+        le=30,
+        description="Nominal control shaft diameter.",
+        json_schema_extra={"recommended_min": 3, "recommended_max": 15},
     )
     shaft_depth_mm: float = Field(
-        default=12, ge=5, le=30, description="How far the bore extends into the knob."
+        default=12,
+        ge=3,
+        le=100,
+        description="How far the bore extends into the knob.",
+        json_schema_extra={"recommended_min": 5, "recommended_max": 30},
     )
     knob_dia_mm: float = Field(
-        default=32, ge=15, le=60, description="Outer diameter of the knob."
+        default=32,
+        ge=8,
+        le=200,
+        description="Outer diameter of the knob.",
+        json_schema_extra={"recommended_min": 15, "recommended_max": 60},
     )
     knob_height_mm: float = Field(
-        default=22, ge=10, le=40, description="Overall height of the knob."
+        default=22,
+        ge=5,
+        le=150,
+        description="Overall height of the knob.",
+        json_schema_extra={"recommended_min": 10, "recommended_max": 40},
     )
     grip_style: Literal["ribbed", "smooth"] = Field(
         default="ribbed",

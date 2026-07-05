@@ -47,29 +47,50 @@ MAX_PART_LENGTH_MM = 250.0
 class AdapterTubeParams(BaseModel):
     """Validated parameters for adapter_tube. All lengths in millimeters."""
 
+    # `ge`/`le` are the HARD buildable limits; `recommended_min/max` are the
+    # softer typical range the UI shows and lets the user expand past. The
+    # relational rules (id < od, wall >= MIN_WALL, total length <= 250) gate it.
     od_a_mm: float = Field(
-        default=20, ge=6, le=120, description="Outer diameter, end A."
+        default=20,
+        ge=4,
+        le=200,
+        description="Outer diameter, end A.",
+        json_schema_extra={"recommended_min": 6, "recommended_max": 120},
     )
     id_a_mm: float = Field(
-        default=14, ge=2, le=116, description="Inner (bore) diameter, end A."
+        default=14,
+        ge=1,
+        le=196,
+        description="Inner (bore) diameter, end A.",
+        json_schema_extra={"recommended_min": 2, "recommended_max": 116},
     )
     od_b_mm: float = Field(
-        default=30, ge=6, le=120, description="Outer diameter, end B."
+        default=30,
+        ge=4,
+        le=200,
+        description="Outer diameter, end B.",
+        json_schema_extra={"recommended_min": 6, "recommended_max": 120},
     )
     id_b_mm: float = Field(
-        default=22, ge=2, le=116, description="Inner (bore) diameter, end B."
+        default=22,
+        ge=1,
+        le=196,
+        description="Inner (bore) diameter, end B.",
+        json_schema_extra={"recommended_min": 2, "recommended_max": 116},
     )
     engagement_a_mm: float = Field(
         default=15,
-        ge=8,
-        le=100,
+        ge=4,
+        le=200,
         description="Length of the constant-diameter section at end A.",
+        json_schema_extra={"recommended_min": 8, "recommended_max": 100},
     )
     engagement_b_mm: float = Field(
         default=20,
-        ge=8,
-        le=100,
+        ge=4,
+        le=200,
         description="Length of the constant-diameter section at end B.",
+        json_schema_extra={"recommended_min": 8, "recommended_max": 100},
     )
     taper: bool = Field(
         default=True,

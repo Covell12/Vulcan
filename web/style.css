@@ -830,6 +830,14 @@ label.checkbox-field {
   border: 1px solid var(--line);
   border-radius: 12px;
 }
+.question-name {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--molten);
+  margin-bottom: 4px;
+}
 .question-prompt {
   font-size: 15px;
   font-weight: 600;
@@ -866,6 +874,10 @@ label.checkbox-field {
   flex: 1 1 100%;
   font-size: 12.5px;
   color: var(--faint);
+}
+/* Outside the recommended range but still buildable — a non-blocking nudge. */
+.range-hint.soft {
+  color: var(--warn);
 }
 .measure-field input.out-of-range,
 .out-of-range {
@@ -1233,56 +1245,96 @@ td.src-default {
 }
 
 /* ============================================================================
-   Dimension overlays (drawn over the user's photo — a glowing "ruler")
+   Dimension overlays — lines drawn INTO the photo like painted-on 3D rulers:
+   a layered "tube" stroke (dark base + molten body + bright highlight) with a
+   soft cast shadow, foreshortened ticks and pin-like end nubs.
    ========================================================================== */
-.dim-halo {
+.dim-cast {
   fill: none;
-  stroke: rgba(0, 0, 0, 0.55);
-  stroke-width: 5;
+  stroke: rgba(0, 0, 0, 0.5);
+  stroke-width: 6;
   stroke-linecap: round;
+  stroke-linejoin: round;
 }
-.dim-line {
+.dim-tube-base {
   fill: none;
-  stroke: var(--molten);
-  stroke-width: 2.25;
+  stroke: #661d02; /* deep ember — the shaded underside of the tube */
+  stroke-width: 6.5;
   stroke-linecap: round;
-  filter: drop-shadow(0 0 3px rgba(255, 106, 26, 0.9));
+  stroke-linejoin: round;
 }
-.dim-line.dim-depth {
-  stroke-dasharray: 7 5;
-  stroke: var(--ember-2);
+.dim-tube-body {
+  fill: none;
+  stroke: var(--ember);
+  stroke-width: 3.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 3px rgba(255, 120, 40, 0.9));
 }
-.dim-grad {
-  stroke: var(--molten);
-  stroke-width: 1.4;
+.dim-tube-hi {
+  fill: none;
+  stroke: rgba(255, 236, 190, 0.92); /* specular glint along the top of the tube */
+  stroke-width: 1.3;
   stroke-linecap: round;
 }
-.dim-witness {
-  stroke: var(--molten);
-  stroke-width: 2.25;
+.dim-tube-base.dim-depth,
+.dim-tube-body.dim-depth {
+  stroke-dasharray: 9 6; /* a receding (depth) line reads dashed */
+}
+.dim-tick {
+  stroke: rgba(255, 209, 94, 0.95);
+  stroke-width: 1.5;
   stroke-linecap: round;
+}
+.dim-arrowline {
+  fill: none;
+  stroke: none;
 }
 .dim-arrowhead {
   fill: var(--molten);
+  stroke: #661d02;
+  stroke-width: 0.5;
 }
-.dim-ellipse {
+.dim-nub-shadow {
+  fill: rgba(0, 0, 0, 0.5);
+}
+.dim-nub {
+  fill: var(--ember-2);
+  stroke: #661d02;
+  stroke-width: 1;
+}
+.dim-nub-hi {
+  fill: rgba(255, 240, 210, 0.95);
+}
+.dim-ring-back {
   fill: none;
-  stroke: var(--molten);
-  stroke-width: 2.25;
-  filter: drop-shadow(0 0 3px rgba(255, 106, 26, 0.9));
+  stroke: rgba(255, 139, 52, 0.45); /* the far side of the band, behind the object */
+  stroke-width: 2;
+  stroke-dasharray: 6 5;
+  stroke-linecap: round;
 }
-.dim-ellipse-halo {
-  fill: rgba(255, 106, 26, 0.08);
-  stroke: rgba(0, 0, 0, 0.55);
-  stroke-width: 5;
+.dim-ring-front {
+  fill: none;
+  stroke: var(--ember);
+  stroke-width: 3.4;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 3px rgba(255, 120, 40, 0.9));
 }
 .dim-chip {
   cursor: pointer;
 }
 .dim-chip-rect {
-  fill: rgba(12, 10, 15, 0.92);
+  fill: rgba(12, 10, 15, 0.9);
   stroke: var(--line-2);
   stroke-width: 1;
+}
+.dim-chip-name {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  fill: #b8b0c2;
 }
 .dim-chip-text {
   font-family: var(--font-sans);

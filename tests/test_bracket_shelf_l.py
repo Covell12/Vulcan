@@ -72,6 +72,26 @@ def test_out_of_range_params_rejected(overrides: dict):
         BracketShelfLParams(**{**VALID_PARAMS, **overrides})
 
 
+def test_expanded_beyond_recommended_still_builds():
+    """A value past the RECOMMENDED range but within the HARD range is accepted
+    and builds — the point of letting the user expand the range. span 350 is
+    beyond the recommended 300 but under the hard 450."""
+    params = BracketShelfLParams(**{**VALID_PARAMS, "span_mm": 350})
+    assert params.span_mm == 350
+    solid = build_bracket(params)
+    assert solid.val().Volume() > 0
+
+
+def test_recommended_range_exposed_in_schema():
+    """The pydantic schema carries the soft recommended range (json_schema_extra)
+    alongside the hard ge/le, so the API/UI can show both."""
+    props = BracketShelfLParams.model_json_schema()["properties"]
+    span = props["span_mm"]
+    assert span["minimum"] == 20 and span["maximum"] == 450  # hard
+    assert span["recommended_min"] == 40 and span["recommended_max"] == 300  # soft
+    assert props["thickness_mm"]["hard_reason"]  # physical floor carries a reason
+
+
 def test_thickness_too_large_for_span_rejected():
     with pytest.raises(ValidationError, match="thickness_mm"):
         BracketShelfLParams(**{**VALID_PARAMS, "span_mm": 40, "thickness_mm": 11})
