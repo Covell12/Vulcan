@@ -20,7 +20,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
 import templates_lib  # noqa: F401  (import side effect: populates the registry)
-from api.rendering import export_design, heal_mesh_file, render_preview
+from api.rendering import (
+    export_design,
+    heal_mesh_file,
+    mesh_body_count,
+    render_preview,
+    write_preview_mesh,
+)
 from templates_lib.registry import (
     EphemeralTemplateSpec,
     TemplateSpec,
@@ -161,22 +167,30 @@ def build_design(
     callouts = _callout_dicts(spec, params_obj, source_map)
     files = _produce_files(spec, params_obj, design_dir, callouts)
 
-    # Runtime manifold gate (M5.5): a part we hand to a printer must be a
-    # watertight, manifold solid. The per-template pytest suite proves this for
-    # DEFAULT params, but a live design runs USER-resolved params (and generated
-    # geometry), so we re-check the actually-exported mesh here and refuse to
-    # return files for a non-printable design. `heal_mesh_file` first tries a
-    # light, print-safe repair (and re-exports the healed STL) so a valid solid
-    # with tessellation artifacts isn't wrongly rejected; a genuinely broken mesh
-    # still fails. Fail closed: delete the half-baked export directory so no
-    # unbuildable STL/STEP can be downloaded.
-    if not heal_mesh_file(files["stl"]):
+    # Runtime printability gate (M5.5): a part we hand to a printer must be a
+    # watertight, manifold solid that is ALSO a SINGLE connected body — no
+    # floating/disjoint pieces (two disjoint closed bodies are each watertight,
+    # so watertightness alone doesn't catch a design that left an add-on unfused).
+    # The per-template pytest suite proves this for DEFAULT params, but a live
+    # design runs USER-resolved params (and generated geometry), so we re-check
+    # the actually-exported mesh here. `heal_mesh_file` first tries a light,
+    # print-safe repair (and re-exports the healed STL) so a valid solid with
+    # tessellation artifacts isn't wrongly rejected. Fail closed: delete the
+    # half-baked export directory so no unbuildable STL/STEP can be downloaded.
+    manifold_ok = heal_mesh_file(files["stl"])
+    bodies = mesh_body_count(files["stl"])
+    if not manifold_ok or bodies != 1:
         shutil.rmtree(design_dir, ignore_errors=True)
+        problem = (
+            "is not watertight/manifold"
+            if not manifold_ok
+            else f"has {bodies} disconnected pieces (floating parts) — it must be ONE connected solid"
+        )
         raise HTTPException(
             status_code=500,
             detail=(
-                f"generated mesh for template '{template_id}' is not watertight/"
-                "manifold and cannot be printed; design rejected."
+                f"generated mesh for template '{template_id}' {problem} and "
+                "cannot be printed; design rejected."
             ),
         )
 
@@ -186,6 +200,11 @@ def build_design(
         "stl": f"/exports/{design_id}/{files['stl'].name}",
         "preview_png": f"/exports/{design_id}/{files['preview_png'].name}",
     }
+    # A coarse, UNGATED preview mesh so the customer can view their part in 3D
+    # even while a pending freeform design's real STL/STEP/3MF stay download-gated.
+    view_mesh = write_preview_mesh(files["stl"])
+    if view_mesh is not None:
+        urls["view_stl"] = f"/exports/{design_id}/{view_mesh.name}"
     return design_id, urls
 
 

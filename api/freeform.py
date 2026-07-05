@@ -189,7 +189,7 @@ def dfm_check(stl_path: Path) -> tuple[bool, dict[str, Any]]:
     for it and founder review is the backstop. Stated in the security notes.)"""
     import trimesh
 
-    from api.rendering import heal_mesh_file
+    from api.rendering import heal_mesh_file, mesh_body_count
 
     # Try a light, print-safe repair first (and re-export the healed STL), so a
     # valid generated solid whose tessellation has hairline gaps / bad winding
@@ -198,6 +198,11 @@ def dfm_check(stl_path: Path) -> tuple[bool, dict[str, Any]]:
     mesh = trimesh.load(str(stl_path), force="mesh")
     faces = getattr(mesh, "faces", [])
     manifold = manifold and len(faces) > 0
+    # Must also be ONE connected body — no floating/disjoint pieces. (Two disjoint
+    # closed bodies are each watertight, so the manifold check alone misses an
+    # add-on the model placed but never fused to the part.)
+    bodies = mesh_body_count(stl_path)
+    connected = bodies == 1
     bounds = getattr(mesh, "bounds", None)
     if bounds is None:
         extent = [0.0, 0.0, 0.0]
@@ -207,12 +212,14 @@ def dfm_check(stl_path: Path) -> tuple[bool, dict[str, Any]]:
     within = 0 < max_extent <= MAX_BBOX_MM + 1e-6
     results = {
         "manifold": manifold,
+        "connected": connected,
+        "body_count": bodies,
         "within_size": within,
         "max_extent_mm": round(max_extent, 2),
         "bbox_mm": [round(x, 2) for x in extent],
         "size_ceiling_mm": MAX_BBOX_MM,
     }
-    return (manifold and within), results
+    return (manifold and connected and within), results
 
 
 def _dfm_feedback(dfm: dict[str, Any]) -> str:
@@ -220,6 +227,12 @@ def _dfm_feedback(dfm: dict[str, Any]) -> str:
     if not dfm["manifold"]:
         problems.append(
             "the solid is not watertight/manifold (must be one closed body)"
+        )
+    if not dfm.get("connected", True):
+        problems.append(
+            f"the part has {dfm.get('body_count', '?')} DISCONNECTED pieces (floating "
+            "parts) — everything must be UNIONed into ONE connected solid (fuse every "
+            "add-on to the body; make touching parts actually overlap in volume)"
         )
     if not dfm["within_size"]:
         problems.append(

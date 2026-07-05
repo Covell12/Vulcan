@@ -27,6 +27,7 @@ const resultPanel = document.getElementById("result-panel");
 const resultStatusLine = document.getElementById("result-status-line");
 const intentJsonEl = document.getElementById("intent-json");
 const generatePartBtn = document.getElementById("generate-part-btn");
+const regenerateBtn = document.getElementById("regenerate-btn");
 const generateStatusEl = document.getElementById("generate-status");
 const designResult = document.getElementById("design-result");
 const designPreviewImg = document.getElementById("design-preview-img");
@@ -1176,7 +1177,9 @@ function renderDesign(design) {
 
   // "The part": interactive 3D model (orbit/zoom/pan) + a dimensioned image.
   designPreviewImg.src = `${VulcanAPI.asset(design.files.preview_png)}?t=${t}`;
-  currentStlUrl = VulcanAPI.asset(design.files.stl);
+  // Prefer the ungated coarse preview mesh so 3D works even for a pending
+  // freeform part (whose real STL is download-gated → would 403 in the viewer).
+  currentStlUrl = VulcanAPI.asset(design.files.view_stl || design.files.stl);
   showPartView("3d");
 
   // Param summary table (value + source), built with DOM nodes.
@@ -1221,10 +1224,13 @@ function renderDesign(design) {
   }
 }
 
-generatePartBtn.addEventListener("click", async () => {
+// Build the design from the confirmed intent (the join). Shared by the first
+// "Forge my part" click and the "Regenerate" button.
+async function doGenerate(verb) {
   if (!currentIntent) return;
   generatePartBtn.disabled = true;
-  setGenerateStatus("Forging your part…", false);
+  if (regenerateBtn) regenerateBtn.disabled = true;
+  setGenerateStatus(`${verb} your part…`, false);
   try {
     const response = await VulcanAPI.joinDesign(currentIntent.intent_id, { fulfillment });
     if (!response.ok) throw new Error(await describeFetchError(response));
@@ -1235,9 +1241,30 @@ generatePartBtn.addEventListener("click", async () => {
         ? "we'll print and ship it to you"
         : "download your files below";
     setGenerateStatus(`Design ${design.design_id} ready — ${how}.`, false);
+    if (regenerateBtn) regenerateBtn.hidden = false; // offer a re-roll now
   } catch (err) {
     setGenerateStatus(`Error: ${errorText(err)}`, true);
   } finally {
     generatePartBtn.disabled = false;
+    if (regenerateBtn) regenerateBtn.disabled = false;
   }
-});
+}
+
+generatePartBtn.addEventListener("click", () => doGenerate("Forging"));
+
+// Regenerate: for a CUSTOM (freeform) part, re-roll the design — the model
+// authors a fresh attempt (useful if the last one had floating pieces or missed
+// the intent); you then re-confirm the measurements and forge it. For a template
+// part the geometry is deterministic, so it just rebuilds/re-renders in place.
+if (regenerateBtn) {
+  regenerateBtn.addEventListener("click", () => {
+    if (!currentIntent) return;
+    if (currentIntent.freeform) {
+      designResult.hidden = true;
+      regenerateBtn.hidden = true;
+      runFreeform(generateStatusEl, regenerateBtn); // new custom-design attempt
+    } else {
+      doGenerate("Regenerating");
+    }
+  });
+}

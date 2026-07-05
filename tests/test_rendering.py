@@ -54,6 +54,35 @@ def test_heal_mesh_rejects_a_single_open_face(tmp_path: Path):
     assert heal_mesh_file(stl) is False
 
 
+def test_body_count_single_vs_floating(tmp_path: Path):
+    from api.rendering import mesh_body_count
+
+    one = tmp_path / "one.stl"
+    trimesh.creation.box(extents=(10, 10, 10)).export(str(one))
+    assert mesh_body_count(one) == 1
+
+    # Two disjoint boxes: watertight overall, but TWO bodies (floating pieces).
+    a = trimesh.creation.box(extents=(5, 5, 5))
+    b = trimesh.creation.box(extents=(5, 5, 5))
+    b.apply_translation((40, 0, 0))
+    two = tmp_path / "two.stl"
+    trimesh.util.concatenate([a, b]).export(str(two))
+    assert mesh_is_watertight(two) is True  # each body is closed…
+    assert mesh_body_count(two) == 2  # …but it's not ONE connected solid
+
+
+def test_write_preview_mesh(tmp_path: Path):
+    from api.rendering import write_preview_mesh
+
+    stl = _bracket_stl(tmp_path)
+    preview = write_preview_mesh(stl)
+    assert preview is not None and preview.name == "part_preview.stl"
+    assert preview.exists() and preview.stat().st_size > 0
+    # It must still be a loadable mesh (used by the 3D viewer).
+    m = trimesh.load(str(preview), force="mesh")
+    assert len(m.faces) > 0
+
+
 def _bracket_stl(tmp_path: Path) -> Path:
     spec = get_template("bracket_shelf_l")
     solid = spec.build_fn(spec.params_model())

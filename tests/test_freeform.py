@@ -64,6 +64,18 @@ OVERSIZE_GEN = {
     **GOOD_GEN,
     "cadquery_code": "import cadquery as cq\ndef build(params):\n    return cq.Workplane('XY').box(400, 30, 20)\n",
 }
+# Two disjoint boxes: each is watertight, so the manifold check passes, but the
+# part is TWO connected bodies (floating pieces) — must be caught + rejected.
+FLOATING_GEN = {
+    **GOOD_GEN,
+    "cadquery_code": (
+        "import cadquery as cq\n"
+        "def build(params):\n"
+        "    a = cq.Workplane('XY').box(10, 10, 10)\n"
+        "    b = cq.Workplane('XY').box(10, 10, 10).translate((40, 0, 0))\n"
+        "    return a.union(b)\n"
+    ),
+}
 
 
 @pytest.fixture
@@ -167,6 +179,23 @@ def test_oversize_part_fails_dfm_and_is_reported(cleanup_generated):
     assert not r.ok
     assert all(a["stage"] in ("dfm",) for a in r.attempts)
     assert r.attempts[0]["dfm"]["within_size"] is False
+
+
+def test_floating_pieces_fail_dfm_and_are_reported(cleanup_generated):
+    """A design that leaves two disconnected bodies (floating pieces) is rejected
+    even though each body is watertight, and the feedback names the problem."""
+    with patch(
+        "api.freeform.codegen_provider.generate_template",
+        return_value=dict(FLOATING_GEN),
+    ):
+        r = ff.generate_and_register("two floating blocks", [])
+    if r.template_id:
+        cleanup_generated.append(r.template_id)
+    assert not r.ok
+    dfm = r.attempts[0]["dfm"]
+    assert dfm["manifold"] is True  # each body is watertight…
+    assert dfm["connected"] is False and dfm["body_count"] == 2  # …but 2 pieces
+    assert "disconnected" in ff._dfm_feedback(dfm).lower()
 
 
 def test_total_failure_logs_demand(tmp_path, monkeypatch):

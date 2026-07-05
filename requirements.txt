@@ -8,6 +8,7 @@ cadquery>=2.4
 trimesh
 manifold3d
 networkx
+fast-simplification
 numpy
 pillow
 matplotlib

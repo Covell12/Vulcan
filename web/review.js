@@ -85,7 +85,8 @@ function buildCardView(record) {
     return b;
   });
 
-  if (f.stl) {
+  const viewStl = f.view_stl || f.stl; // ungated coarse preview mesh when present
+  if (viewStl) {
     const b3d = el("button", { type: "button", className: "seg", textContent: "3D" });
     b3d.addEventListener("click", () => {
       if (dashViewer) dashViewer.dispose();
@@ -93,14 +94,14 @@ function buildCardView(record) {
       viewer.style.display = "";
       clearActive();
       b3d.classList.add("active");
-      Vulcan3D.create(viewer, VulcanAPI.asset(f.stl), {
+      Vulcan3D.create(viewer, VulcanAPI.asset(viewStl), {
         token: founderToken(),
         fallbackImg: VulcanAPI.asset(f.preview_png),
       }).then((v) => (dashViewer = v));
     });
     bar.append(b3d);
     const exp = el("button", { type: "button", className: "expand-btn", textContent: "⛶ Expand" });
-    exp.addEventListener("click", () => openCardModal(VulcanAPI.asset(f.stl)));
+    exp.addEventListener("click", () => openCardModal(VulcanAPI.asset(viewStl)));
     bar.append(exp);
   }
 
@@ -151,6 +152,9 @@ function dfmLine(dfm) {
   if (!dfm) return "no DFM data";
   const bits = [];
   bits.push(dfm.manifold ? "manifold ✓" : "NOT manifold ✗");
+  if (dfm.connected !== undefined) {
+    bits.push(dfm.connected ? "1 body ✓" : `${dfm.body_count} PIECES ✗`);
+  }
   bits.push(
     dfm.within_size
       ? `size OK (${dfm.max_extent_mm}mm ≤ ${dfm.size_ceiling_mm}mm)`

@@ -850,7 +850,7 @@ def test_design_join_precedence_end_to_end(cleanup_intents: list[str]):
     assert r.status_code == 200, r.text
     body = r.json()
 
-    assert set(body["files"]) == {"step", "threemf", "stl", "preview_png"}
+    assert set(body["files"]) == {"step", "threemf", "stl", "preview_png", "view_stl"}
     by_name = {p["name"]: p for p in body["params"]}
 
     assert (by_name["span_mm"]["value"], by_name["span_mm"]["source"]) == (
@@ -1130,6 +1130,20 @@ def test_join_produces_fetchable_composite(cleanup_intents: list[str]):
         shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
 
 
+def test_join_provides_ungated_view_mesh(cleanup_intents: list[str]):
+    """The join returns a coarse `view_stl` preview mesh, fetchable WITHOUT the
+    review token — so a customer can see their part in 3D even when the real STL
+    is download-gated."""
+    iid = _ready_intent_with_valid_photo(cleanup_intents, annotation=None)
+    body = client.post(f"/intents/{iid}/design").json()
+    try:
+        assert "view_stl" in body["files"], body["files"]
+        resp = client.get(body["files"]["view_stl"])  # no X-Review-Token
+        assert resp.status_code == 200 and len(resp.content) > 0
+    finally:
+        shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
+
+
 def test_join_defaults_fulfillment_to_files(cleanup_intents: list[str]):
     """An empty join body defaults the delivery choice to 'files'."""
     iid = _ready_intent_with_valid_photo(cleanup_intents, annotation=None)
@@ -1174,7 +1188,13 @@ def test_join_without_photo_has_no_composite(cleanup_intents: list[str]):
     body = client.post(f"/intents/{iid}/design").json()
     try:
         assert "composite" not in body["files"]
-        assert set(body["files"]) == {"step", "threemf", "stl", "preview_png"}
+        assert set(body["files"]) == {
+            "step",
+            "threemf",
+            "stl",
+            "preview_png",
+            "view_stl",
+        }
     finally:
         shutil.rmtree(EXPORTS_DIR / body["design_id"], ignore_errors=True)
 

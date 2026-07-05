@@ -865,6 +865,23 @@ label.checkbox-field {
 .fulfillment-choice {
   flex-wrap: wrap;
 }
+/* Regenerate: a subtle secondary action under the result. */
+#regenerate-btn {
+  margin-top: 4px;
+  align-self: flex-start;
+  color: var(--molten);
+  background: rgba(255, 106, 26, 0.08);
+  border: 1px solid var(--line-2);
+  box-shadow: none;
+}
+#regenerate-btn:hover:not(:disabled) {
+  border-color: var(--ember);
+  background: rgba(255, 106, 26, 0.16);
+  color: var(--molten);
+  transform: none;
+  filter: none;
+  box-shadow: none;
+}
 .review-fulfillment {
   font-size: 13.5px;
   color: var(--ink);

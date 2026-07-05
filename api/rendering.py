@@ -141,6 +141,48 @@ def mesh_is_watertight(stl_path: Path) -> bool:
     return bool(getattr(mesh, "is_watertight", False)) and len(mesh.faces) > 0
 
 
+def write_preview_mesh(stl_path: Path) -> Path | None:
+    """Write a coarse, decimated `part_preview.stl` next to the real STL for the
+    interactive 3D viewer. It's low-poly (good enough to orbit and judge the
+    shape, NOT a clean manufacturing deliverable), so it can be served UNGATED —
+    letting a customer see their part in 3D while the review gate keeps the
+    full-res STEP/3MF/STL locked until the founder approves. Returns the preview
+    path, or None if it couldn't be produced (the viewer then falls back)."""
+    out = stl_path.with_name("part_preview.stl")
+    try:
+        mesh = trimesh.load(str(stl_path), force="mesh")
+        if len(getattr(mesh, "faces", [])) == 0:
+            return None
+        if len(mesh.faces) > 800:
+            try:
+                target = max(300, len(mesh.faces) // 4)
+                mesh = mesh.simplify_quadric_decimation(face_count=target)
+            except Exception:
+                pass  # decimation lib unavailable → ship the mesh as-is
+        mesh.export(str(out))
+        return out
+    except Exception:
+        return None
+
+
+def mesh_body_count(stl_path: Path) -> int:
+    """How many DISCONNECTED bodies the exported mesh has. A real printable part
+    is ONE connected solid; >1 means floating/disjoint pieces (a common failure
+    of generated geometry — e.g. an add-on that was placed but never fused to the
+    body). Loaded with `force="mesh"` and split by connectivity."""
+    mesh = trimesh.load(str(stl_path), force="mesh")
+    if len(getattr(mesh, "faces", [])) == 0:
+        return 0
+    try:
+        return int(mesh.body_count)
+    except Exception:
+        # Fall back to an explicit connected-component split.
+        try:
+            return len(mesh.split(only_watertight=False))
+        except Exception:
+            return 1
+
+
 def heal_mesh_file(stl_path: Path) -> bool:
     """Manifold gate WITH automatic repair. Checks the exported mesh; if it isn't
     watertight, attempts a light, print-safe repair (merge coincident vertices,

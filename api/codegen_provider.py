@@ -140,12 +140,21 @@ wrong means the part won't fit. These will require the user to physically measur
 conservative and include every mating/clearance dimension.
 
 Design for FDM printing and our DFM rules:
+- FUNCTION FIRST: the part must ACTUALLY WORK for what was requested. Include the real mating/\
+clearance features (a bracket needs mounting holes AND a load-bearing arm; a clip needs a \
+springy jaw sized to grip; a bore must clear its shaft). Add a printing clearance (~0.2-0.4 mm) \
+to any feature that must fit onto/into another object. Think about how the part is used and \
+oriented before you write geometry.
+- ONE CONNECTED SOLID, NO FLOATING PIECES: the automatic check REJECTS any design with more \
+than one disconnected body. Every rib, boss, pointer, tab or add-on must be `.union()`-ed to \
+the main body AND actually overlap it in volume (a piece merely touching at a face/edge, or \
+placed near but not fused, counts as a separate floating body). Build the body, then cut holes, \
+then union add-ons; return one Workplane.
 - Minimum wall/feature thickness {_MIN_WALL_MM} mm (PETG). Never produce a wall thinner than this.
 - The whole part must fit within a {_MAX_BBOX_MM} x {_MAX_BBOX_MM} x {_MAX_BBOX_MM} mm bounding box; \
 choose parameter ranges so even the maximums stay within it.
 - Prefer a flat base and self-supporting geometry (overhangs steeper than ~45 degrees from \
 vertical need support — avoid them where you can). Avoid knife-edges and sub-1mm details.
-- Keep it a SINGLE solid. Give sensible min/max ranges so the geometry stays valid across them.
 - Deterministic: no randomness, no time, no I/O.
 
 Here are two exemplar templates for STYLE and structure (the build(params) contract, reading \

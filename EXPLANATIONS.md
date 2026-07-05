@@ -331,6 +331,15 @@ non-expert can follow: what it does, why it exists, what talks to it).
   rejected. `api/designs.build_design` and `api/freeform.dfm_check` both call it, so a valid
   generated solid whose tessellation had hairline gaps is no longer wrongly rejected as
   "not manifold". A no-op for already-watertight meshes (every template default).
+  **M9.1:** adds `mesh_body_count` (how many DISCONNECTED bodies the mesh has — a real part
+  is ONE connected solid; >1 = floating/disjoint pieces, which watertightness alone misses
+  because two disjoint closed bodies are each watertight) and `write_preview_mesh` (a coarse,
+  decimated `part_preview.stl` for the 3D viewer — low-poly enough to serve UNGATED so a
+  customer can orbit their part while the full-res STEP/3MF/STL stay download-gated; needs
+  `fast-simplification`, falls back to the full mesh if absent). `api/designs.build_design`
+  now rejects a design that isn't watertight OR isn't a single body, and emits a `view_stl`
+  URL for the preview mesh; `api/freeform.dfm_check` adds `connected`/`body_count` to its
+  report and its feedback so the self-repair loop is told to fuse floating pieces.
   **M5.5:** `render_preview` now pads any zero-thickness bounding-box axis before setting the
   3D limits, so a degenerate/flat mesh (e.g. a broken template producing a single planar
   face) renders instead of crashing matplotlib's projection — the manifold gate is what then
@@ -691,6 +700,11 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   change updates the toggle. (c) `makeZoomable` gives the composite + the question overlay
   scroll-to-zoom / drag-to-pan (double-click resets; clicks pass through at 1×). (d) A
   `#fulfillment-choice` (files vs ship) is captured at generate and sent to `joinDesign`.
+  **M9.1:** the 3D viewer now uses the UNGATED `files.view_stl` (coarse preview mesh) when
+  present, so 3D works for a pending freeform part whose real STL would 403. A `#regenerate-btn`
+  appears after a design is built: for a CUSTOM (freeform) part it re-rolls a fresh model attempt
+  (`runFreeform`), for a template it rebuilds via the shared `doGenerate()`. `review.js` shows the
+  DFM connectivity (`1 body ✓` / `N PIECES ✗`) and its viewer also prefers `view_stl`.
 - **web/style.css** — Styling for the test UI. **M3:** tab styling, the photo/canvas/SVG
   overlay layout, question rows, the IntentSpec JSON display. **M4:** the `.mismatch-card`
   / `.reconfirm-btn` cross-check styles. **M5:** the `.measure-field` (input + unit
