@@ -12,8 +12,11 @@ still keep it clearly a preview, not a photo of a finished part.
 
 Deliberately dependency-light: pure numpy + Pillow + trimesh, NO OpenGL /
 pyrender / GPU. It runs in the same headless API process as everything else.
-The projection is a textbook pinhole camera; triangles are painted back-to-
-front (painter's algorithm). That's plenty for a preview and keeps the math
+The projection is a textbook pinhole camera; triangles are rasterized with a
+per-pixel Z-BUFFER (api/raster, M10b) so self-occluding parts and assemblies
+render correctly (the old painter's algorithm mis-ordered them). M10b also adds
+a soft contact shadow, a lighting match to the scene, and — when a scene depth
+map is available — real occlusion by foreground objects. It keeps the math
 unit-testable (see tests/test_composite.py).
 
 HONESTY / v0 LIMITATIONS (surfaced to the user in the UI copy):
@@ -26,9 +29,10 @@ HONESTY / v0 LIMITATIONS (surfaced to the user in the UI copy):
   - PLACEMENT anchors the part's centroid at the annotation centroid (or the
     photo center). No contact/gravity solve.
   - OCCLUSION (part hidden behind foreground objects) needs a metric depth map of
-    the WHOLE scene, which requires a depth model; the current depth provider only
-    returns depth at the single circled point (for scale), so occlusion is not yet
-    applied — the part is drawn fully in front. A documented next step.
+    the WHOLE scene. When DEPTH_PROVIDER supplies one (api/depth_provider.
+    depth_map_mm), the z-buffer tests the part against it so foreground objects
+    correctly cover the part; with no depth map it degrades gracefully to drawing
+    the part fully in front (the honest default with DEPTH_PROVIDER=none).
 Treat the preview as "about this big, about here", not a measurement.
 """
 
@@ -42,6 +46,8 @@ from typing import Any
 import numpy as np
 import trimesh
 from PIL import Image, ImageDraw
+
+from api import raster
 
 # Assumed horizontal field of view when the photo carries no EXIF focal length.
 # Matches api/depth_provider._ASSUMED_HFOV_DEG so both subsystems make the same
@@ -282,22 +288,101 @@ def _load_photo(photo_bytes: bytes) -> tuple[Image.Image, float | None]:
     return img, exif_focal
 
 
-def _face_shades(verts_cam: np.ndarray, faces: np.ndarray) -> np.ndarray:
-    """A 0..1 brightness per face from simple flat shading: normals oriented
-    toward the camera, lit from the upper-left-front, so the solid reads as a 3D
-    object rather than a flat blob. Pure numpy — no lighting model dependency."""
-    tris = verts_cam[faces]  # (F,3,3)
-    n = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
-    nl = np.linalg.norm(n, axis=1, keepdims=True)
-    nl[nl == 0] = 1.0
-    n = n / nl
-    centers = tris.mean(axis=1)
-    # Flip normals that point away from the camera (origin), so all face the viewer.
-    away = np.sum(n * centers, axis=1) > 0
-    n[away] = -n[away]
-    facing = np.clip(-n[:, 2], 0.0, 1.0)  # 1 = square to camera
-    left_light = np.clip(-n[:, 0], 0.0, 1.0)  # a touch brighter on left-facing
-    return np.clip(0.42 + 0.5 * facing + 0.14 * left_light, 0.0, 1.0)
+# Luminance the ember base color is tuned for; the lighting match scales part
+# brightness toward the scene's luminance around this reference.
+_REF_LUM = 150.0
+_BRIGHTNESS_CLAMP = (0.6, 1.3)
+_MAX_TINT = 0.10  # at most a ±10% warm/cool channel nudge — tint, don't repaint
+
+
+def _luminance(rgb: np.ndarray) -> float:
+    return float(0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2])
+
+
+def scene_lighting(
+    photo_arr: np.ndarray, anchor_uv: tuple[float, float], radius_px: float
+) -> tuple[float, tuple[float, float, float]]:
+    """Estimate (brightness_scale, tint) from the photo's pixels around the anchor.
+    brightness_scale = clamp(scene median luminance / reference, 0.6..1.3);
+    tint nudges the part's channels toward the scene's warm/cool cast (≤±10%), so
+    the part sits in the scene's light WITHOUT losing its ember identity."""
+    H, W = photo_arr.shape[:2]
+    u, v = anchor_uv
+    r = max(8.0, radius_px)
+    x0, x1 = max(0, int(u - r)), min(W, int(u + r))
+    y0, y1 = max(0, int(v - r)), min(H, int(v + r))
+    patch = photo_arr[y0:y1, x0:x1].reshape(-1, 3)
+    if patch.size == 0:
+        return 1.0, (1.0, 1.0, 1.0)
+    med = np.median(patch, axis=0).astype(float)
+    lum = _luminance(med)
+    brightness = float(np.clip(lum / _REF_LUM, *_BRIGHTNESS_CLAMP))
+    gray = float(med.mean()) or 1.0
+    warm = float(np.clip((med[0] - med[2]) / gray, -0.6, 0.6))  # >0 warm, <0 cool
+    tint = (1.0 + _MAX_TINT * warm, 1.0, 1.0 - _MAX_TINT * warm)
+    return brightness, tint
+
+
+def _adjust_color(
+    rgb: tuple[int, int, int], brightness: float, tint: tuple[float, float, float]
+) -> np.ndarray:
+    arr = np.array(rgb, dtype=float) * brightness * np.array(tint, dtype=float)
+    return np.clip(arr, 0, 255)
+
+
+def _shaded_face_colors(
+    verts_cam: np.ndarray,
+    faces: np.ndarray,
+    lit: np.ndarray,
+    shadow: np.ndarray,
+) -> np.ndarray:
+    """Per-face RGB (F,3): flat-shaded interpolation between the (adjusted) shadow
+    and lit ember colors by each face's 0..1 brightness."""
+    shades = raster.face_shades(verts_cam, faces)[:, None]  # (F,1)
+    return shadow[None, :] + (lit - shadow)[None, :] * shades
+
+
+def _contact_shadow(
+    alpha: np.ndarray, mounting: str, size: tuple[int, int]
+) -> Image.Image:
+    """A soft dark contact shadow as an RGBA layer, from the part's silhouette:
+    a surface mount drops a flattened blurred ellipse BELOW the part; a wall mount
+    casts the blurred silhouette BEHIND (down-right). Opacity scales with how much
+    of the frame the part fills. Blur via Pillow's GaussianBlur."""
+    from PIL import ImageChops, ImageFilter
+
+    W, H = size
+    solid = alpha > 20
+    ys, xs = np.where(solid)
+    if xs.size == 0:
+        return Image.new("RGBA", size, (0, 0, 0, 0))
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+    frac = float(solid.mean())
+    opacity = int(np.clip(60 + 220 * frac, 45, 125))
+    blur = max(4.0, 0.018 * max(W, H))
+
+    shadow_l = Image.new("L", size, 0)
+    if mounting == "wall":
+        # Cast the silhouette itself behind the part (offset + blurred).
+        sil = Image.fromarray(np.clip(alpha, 0, 255).astype(np.uint8), mode="L")
+        dx, dy = int(0.02 * W), int(0.03 * H)
+        cast = ImageChops.offset(sil, dx, dy)
+        cast = cast.point(lambda p: int(p * opacity / 255))
+        shadow_l = cast.filter(ImageFilter.GaussianBlur(blur))
+    else:
+        # Surface: a flattened ellipse on the ground just below the part.
+        width = x1 - x0
+        rx = max(6.0, width * 0.55)
+        ry = max(3.0, width * 0.16)
+        ccx = (x0 + x1) / 2.0
+        ccy = y1 + width * 0.03
+        d = ImageDraw.Draw(shadow_l)
+        d.ellipse([ccx - rx, ccy - ry, ccx + rx, ccy + ry], fill=opacity)
+        shadow_l = shadow_l.filter(ImageFilter.GaussianBlur(blur))
+
+    dark = Image.new("RGBA", size, (12, 8, 6, 0))
+    dark.putalpha(shadow_l)
+    return dark
 
 
 def _rasterize(
@@ -308,39 +393,51 @@ def _rasterize(
     fy: float,
     cx: float,
     cy: float,
+    *,
+    mounting: str = "surface",
+    brightness: float = 1.0,
+    tint: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    scene_depth_mm: np.ndarray | None = None,
 ) -> Image.Image:
-    """Paint the mesh as an OPAQUE, flat-shaded solid onto `base`, back-to-front
-    (so nearer faces cover farther ones), then add a glowing orange halo around
-    its silhouette. Faces with any vertex at or behind the camera are skipped."""
+    """Z-buffer the mesh as an OPAQUE ember solid onto `base`: lighting-matched
+    base color, a soft contact shadow beneath/behind it, optional scene occlusion,
+    and a glowing orange halo around the silhouette. Correct for self-occluding
+    parts and assemblies (per-pixel z-test, not painter's order)."""
     from PIL import ImageFilter
 
-    verts_2d = pinhole_project(verts_cam, fx, fy, cx, cy)
-    face_z = verts_cam[faces][:, :, 2]  # (F,3) camera depth per face vertex
+    W, H = base.size
+    lit = _adjust_color(_PART_RGB, brightness, tint)
+    shadow = _adjust_color(_PART_SHADOW_RGB, brightness, tint)
+    face_rgb = _shaded_face_colors(verts_cam, faces, lit, shadow)
 
-    keep = np.all(face_z > 1e-6, axis=1)
-    order = np.argsort(-face_z.mean(axis=1))
-    order = order[keep[order]]
+    rgba = raster.render_mesh(
+        verts_cam,
+        faces,
+        face_rgb,
+        fx,
+        fy,
+        cx,
+        cy,
+        W,
+        H,
+        supersample=2,
+        scene_depth=scene_depth_mm,
+    )
+    part = Image.fromarray(rgba, mode="RGBA")
+    alpha_arr = rgba[..., 3]
 
-    shades = _face_shades(verts_cam, faces)
-    part = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(part)
-    lit = np.array(_PART_RGB, dtype=float)
-    shadow = np.array(_PART_SHADOW_RGB, dtype=float)
-    for fi in order:
-        tri = verts_2d[faces[fi]]
-        poly = [(float(p[0]), float(p[1])) for p in tri]
-        s = float(shades[fi])
-        col = tuple(int(round(shadow[i] + (lit[i] - shadow[i]) * s)) for i in range(3))
-        draw.polygon(poly, fill=col + (255,), outline=_EDGE_RGBA)
+    # Soft contact shadow, composited UNDER the part but over the photo.
+    contact = _contact_shadow(alpha_arr, mounting, (W, H))
 
     # Glowing orange border: blur the part's silhouette and colour the spill.
-    alpha = part.split()[3]
-    halo = alpha.filter(ImageFilter.GaussianBlur(_GLOW_RADIUS_PX))
+    alpha_img = part.split()[3]
+    halo = alpha_img.filter(ImageFilter.GaussianBlur(_GLOW_RADIUS_PX))
     glow = Image.new("RGBA", base.size, _GLOW_RGB + (0,))
     glow.putalpha(halo)
 
     out = base.convert("RGBA")
-    out = Image.alpha_composite(out, glow)  # halo sits under the part
+    out = Image.alpha_composite(out, contact)  # ground shadow first
+    out = Image.alpha_composite(out, glow)  # halo under the part
     out = Image.alpha_composite(out, glow)  # doubled → a brighter, real "glow"
     out = Image.alpha_composite(out, part)  # opaque part on top
     return out.convert("RGB")
@@ -351,6 +448,18 @@ def _rasterize(
 # ---------------------------------------------------------------------------
 
 
+def _prep_scene_depth(depth: np.ndarray, W: int, H: int) -> np.ndarray | None:
+    """Nearest-resize a scene depth map to the composited photo's (H,W). Assumes
+    the map is already in the photo's orientation (the caller supplies it for the
+    same, EXIF-corrected frame). Returns None if it isn't a usable 2D map."""
+    arr = np.asarray(depth, dtype=float)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    if arr.ndim != 2 or arr.size == 0:
+        return None
+    return raster._resize_depth(arr, H, W)
+
+
 def render_composite(
     photo_bytes: bytes,
     stl_path: Path,
@@ -359,11 +468,16 @@ def render_composite(
     category: str | None,
     annotation: Any = None,
     depth_mm: float | None = None,
+    scene_depth_mm: np.ndarray | None = None,
 ) -> Path:
     """Render `stl_path`'s geometry into `photo_bytes` and write a PNG to
     `out_path`. Returns out_path. Raises on unreadable inputs — the caller (the
     design join) treats the composite as best-effort and swallows failures so a
-    preview problem never blocks delivering the actual part files."""
+    preview problem never blocks delivering the actual part files.
+
+    `scene_depth_mm` (optional HxW metric depth of the WHOLE photo, mm) enables
+    real occlusion: foreground objects nearer than the part correctly cover it.
+    Absent → the part is drawn fully in front (graceful default)."""
     mesh = trimesh.load(str(stl_path), force="mesh")
     verts = np.asarray(mesh.vertices, dtype=float)
     faces = np.asarray(mesh.faces)
@@ -391,10 +505,34 @@ def render_composite(
             z_anchor,
         ]
     )
-    rotation = canonical_rotation(mounting_for_category(category))
+    mounting = mounting_for_category(category)
+    rotation = canonical_rotation(mounting)
     verts_cam = transform_to_camera(verts - part_center, rotation, anchor_cam)
 
-    result = _rasterize(photo, verts_cam, faces, fx, fy, cx, cy)
+    # Lighting match: tune the part's brightness/tint to the scene around the
+    # anchor so it sits in the photo's light (ember identity preserved).
+    photo_arr = np.asarray(photo, dtype=float)
+    brightness, tint = scene_lighting(
+        photo_arr, (anchor_u, anchor_v), radius_px=0.12 * max(W, H)
+    )
+
+    scene_depth = (
+        _prep_scene_depth(scene_depth_mm, W, H) if scene_depth_mm is not None else None
+    )
+
+    result = _rasterize(
+        photo,
+        verts_cam,
+        faces,
+        fx,
+        fy,
+        cx,
+        cy,
+        mounting=mounting,
+        brightness=brightness,
+        tint=tint,
+        scene_depth_mm=scene_depth,
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     result.save(str(out_path))
     # Also save the plain (EXIF-corrected, downscaled) photo next to the

@@ -25,11 +25,16 @@ from api.depth_provider import (
     _region_size_mm,
     _sample_depth,
     check_provider_configured,
+    depth_map_mm,
     estimate_scale,
     get_model_name,
     get_provider_name,
 )
 from api.photo import PhotoInput
+
+
+def _photo() -> PhotoInput:
+    return PhotoInput(content=b"\xff\xd8\xff", mime_type="image/jpeg")
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +65,37 @@ def test_default_and_overridden_model(monkeypatch):
 
 def test_check_none_never_needs_anything():
     check_provider_configured("none")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Full scene depth map (M10b occlusion)
+# ---------------------------------------------------------------------------
+
+
+def test_depth_map_mm_none_without_provider():
+    # Default provider is "none" → no map (occlusion degrades to no-occlusion).
+    assert depth_map_mm(_photo()) is None
+
+
+def test_depth_map_mm_returns_mm_and_marks_invalid_as_inf(monkeypatch):
+    monkeypatch.setenv("DEPTH_PROVIDER", "replicate")
+    # meters map: one valid pixel (2 m), one zero, one NaN.
+    meters = np.array([[2.0, 0.0], [np.nan, 1.5]])
+    with patch(
+        "api.depth_provider._run_depth_model", return_value=(meters, 800.0, 800.0)
+    ):
+        out = depth_map_mm(_photo())
+    assert out is not None
+    assert out[0, 0] == 2000.0 and out[1, 1] == 1500.0  # meters → mm
+    assert np.isinf(out[0, 1]) and np.isinf(
+        out[1, 0]
+    )  # invalid → +inf (never occludes)
+
+
+def test_depth_map_mm_swallows_failure(monkeypatch):
+    monkeypatch.setenv("DEPTH_PROVIDER", "replicate")
+    with patch("api.depth_provider._run_depth_model", side_effect=RuntimeError("boom")):
+        assert depth_map_mm(_photo()) is None  # never raises
 
 
 def test_check_replicate_without_token_raises(monkeypatch):

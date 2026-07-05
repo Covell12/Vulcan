@@ -164,6 +164,28 @@ def depth_mm_at(photo: PhotoInput, x_norm: float, y_norm: float) -> float | None
         return None
 
 
+def depth_map_mm(photo: PhotoInput):
+    """Best-effort FULL-SCENE metric depth map (HxW, millimetres) for the whole
+    photo — used by the ghost composite (api/composite.py) to occlude the part
+    behind nearer foreground objects. Invalid/background pixels come back as +inf
+    (they never occlude). Returns None whenever a depth map is unavailable
+    (DEPTH_PROVIDER=none or any model failure); like depth_mm_at it NEVER raises,
+    because occlusion is a pure preview nicety that must never break the join."""
+    if get_provider_name() != "replicate":
+        return None
+    try:
+        import numpy as np
+
+        depth_map, _fx, _fy = _run_depth_model(photo)
+        arr = np.asarray(depth_map, dtype=float)
+        if arr.ndim != 2 or arr.size == 0:
+            return None
+        valid = np.isfinite(arr) & (arr > 0)
+        return np.where(valid, arr * 1000.0, np.inf)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Pure metric geometry (no network, unit-tested against synthetic depth maps)
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ from api.codegen_provider import CodegenProviderError
 from api.depth_provider import (
     DepthProviderError,
     ScaleRegion,
+    depth_map_mm,
     depth_mm_at,
     estimate_scale,
 )
@@ -1002,6 +1003,21 @@ def _bounded_depth_mm_at(
         executor.shutdown(wait=False)
 
 
+def _bounded_depth_map(
+    photo: PhotoInput, deadline_s: float = _COMPOSITE_DEPTH_DEADLINE_S
+):
+    """`depth_map_mm` (full scene depth for occlusion) with a hard deadline. None
+    on timeout or when unavailable (DEPTH_PROVIDER=none returns instantly). Never
+    blocks the join — occlusion is a best-effort preview nicety."""
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        return executor.submit(depth_map_mm, photo).result(timeout=deadline_s)
+    except FuturesTimeout:
+        return None
+    finally:
+        executor.shutdown(wait=False)
+
+
 def _render_ghost_composite(
     intent: dict[str, Any], spec: TemplateSpec, design_id: str
 ) -> str | None:
@@ -1024,15 +1040,16 @@ def _render_ghost_composite(
         # Optional: true metric depth at the circled point (usually unavailable
         # with DEPTH_PROVIDER=none; render_composite then infers scale itself).
         # Deadline-bounded so a slow replicate backend can't hang the join.
-        centroid = composite.annotation_centroid(annotation) or (0.5, 0.5)
-        depth_mm = _bounded_depth_mm_at(
-            PhotoInput(
-                content=photo_bytes,
-                mime_type=photo_ref.get("mime_type") or "image/jpeg",
-            ),
-            centroid[0],
-            centroid[1],
+        photo_input = PhotoInput(
+            content=photo_bytes,
+            mime_type=photo_ref.get("mime_type") or "image/jpeg",
         )
+        centroid = composite.annotation_centroid(annotation) or (0.5, 0.5)
+        depth_mm = _bounded_depth_mm_at(photo_input, centroid[0], centroid[1])
+
+        # Optional: a FULL scene depth map for real occlusion (foreground objects
+        # cover the part). None with DEPTH_PROVIDER=none → part drawn in front.
+        scene_depth = _bounded_depth_map(photo_input)
 
         # A multi-part assembly is merged into assembly.stl; a single part is
         # part.stl. Show the whole assembly in the photo either way.
@@ -1048,6 +1065,7 @@ def _render_ghost_composite(
             category=spec.category,
             annotation=annotation,
             depth_mm=depth_mm,
+            scene_depth_mm=scene_depth,
         )
         return f"/exports/{design_id}/{out_path.name}"
     except Exception as e:  # noqa: BLE001 — preview is strictly best-effort

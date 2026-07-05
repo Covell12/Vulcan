@@ -207,21 +207,129 @@ def test_render_composite_actually_draws_the_ghost(tmp_path: Path):
 
 
 def test_render_composite_is_opaque_ember(tmp_path: Path):
-    """The part is drawn OPAQUE in the ember family (not a translucent blue
-    smear): the photo has meaningful solid orange/ember pixels, and there's a
-    glowing border of intermediate orange around it."""
+    """The part is drawn OPAQUE and ORANGE (ember family, not a translucent blue
+    smear). The lighting match may DIM it toward a dark scene, so we assert the
+    hue ordering (r > g > b, red clearly dominant) rather than a fixed brightness —
+    ember identity must survive the tint/dim."""
     stl = _bracket_stl(tmp_path)
     out = tmp_path / "composite.png"
-    # A flat gray photo so any orange comes only from the part + its glow.
     photo = io.BytesIO()
     Image.new("RGB", (600, 450), (70, 70, 74)).save(photo, "JPEG")
     ann = [{"photo_index": 0, "points": [[0.35, 0.4], [0.65, 0.62]]}]
     C.render_composite(photo.getvalue(), stl, out, category="bracket", annotation=ann)
     arr = np.asarray(Image.open(out).convert("RGB"), dtype=int)
     r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-    # Opaque ember body: strong red, mid green, low blue (unlike the old blue ghost).
-    ember = (r > 170) & (g > 55) & (g < 175) & (b < 110)
+    # Opaque ember body: orange, red clearly dominant over blue, g between.
+    ember = (r > 120) & (r - b > 55) & (g < r) & (g > b)
     assert ember.sum() > 400, "expected an opaque ember-coloured part"
-    # A glow halo: orange-ish pixels that are NOT the flat gray background.
-    glow = (r > 110) & (r - b > 40) & ~ember
-    assert glow.sum() > 200, "expected a glowing orange border around the part"
+    # A brighter glow halo (the glow is ember-identity, NOT dimmed by lighting).
+    glow = (r > 175) & (r - b > 70)
+    assert glow.sum() > 120, "expected a glowing orange border around the part"
+
+
+# ---------------------------------------------------------------------------
+# M10b: scene occlusion, lighting match, contact shadow
+# ---------------------------------------------------------------------------
+
+
+def _ember_mask(arr: np.ndarray) -> np.ndarray:
+    r, g, b = (
+        arr[:, :, 0].astype(int),
+        arr[:, :, 1].astype(int),
+        arr[:, :, 2].astype(int),
+    )
+    return (r > 120) & (r - b > 45) & (g < r)
+
+
+def test_scene_occlusion_hides_occluded_region(tmp_path: Path):
+    """With a scene depth map whose LEFT half is nearer than the part, the part's
+    left half is occluded (mostly gone) while the right half stays visible."""
+    stl = _bracket_stl(tmp_path)
+    ann = [{"photo_index": 0, "points": [[0.4, 0.4], [0.62, 0.62]]}]
+    photo = _photo_bytes(600, 450)
+
+    C.render_composite(
+        photo, stl, tmp_path / "noocc.png", category="bracket", annotation=ann
+    )
+    base = _ember_mask(np.asarray(Image.open(tmp_path / "noocc.png").convert("RGB")))
+
+    H, W = 450, 600
+    depth = np.full((H, W), np.inf)
+    depth[:, : W // 2] = 1.0  # 1 mm — nearer than the part → occludes the left half
+    C.render_composite(
+        photo,
+        stl,
+        tmp_path / "occ.png",
+        category="bracket",
+        annotation=ann,
+        scene_depth_mm=depth,
+    )
+    occ = _ember_mask(np.asarray(Image.open(tmp_path / "occ.png").convert("RGB")))
+
+    half = W // 2
+    assert base[:, :half].sum() > 500  # there WAS a left-half part to hide
+    assert occ[:, :half].sum() < 0.25 * base[:, :half].sum()  # left half occluded
+    assert occ[:, half:].sum() > 0.6 * base[:, half:].sum()  # right half kept
+
+
+def test_scene_occlusion_absent_degrades_to_full_front(tmp_path: Path):
+    """No depth map → the part is drawn fully in front (graceful default)."""
+    stl = _bracket_stl(tmp_path)
+    ann = [{"photo_index": 0, "points": [[0.4, 0.4], [0.62, 0.62]]}]
+    out = tmp_path / "c.png"
+    C.render_composite(
+        _photo_bytes(),
+        stl,
+        out,
+        category="bracket",
+        annotation=ann,
+        scene_depth_mm=None,
+    )
+    assert _ember_mask(np.asarray(Image.open(out).convert("RGB"))).sum() > 500
+
+
+def test_lighting_match_dims_part_in_dark_scene(tmp_path: Path):
+    """The same part is dimmer in a dark scene than a bright one (brightness is
+    matched to the photo), while staying ember."""
+    stl = _bracket_stl(tmp_path)
+    ann = [{"photo_index": 0, "points": [[0.4, 0.4], [0.62, 0.62]]}]
+
+    def median_ember_r(bg):
+        buf = io.BytesIO()
+        Image.new("RGB", (600, 450), bg).save(buf, "JPEG")
+        out = tmp_path / f"l{bg[0]}.png"
+        C.render_composite(buf.getvalue(), stl, out, category="bracket", annotation=ann)
+        arr = np.asarray(Image.open(out).convert("RGB"))
+        m = _ember_mask(arr)
+        return float(np.median(arr[:, :, 0][m]))
+
+    dark_r = median_ember_r((25, 25, 28))
+    bright_r = median_ember_r((235, 235, 235))
+    assert (
+        bright_r > dark_r + 20
+    ), f"part should brighten in a bright scene ({dark_r} vs {bright_r})"
+
+
+def test_scene_lighting_estimate_clamps():
+    """scene_lighting clamps brightness to 0.6..1.3 for extreme scenes."""
+    dark = np.full((40, 40, 3), 5.0)
+    bright = np.full((40, 40, 3), 250.0)
+    b_dark, _ = C.scene_lighting(dark, (20, 20), 15)
+    b_bright, _ = C.scene_lighting(bright, (20, 20), 15)
+    assert abs(b_dark - 0.6) < 1e-6 and abs(b_bright - 1.3) < 1e-6
+
+
+def test_contact_shadow_darkens_around_part(tmp_path: Path):
+    """A soft contact shadow darkens pixels around the part below the flat
+    background (they're not part pixels — it's the cast shadow)."""
+    stl = _bracket_stl(tmp_path)
+    ann = [{"photo_index": 0, "points": [[0.4, 0.4], [0.62, 0.62]]}]
+    bg = 185
+    buf = io.BytesIO()
+    Image.new("RGB", (600, 450), (bg, bg, bg)).save(buf, "JPEG")
+    out = tmp_path / "shadow.png"
+    C.render_composite(buf.getvalue(), stl, out, category="knob", annotation=ann)
+    arr = np.asarray(Image.open(out).convert("RGB"), dtype=int)
+    lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    dark_non_part = (lum < bg - 25) & ~_ember_mask(arr)
+    assert dark_non_part.sum() > 150, "expected a contact shadow darkening the ground"

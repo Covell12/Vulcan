@@ -1,17 +1,26 @@
 """Export a CadQuery solid to STEP/3MF/STL and render a PNG preview.
 
-Preview rendering uses matplotlib (Agg backend) over the exported STL's
-triangle mesh rather than a CAD viewer, so it works headless with no display
-or GPU — important since this runs inside the API process on a server.
+The PRODUCT SHOT (the `preview.png` shown in the UI, review page, and later order
+emails) is `render_studio` (M10b): it renders through the shared software
+z-buffer rasterizer (api/raster) — the SAME renderer the in-photo composite uses —
+with a fixed 3/4 view, a neutral gradient background, per-part palette colours,
+a silhouette edge line, and projected dimension callouts. One consistent look
+everywhere, correct for self-occluding parts/assemblies, still fully headless
+(no display/GPU).
+
+`render_preview`/`render_assembly_preview` (matplotlib) are kept for tests and as
+a fallback; the design pipeline now emits the studio shot.
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
 import cadquery as cq
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 
@@ -19,6 +28,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 import trimesh  # noqa: E402
 from cadquery import exporters  # noqa: E402
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+
+from api import raster  # noqa: E402
 
 FACE_COLOR = (0.70, 0.75, 0.85, 1.0)
 EDGE_COLOR = (0.2, 0.2, 0.2, 0.3)
@@ -44,7 +56,7 @@ def export_design(
     exporters.export(solid, str(stl_path))
     exporters.export(solid, str(threemf_path))
 
-    render_preview(stl_path, preview_path, callouts)
+    render_studio([stl_path], preview_path, callouts)
 
     return {
         "step": step_path,
@@ -220,6 +232,176 @@ def render_canonical_views(
         finally:
             plt.close(fig)
     return paths
+
+
+# ---------------------------------------------------------------------------
+# Studio product shot (M10b) — the shared z-buffer renderer, fixed 3/4 view,
+# gradient background, silhouette edge, per-part palette colours, callouts.
+# ---------------------------------------------------------------------------
+
+# Per-part base colours (0..255), the ember-first palette matching PART_PALETTE
+# and the client viewer, so a piece is the same colour in every view.
+_STUDIO_PALETTE = np.array([[int(c * 255) for c in rgba[:3]] for rgba in PART_PALETTE])
+_STUDIO_FOV_DEG = 34.0
+_STUDIO_EDGE_RGB = (28, 30, 38)
+# Neutral vertical gradient (top → bottom) for the product-shot background.
+_STUDIO_BG_TOP = (240, 242, 246)
+_STUDIO_BG_BOT = (206, 210, 218)
+_STUDIO_CALLOUT_RGB = (212, 64, 26)
+
+
+def _studio_rotation(elev_deg: float = 22.0, azim_deg: float = -52.0) -> np.ndarray:
+    """A fixed look-at rotation (world +Z up) giving a consistent 3/4 product
+    view. Rows are the camera axes in world coords: X right, Y down, Z into the
+    scene."""
+    e, a = math.radians(elev_deg), math.radians(azim_deg)
+    cam_dir = np.array(
+        [math.cos(e) * math.cos(a), math.cos(e) * math.sin(a), math.sin(e)]
+    )
+    forward = -cam_dir  # camera looks toward the origin
+    world_up = np.array([0.0, 0.0, 1.0])
+    right = np.cross(world_up, forward)
+    right /= np.linalg.norm(right) or 1.0
+    cam_up = np.cross(forward, right)
+    return np.stack([right, -cam_up, forward], axis=0)
+
+
+def _gradient_background(W: int, H: int) -> Image.Image:
+    top = np.array(_STUDIO_BG_TOP, dtype=float)
+    bot = np.array(_STUDIO_BG_BOT, dtype=float)
+    t = np.linspace(0.0, 1.0, H)[:, None, None]
+    grad = top[None, None, :] * (1 - t) + bot[None, None, :] * t
+    grad = np.broadcast_to(grad, (H, W, 3)).astype(np.uint8)
+    return Image.fromarray(grad, "RGB")
+
+
+def _fit_camera(
+    vcam0: np.ndarray, fx: float, fy: float, cx: float, cy: float, W: int, H: int
+) -> tuple[float, float, float]:
+    """Choose the camera depth D and centered principal point (cx, cy) so the
+    rotated, origin-centered part fills ~`fill` of the frame and is centred. D is
+    found by iterating on the ACTUAL projected extent (robust to perspective +
+    the 3/4 tilt); cx/cy are then shifted so the projected part is centred."""
+    hz = float(np.abs(vcam0[:, 2]).max())
+    fill = 0.82
+    # Seed from the on-axis half-extents, then refine against the real projection.
+    hx = float(np.abs(vcam0[:, 0]).max())
+    hy = float(np.abs(vcam0[:, 1]).max())
+    D = max(2 * hx * fx / (fill * W), 2 * hy * fy / (fill * H)) + hz + 1.0
+    for _ in range(4):
+        uv = raster.project(vcam0 + np.array([0.0, 0.0, D]), fx, fy, cx, cy)
+        used = max(
+            (uv[:, 0].max() - uv[:, 0].min()) / W,
+            (uv[:, 1].max() - uv[:, 1].min()) / H,
+        )
+        if used < 1e-6:
+            break
+        D = max(D * used / fill, hz * 1.05 + 1.0)
+    uv = raster.project(vcam0 + np.array([0.0, 0.0, D]), fx, fy, cx, cy)
+    cx += W / 2.0 - (uv[:, 0].min() + uv[:, 0].max()) / 2.0
+    cy += H / 2.0 - (uv[:, 1].min() + uv[:, 1].max()) / 2.0
+    return D, cx, cy
+
+
+def render_studio(
+    stl_paths: list[Path],
+    out_path: Path,
+    callouts: list[dict[str, Any]] | None = None,
+    *,
+    size: tuple[int, int] = (720, 720),
+) -> None:
+    """The product shot: z-buffer the part(s) from a fixed 3/4 view onto a neutral
+    gradient background, with a silhouette edge and (optional) dimension callouts.
+    Each part of an assembly gets its own palette colour. Same renderer as the
+    in-photo composite, so the look is consistent everywhere."""
+    W, H = size
+    meshes = [trimesh.load(str(p), force="mesh") for p in stl_paths]
+    meshes = [m for m in meshes if len(getattr(m, "faces", [])) > 0]
+    if not meshes:
+        _gradient_background(W, H).save(str(out_path))
+        return
+
+    all_v, all_f, face_part = [], [], []
+    offset = 0
+    for i, m in enumerate(meshes):
+        v = np.asarray(m.vertices, dtype=float)
+        f = np.asarray(m.faces) + offset
+        all_v.append(v)
+        all_f.append(f)
+        face_part.append(np.full(len(m.faces), i, dtype=int))
+        offset += len(v)
+    verts = np.vstack(all_v)
+    faces = np.vstack(all_f)
+    face_part = np.concatenate(face_part)
+
+    center = (verts.min(axis=0) + verts.max(axis=0)) / 2.0
+    R = _studio_rotation()
+    vcam0 = (verts - center) @ R.T
+
+    fx = fy = (W / 2.0) / math.tan(math.radians(_STUDIO_FOV_DEG) / 2.0)
+    D, cx, cy = _fit_camera(vcam0, fx, fy, W / 2.0, H / 2.0, W, H)
+    verts_cam = vcam0 + np.array([0.0, 0.0, D])
+
+    # Per-face colour = its part's palette base, flat-shaded.
+    base = _STUDIO_PALETTE[face_part % len(_STUDIO_PALETTE)].astype(float)
+    shades = raster.face_shades(verts_cam, faces)[:, None]
+    shadow = base * 0.30
+    face_rgb = shadow + (base - shadow) * shades
+
+    rgba = raster.render_mesh(
+        verts_cam,
+        faces,
+        face_rgb,
+        fx,
+        fy,
+        cx,
+        cy,
+        W,
+        H,
+        supersample=2,
+        edge_rgb=_STUDIO_EDGE_RGB,
+        edge_alpha=0.85,
+    )
+    part = Image.fromarray(rgba, "RGBA")
+    out = Image.alpha_composite(_gradient_background(W, H).convert("RGBA"), part)
+
+    if callouts:
+        draw = ImageDraw.Draw(out)
+        _draw_studio_callouts(draw, callouts, center, R, D, fx, fy, cx, cy)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.convert("RGB").save(str(out_path))
+
+
+def _draw_studio_callouts(
+    draw: ImageDraw.ImageDraw,
+    callouts: list[dict[str, Any]],
+    center: np.ndarray,
+    R: np.ndarray,
+    D: float,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+) -> None:
+    """Project each dimension's two 3D endpoints through the studio camera and
+    draw a labeled line with end ticks."""
+    col = _STUDIO_CALLOUT_RGB
+    for c in callouts:
+        pts = np.array([c["p0"], c["p1"]], dtype=float)
+        pcam = (pts - center) @ R.T + np.array([0.0, 0.0, D])
+        if np.any(pcam[:, 2] <= 1e-6):
+            continue
+        uv = raster.project(pcam, fx, fy, cx, cy)
+        (x0, y0), (x1, y1) = uv
+        draw.line([(x0, y0), (x1, y1)], fill=col, width=2)
+        # End ticks perpendicular-ish (short marks).
+        for x, y in ((x0, y0), (x1, y1)):
+            draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=col)
+        label = str(c.get("text", ""))
+        if label:
+            mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            draw.text((mx + 4, my - 12), label, fill=col)
 
 
 def _draw_callouts(ax: Any, callouts: list[dict[str, Any]], bounds: Any) -> None:

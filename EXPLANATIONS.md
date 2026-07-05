@@ -100,30 +100,38 @@ non-expert can follow: what it does, why it exists, what talks to it).
   and its half-baked export directory is deleted, so no unbuildable STL/STEP can ever be
   downloaded. The per-template pytest suite proves watertightness for DEFAULT params; this
   guards the live path where user-resolved (and, later, generated) params run.
-- **api/composite.py** (M5.5) — The in-photo preview: renders the ACTUAL generated
-  geometry back into the user's own photo, scale- and position-true. **M9:** the part is now
-  drawn as an OPAQUE, flat-shaded ember solid (`_face_shades` gives simple normal-based
-  brightness so it reads as a 3D object) with a GLOWING ORANGE BORDER (`_rasterize` blurs the
-  silhouette alpha and colours the spill) — not the old translucent-blue smear. A fixed ember
-  colour keeps it honestly a preview, not a photo. Occlusion (part hidden behind foreground
-  objects) needs a whole-scene depth map — the provider only returns depth at the one circled
-  point today — so it's a documented next step. Pure numpy + Pillow + trimesh — NO OpenGL/GPU — so it runs in the
-  same headless API process as everything else. It loads the exported STL, poses it with a
-  textbook pinhole camera (focal length from the photo's EXIF 35mm-equivalent when present,
-  else an assumed 60° field of view), and paints the triangles back-to-front (painter's
-  algorithm) as translucent polygons. Placement anchors the part's centroid at the user's
-  annotation centroid (or the photo center); scale prefers true metric depth at that point
-  (`depth_provider.depth_mm_at`), falls back to the part's own size vs. the annotation's
-  on-screen extent, then to a fixed fraction of the frame. Orientation is a canonical 3/4
-  pose chosen only by the template's mounting category (bracket/hook/clip → wall, everything
-  else → surface) — it is NOT recovered from the photo, the honest v0 limitation stated in
-  the module docstring and the UI. The camera math (`pinhole_project`, `transform_to_camera`,
-  `canonical_rotation`, `focal_px`) is split out as pure functions and unit-tested against
-  analytic cases. `api/intents.py`'s design join calls `render_composite` best-effort.
-  **3D-viewer follow-up:** `render_composite` now also saves the plain (EXIF-corrected,
-  downscaled) photo as `photo.png` next to the composite, and the design join returns it as
-  `files.photo`, so the UI can toggle the part in/out of the picture (photo with vs. without
-  the model) — most useful on the founder review dashboard.
+- **api/raster.py** (M10b) — The shared software Z-BUFFER rasterizer both previews render
+  through. Vectorized numpy, NO OpenGL/pyrender/GPU: `render_mesh` projects triangles, then
+  fills each one over its pixel bounding box with barycentric weights and a PER-PIXEL z-test
+  using perspective-correct depth (interpolated 1/z), so nearer surfaces correctly cover
+  farther ones — fixing the old painter's-algorithm mis-ordering of self-occluding parts and
+  assemblies. Renders at 2× and box-downsamples for anti-aliasing. Optional SCENE OCCLUSION
+  (a per-pixel scene inverse-depth culls part pixels behind the scene) and a silhouette edge
+  line. `face_shades` gives per-face flat shading; the caller owns base colour. The
+  interlocking-boxes regression in `tests/test_raster.py` asserts the z-order is correct and
+  order-independent.
+- **api/composite.py** (M5.5; M10b overhaul) — The in-photo preview: renders the ACTUAL
+  generated geometry back into the user's own photo, scale- and position-true, as an OPAQUE
+  ember solid with a glowing orange border. **M10b** rebuilds the drawing on the shared
+  z-buffer (`api/raster.render_mesh`) so self-occluding parts and assemblies render correctly
+  (no more painter's-order artifacts / internal-face bleed), and adds: (1) a soft CONTACT
+  SHADOW (`_contact_shadow`) — a blurred dark ellipse below a surface mount, or the silhouette
+  cast behind a wall mount, opacity scaled by how much of the frame the part fills; (2) a
+  LIGHTING MATCH (`scene_lighting`) — the part's brightness is scaled toward the scene's median
+  luminance around the anchor (clamped 0.6–1.3) with a subtle warm/cool tint (≤±10%), so it
+  sits in the photo's light while staying recognizably ember (tint, don't repaint); (3) real
+  SCENE OCCLUSION when a whole-scene depth map is supplied (`render_composite(scene_depth_mm=)`
+  → the z-buffer tests the part against it so foreground objects cover it; absent → drawn fully
+  in front). Pure numpy + Pillow + trimesh, still headless. Poses the part with a textbook
+  pinhole camera (focal from EXIF 35mm-equivalent, else 60° FOV); placement anchors the
+  centroid at the annotation centroid (or photo center); scale prefers metric depth at that
+  point (`depth_provider.depth_mm_at`), else the part-vs-annotation size, else a frame
+  fraction; orientation is a canonical 3/4 pose by mounting category (wall vs surface) — NOT
+  recovered from the photo (honest v0 limit). The camera math (`pinhole_project`,
+  `transform_to_camera`, `canonical_rotation`, `focal_px`) stays pure + unit-tested.
+  `render_composite` also saves the plain (EXIF-corrected) photo as `photo.png` next to the
+  composite so the UI can toggle the part in/out. `api/intents.py`'s design join calls it
+  best-effort, now also passing a bounded full-scene depth map for occlusion.
 - **api/templates.py** (M2, refactored M3) — Defines `GET /templates`, which describes
   every registered template's parameter form (name, type, min/max, choices, default,
   description) so the web UI can build the right form for whichever template the user
@@ -216,6 +224,10 @@ non-expert can follow: what it does, why it exists, what talks to it).
   part at the true distance of the circled surface. Unlike the rest of the module it NEVER
   raises and returns `None` whenever depth is unavailable (`DEPTH_PROVIDER=none` or any
   model failure) — a preview must not be able to break because a depth backend hiccuped.
+  **M10b:** adds `depth_map_mm(photo)`, the best-effort FULL-scene depth map (HxW, mm) the
+  composite z-tests the part against for occlusion; invalid/background pixels come back as
+  `+inf` (never occlude), and like `depth_mm_at` it returns `None` (never raises) when depth
+  is unavailable — so occlusion degrades gracefully to drawing the part in front.
 - **api/intents.py** (M3) — `POST /intents` and `POST /intents/{id}/answers`: the
   photo(s)+annotation+text → IntentSpec → answered-dimensions pipeline. Builds a
   `template_catalog` from the live template registry (id, category, critical_dims,
@@ -326,9 +338,15 @@ non-expert can follow: what it does, why it exists, what talks to it).
   used to be synthesized overlay-less.
 - **api/rendering.py** — Takes a finished CadQuery solid and writes it to disk in every
   format the rest of the product needs: STEP (for manufacturing/slicing), 3MF and STL
-  (for 3D printing), and a PNG preview. The preview is rendered by loading the exported
-  STL's triangle mesh with `trimesh` and drawing it with `matplotlib` — deliberately not
-  a live CAD viewport, so it renders correctly with no display or GPU on a server. **M5:**
+  (for 3D printing), and a PNG preview. **M10b — the PRODUCT SHOT:** `render_studio` now
+  renders the `preview.png` shown in the UI/review page (and later order emails) through the
+  SAME shared z-buffer renderer as the in-photo composite (`api/raster`), for one consistent
+  look: a fixed 3/4 view, a neutral vertical-gradient background, per-part palette colours
+  (so an assembly's pieces match the 3D viewer), a silhouette edge line, and the dimension
+  callouts projected through the same camera and drawn with Pillow. The camera auto-fits (it
+  iterates on the real projected extent, then centres). `export_design` (single part) and
+  `designs._produce_files_freeform` (assemblies) both emit the studio shot. The older
+  matplotlib `render_preview`/`render_assembly_preview` remain for tests / as a fallback. **M5:**
   `render_preview`/`export_design` take optional `callouts` ({p0, p1, text}) and draw each
   as a labeled 3D dimension arrow (the "honest preview" — value + measured ✓ / suggested ~
   / default marker), still fully headless. Also
@@ -906,15 +924,23 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   `test_manifold_gate_rejects_non_watertight_mesh_and_cleans_up` monkeypatches the bracket's
   `build_fn` to emit a single planar (non-watertight) face and asserts `build_design` raises
   a 500 AND leaves no export directory behind (fail closed).
-- **tests/test_composite.py** (M5.5) — Tests `api/composite.py`, the in-photo ghost. The
+- **tests/test_raster.py** (M10b) — Tests `api/raster.py`, the shared z-buffer. Headline: two
+  INTERLOCKING boxes (one nearer) — the nearer box must cover the farther one at the overlap,
+  AND stay correct when the far box's faces are drawn last (proving order-independence, unlike
+  painter's algorithm). Also: 2× supersampling produces anti-aliased (fractional-alpha) edges,
+  and `edge_rgb` draws a silhouette line.
+- **tests/test_composite.py** (M5.5; M10b) — Tests `api/composite.py`, the in-photo ghost. The
   camera math is checked against ANALYTIC pinhole cases (no image diffing): a point on the
   optical axis lands on the principal point, a known offset lands at the algebraically-
   predicted pixel, a unit cube at a known pose projects symmetrically with the near face
   larger than the far, `focal_px` matches both the EXIF-35mm and assumed-FOV formulas, and
   both canonical mounting rotations are proper (orthonormal, det=1). It also covers the
   annotation centroid/extent parsing and the depth→annotation→fallback scale precedence,
-  then renders end-to-end on a real bracket mesh (with and without an annotation) and asserts
-  the ghost actually changes the photo (isn't a no-op copy).
+  then renders end-to-end on a real bracket mesh and asserts the ghost is opaque ember. **M10b:**
+  a synthetic depth map whose near half occludes the part hides that half (and absent depth
+  degrades to drawing in front); the lighting match makes the part dimmer in a dark scene than
+  a bright one (`scene_lighting` clamps 0.6–1.3); and a contact shadow darkens the ground
+  around the part.
 - **tests/template_test_helpers.py** (M2) — Template-agnostic check functions shared by
   every template's test coverage: `assert_mesh_is_manifold`, `assert_min_wall_violation_rejected`,
   `assert_all_exports_non_empty`. Not a test module itself (the name doesn't match
@@ -926,10 +952,13 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   coverage automatically the moment it registers itself. **M5:** also asserts every
   template declares valid preview callouts (each references a real field, has two distinct
   3D endpoints, and a label).
-- **tests/test_rendering.py** (M5) — Tests the headless preview pipeline: `render_preview`
+- **tests/test_rendering.py** (M5; M10b) — Tests the headless preview pipeline: `render_preview`
   always closes its matplotlib figure — even when `savefig` fails — so figures can't
   accumulate in matplotlib's global registry inside the long-lived server (regression for
   a review finding), plus `export_design` with callouts writes a non-empty annotated PNG.
+  **M10b:** `render_studio` produces a product shot with solid ember part pixels over a
+  top-lighter gradient background, an assembly gets distinct per-part palette colours, and an
+  empty mesh still writes a background PNG (never crashes the join).
 - **tests/test_adapter_tube.py** (M2) — Geometry sanity checks specific to the tube
   adapter, beyond the shared suite: the bore is a genuine through-hole (checked two
   ways — mesh Euler number 0, i.e. torus-like/genus-1 topology, for both `taper=True`
@@ -967,7 +996,9 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   return `None`; confidence stays modest and capped), the Replicate decode path with
   `replicate` mocked (a visualization PNG is rejected, a metric `.npz` + focal length
   decodes to the right size, an API error is wrapped), and the grep test that only
-  `depth_provider.py` imports `replicate`.
+  `depth_provider.py` imports `replicate`. **M10b:** `depth_map_mm` returns `None` without a
+  provider, converts a mocked meters map to mm marking invalid pixels `+inf`, and swallows a
+  model failure to `None` (occlusion never breaks the join).
 - **tests/test_intents.py** (M3, extended M4 and M5) — Tests `api/intents.py` with
   `api.intents.parse_intent` (and, for M4, `api.intents.estimate_scale`) mocked — no
   network. Covers the create → answer → `ready_for_design` round-trip; the

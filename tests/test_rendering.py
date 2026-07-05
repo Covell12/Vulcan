@@ -10,7 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 from cadquery import exporters
+from PIL import Image
 
 import trimesh
 
@@ -19,6 +21,7 @@ from api.rendering import (
     heal_mesh_file,
     mesh_is_watertight,
     render_preview,
+    render_studio,
 )
 from templates_lib.registry import get_template
 
@@ -109,6 +112,55 @@ def test_render_preview_closes_figure_on_success(tmp_path: Path):
     render_preview(stl, tmp_path / "out.png")
     assert (tmp_path / "out.png").exists()
     assert len(plt.get_fignums()) == before
+
+
+# ---------------------------------------------------------------------------
+# M10b studio product shot
+# ---------------------------------------------------------------------------
+
+
+def test_render_studio_single_part(tmp_path: Path):
+    """The product shot renders a part over a gradient background with a
+    silhouette edge — an image with real ember part pixels and no transparency."""
+    stl = _bracket_stl(tmp_path)
+    out = tmp_path / "studio.png"
+    render_studio(
+        [stl], out, [{"p0": (0, 0, 0), "p1": (180, 0, 0), "text": "span: 180 mm"}]
+    )
+    assert out.exists()
+    arr = np.asarray(Image.open(out).convert("RGB"), dtype=int)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    ember = (r > 120) & (r - b > 45) & (g < r)
+    assert ember.sum() > 1000, "expected a solid ember part in the studio shot"
+    # Neutral gradient background: the top row is lighter than the bottom row.
+    top = arr[2].mean()
+    bottom = arr[-3].mean()
+    assert top > bottom, "expected a top-lighter neutral gradient background"
+
+
+def test_render_studio_assembly_uses_distinct_colors(tmp_path: Path):
+    """Each part of an assembly gets its own palette colour (not both ember)."""
+    a = trimesh.creation.box(extents=(30, 30, 30))
+    b = trimesh.creation.box(extents=(30, 30, 30))
+    b.apply_translation([50, 0, 0])
+    pa, pb = tmp_path / "a.stl", tmp_path / "b.stl"
+    a.export(str(pa))
+    b.export(str(pb))
+    out = tmp_path / "asm.png"
+    render_studio([pa, pb], out)
+    arr = np.asarray(Image.open(out).convert("RGB"), dtype=int)
+    r, g, b_ = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    ember = (r > 150) & (r - b_ > 60) & (g < r)  # part 0 (ember)
+    blue = (b_ > 140) & (b_ - r > 30)  # part 1 (blue in the palette)
+    assert ember.sum() > 300 and blue.sum() > 300
+
+
+def test_render_studio_empty_meshes_writes_background(tmp_path: Path):
+    empty = tmp_path / "empty.stl"
+    empty.write_text("solid empty\nendsolid empty\n")
+    out = tmp_path / "bg.png"
+    render_studio([empty], out)
+    assert out.exists()
 
 
 def test_mesh_is_watertight_true_for_real_solid(tmp_path: Path):

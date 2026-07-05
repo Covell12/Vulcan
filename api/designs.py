@@ -24,7 +24,7 @@ from api.rendering import (
     export_design,
     heal_mesh_file,
     mesh_body_count,
-    render_assembly_preview,
+    render_studio,
     write_preview_mesh,
 )
 from templates_lib.registry import (
@@ -140,7 +140,7 @@ def _produce_files_freeform(
 
     parts = result.parts or []
     preview_path = design_dir / "preview.png"
-    render_assembly_preview([p["stl"] for p in parts], preview_path, callouts)
+    render_studio([p["stl"] for p in parts], preview_path, callouts)
     return {"parts": parts, "preview_png": preview_path}
 
 
