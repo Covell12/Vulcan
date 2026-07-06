@@ -50,6 +50,10 @@ what talks to it). Keep entries current — stale explanations are bugs.
 
 ## Run commands
 
-- API: `uvicorn api.main:app --reload` (serves web UI at http://localhost:8000)
+- API: `uvicorn api.main:app --reload --reload-dir api --reload-dir web --reload-dir templates_lib --reload-dir schemas`
+  (serves web UI at http://localhost:8000). SCOPE `--reload` to source dirs: a bare
+  `--reload` also watches `data/`, so a freeform generation writing under it restarts
+  the server mid-request and drops the in-flight async job. (Generated code is also stored
+  as `.cqpy`, not `.py`, so it can't trip the default `*.py` watcher either.)
 - Tests: `pytest -q`
 - Never commit `.env`, exports/, or __pycache__.

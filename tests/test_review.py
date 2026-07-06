@@ -129,6 +129,47 @@ def _generate(cleanup: dict, iid: str, gen=GOOD_GEN) -> dict:
     return intent
 
 
+def test_freeform_poll_recovers_after_registry_loss(cleanup):
+    """Regression: the in-memory job registry doesn't survive a server restart
+    (e.g. `uvicorn --reload` restarting when generation writes files). Polling a
+    job whose registry entry is gone must RECOVER the finished result from the
+    intent on disk — not strand the client on a bare 404."""
+    from api import jobs
+
+    iid = _make_other_intent(cleanup)
+    with patch(
+        "api.freeform.codegen_provider.generate_template", return_value=dict(GOOD_GEN)
+    ), patch("api.intents.codegen_provider.check_provider_configured"):
+        status_url = client.post(f"/intents/{iid}/freeform").json()["status_url"]
+        ready = client.get(status_url).json()
+    tid = ready["intent"]["template_id"]
+    cleanup["generated"].append(tid)
+    assert ready["status"] == "ready" and tid.startswith("gen_")
+
+    # Simulate the server restart that wiped the in-memory jobs.
+    jobs._JOBS.clear()
+    recovered = client.get(status_url)
+    assert recovered.status_code == 200, recovered.text
+    body = recovered.json()
+    assert body["status"] == "ready" and body["intent"]["template_id"] == tid
+
+
+def test_freeform_poll_reports_interrupted_when_run_never_finished(cleanup):
+    """A lost job whose intent shows no freeform result (the run was interrupted
+    mid-generation) returns a clear 'interrupted' failure, not a bare 404 loop."""
+    iid = _make_other_intent(cleanup)
+    r = client.get(f"/intents/{iid}/freeform/never0000made")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "failed" and "interrupted" in body["error"].lower()
+
+
+def test_freeform_poll_404s_only_when_intent_is_gone():
+    """A genuinely missing intent still 404s (nothing to recover from)."""
+    r = client.get("/intents/no_such_intent_xyz/freeform/whatever0000")
+    assert r.status_code == 404
+
+
 def test_freeform_end_to_end_and_review_gate(cleanup):
     iid = _make_other_intent(cleanup)
 

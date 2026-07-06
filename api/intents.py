@@ -780,21 +780,58 @@ def start_freeform(intent_id: str) -> dict[str, Any]:
 def get_freeform_job(intent_id: str, job_id: str) -> dict[str, Any]:
     """Poll a freeform generation job. Stage advances generating → critiquing →
     ready | failed. On 'ready' the updated intent (with the attached template and
-    seeded questions) is included so the client can proceed without a second GET."""
+    seeded questions) is included so the client can proceed without a second GET.
+
+    Resilient to job-registry loss: the in-memory job map does NOT survive a
+    server restart (the dev `uvicorn --reload` server restarts on file changes,
+    and a generation writes files under the repo). When the job id is unknown we
+    therefore RECOVER the outcome from the intent's PERSISTED state on disk —
+    'ready' if the template was attached, 'failed' if it recorded an error, and a
+    clear 'interrupted' message (not a bare 404) if the run never finished — so a
+    lost registry doesn't strand the client polling a 404 forever."""
     job = jobs.get_job(job_id)
-    if job is None or job.get("intent_id") != intent_id:
-        raise HTTPException(status_code=404, detail=f"No freeform job '{job_id}'.")
-    resp: dict[str, Any] = {
+    if job is not None and job.get("intent_id") == intent_id:
+        resp: dict[str, Any] = {
+            "job_id": job_id,
+            "status": job.get("status"),
+            "stage": job.get("stage"),
+            "error": job.get("error"),
+        }
+        result = job.get("result") or {}
+        if result.get("intent") is not None:
+            resp["intent"] = result["intent"]
+            resp["template_id"] = result.get("template_id")
+        return resp
+
+    # Unknown job (registry lost on a restart, or trimmed). Recover from the
+    # intent's persisted state — the authoritative record of what finished.
+    intent = _load_intent(intent_id)  # genuine 404 only if the intent itself is gone
+    if intent.get("freeform") and intent.get("template_id"):
+        return {
+            "job_id": job_id,
+            "status": "ready",
+            "stage": "ready",
+            "error": None,
+            "intent": intent,
+            "template_id": intent["template_id"],
+        }
+    if intent.get("freeform_error"):
+        return {
+            "job_id": job_id,
+            "status": "failed",
+            "stage": "failed",
+            "error": intent["freeform_error"],
+            "intent": intent,
+        }
+    return {
         "job_id": job_id,
-        "status": job.get("status"),
-        "stage": job.get("stage"),
-        "error": job.get("error"),
+        "status": "failed",
+        "stage": "failed",
+        "error": (
+            "The design run was interrupted (the server restarted before it "
+            "finished). Please try again."
+        ),
     }
-    result = job.get("result") or {}
-    if result.get("intent") is not None:
-        resp["intent"] = result["intent"]
-        resp["template_id"] = result.get("template_id")
-    return resp
 
 
 def _apply_freeform_outcome(

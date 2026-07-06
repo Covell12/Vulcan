@@ -548,8 +548,28 @@ def dimensional_contract_check(
 # ---------------------------------------------------------------------------
 
 
+# The generated CadQuery module is stored as DATA (it's read back as text and
+# exec'd in the sandbox — NEVER imported), under a NON-.py filename. A `.py` file
+# under the repo would trip a dev `uvicorn --reload` (which watches *.py) and
+# restart the server mid-generation — dropping the in-flight async job and
+# stranding the client's poll on a 404. `.cqpy` keeps it recognizable as
+# CadQuery Python without the reload landmine. Legacy dirs used `code.py`.
+_CODE_FILENAME = "code.cqpy"
+_LEGACY_CODE_FILENAME = "code.py"
+
+
 def _template_dir(gen_id: str) -> Path:
     return GENERATED_DIR / gen_id
+
+
+def _code_path(d: Path) -> Path:
+    """Stored code path: the current non-.py name, falling back to the legacy
+    `code.py` for templates persisted before the rename."""
+    current = d / _CODE_FILENAME
+    if current.exists():
+        return current
+    legacy = d / _LEGACY_CODE_FILENAME
+    return legacy if legacy.exists() else current
 
 
 def _persist(
@@ -561,7 +581,7 @@ def _persist(
 ) -> None:
     d = _template_dir(gen_id)
     d.mkdir(parents=True, exist_ok=True)
-    (d / "code.py").write_text(code, encoding="utf-8")
+    (d / _CODE_FILENAME).write_text(code, encoding="utf-8")
     (d / "schema.json").write_text(
         json.dumps(
             {"param_schema": param_schema, "critical_dims": critical_dims}, indent=2
@@ -599,7 +619,7 @@ def load_ephemeral_from_disk(gen_id: str) -> EphemeralTemplateSpec | None:
         return None
     d = _template_dir(gen_id)
     try:
-        code = (d / "code.py").read_text(encoding="utf-8")
+        code = _code_path(d).read_text(encoding="utf-8")
         schema = json.loads((d / "schema.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None

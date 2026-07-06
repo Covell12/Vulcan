@@ -167,7 +167,9 @@ def test_generate_success_first_try(cleanup_generated):
     spec = get_template(r.template_id)
     assert isinstance(spec, EphemeralTemplateSpec)
     assert spec.critical_dims == ("w_mm", "d_mm")
-    assert (ff.GENERATED_DIR / r.template_id / "code.py").exists()
+    # Stored under a NON-.py name so persisting it can't trip `uvicorn --reload`.
+    assert (ff.GENERATED_DIR / r.template_id / ff._CODE_FILENAME).exists()
+    assert not (ff.GENERATED_DIR / r.template_id / "code.py").exists()
 
 
 def test_self_repair_unsafe_then_badbuild_then_good(cleanup_generated, monkeypatch):

@@ -350,7 +350,14 @@ non-expert can follow: what it does, why it exists, what talks to it).
   on ready, returns the updated intent. `_apply_freeform_outcome` (run on the job thread) adopts
   the winning template and stashes the generation-quality provenance (`freeform_critique`,
   `freeform_dim_contract`, `freeform_score`, `freeform_candidates`) on the intent — which the
-  design join then copies onto the review record.
+  design join then copies onto the review record. **Job-loss recovery (bugfix):** the in-memory
+  job registry (`api/jobs`) does NOT survive a server restart, so the poll RECOVERS from the
+  intent's persisted state when the job id is unknown — `ready` if the template was attached,
+  `failed` if it errored, and a clear "interrupted, please try again" (never a bare 404) if the
+  run never finished. This was hit routinely under `uvicorn --reload`: a generation writes
+  `data/generated_templates/<id>/…` and the dev reloader restarted the server mid-run — now the
+  generated module is stored as `.cqpy` (not `.py`, see api/freeform) AND the documented run
+  command scopes `--reload` to source dirs, so generation no longer restarts the server.
   **M7 (Part A routing fix):** `_apply_freeform_routing` sets `freeform_available` (true for
   any in-scope request — the always-on override) and `freeform_recommended` (true when no
   template matched, `template_fit` < 0.65, or any `unsupported_features`) so the greedy router
@@ -501,7 +508,10 @@ sandbox; every freeform design requires founder review before its files can ship
   candidate from 4 canonical views and asks `vision_provider.critique_design` for a
   `matches_request` 0–1 score + defects + fixes; below `CRITIQUE_THRESHOLD` (0.7) → regenerate.
   Still normalizes param_schema → pydantic model, keeps `dfm_check`, self-repair, demand log,
-  persistence under `data/generated_templates/<id>/`, and rehydration. On success persists full
+  persistence under `data/generated_templates/<id>/` (the generated module is stored as `.cqpy`,
+  NOT `.py`, so writing it can't trip a dev `uvicorn --reload` and restart the server mid-job —
+  it's read back as text + sandbox-exec'd, never imported; `_code_path` still reads legacy
+  `code.py`), and rehydration. On success persists full
   provenance (every candidate's code+scores, all critiques, the dimensional-contract detail).
   If geometry is valid but critique never clears the bar after all rounds, the best shippable
   candidate STILL ships (founder review is the backstop). Takes an optional `progress` callback
@@ -530,7 +540,9 @@ sandbox; every freeform design requires founder review before its files can ship
   background thread (or INLINE when `VULCAN_JOBS_SYNC` is set — tests use this so a provider mock
   stays active and polling is deterministic), updating stage generating→critiquing→ready|failed;
   `get_job` is what the poll endpoint reads. Right-sized for the single-founder Phase-0 deploy; a
-  multi-worker deploy would swap in a real queue without changing the API surface.
+  multi-worker deploy would swap in a real queue without changing the API surface. The registry is
+  in-memory (lost on restart) — the poll endpoint recovers a finished run from the intent on disk
+  (see api/intents `get_freeform_job`), so a restart doesn't strand the client on a 404.
 - **api/design_store.py** (M-B) — One JSON record per freeform design under `data/designs/`
   (request, generated code, resolved params, DFM results, files, and the founder's verdict +
   note). Only freeform designs get a record; Track A designs don't (so they're never gated).
