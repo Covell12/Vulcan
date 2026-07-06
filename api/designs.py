@@ -39,6 +39,10 @@ router = APIRouter()
 BASE_DIR = Path(__file__).resolve().parent.parent
 EXPORTS_DIR = BASE_DIR / "exports"
 
+# Size ceiling for the shipped-artifact gate (mirrors api.freeform.MAX_BBOX_MM;
+# kept as a local literal so designs.py has no freeform import at module load).
+_MAX_BBOX_MM = 250.0
+
 # How a resolved param's provenance shows up on a preview callout label.
 SOURCE_MARKER = {
     "measured": "✓",
@@ -149,11 +153,17 @@ def build_design(
     params: dict[str, Any],
     *,
     source_map: dict[str, str] | None = None,
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """Validate params, build the solid, export STEP/3MF/STL + an annotated
-    preview, and return (design_id, {file_key: url}). Raises HTTPException on an
-    unknown template (400) or invalid/unbuildable params (422). This is the one
-    place the export pipeline is invoked."""
+    preview, and return (design_id, {file_key: url}, shipped_dfm). Raises
+    HTTPException on an unknown template (400), invalid/unbuildable params (422),
+    or a mesh that fails the printability gate (500). This is the one place the
+    export pipeline is invoked.
+
+    `shipped_dfm` measures the ACTUAL final artifact we hand off — the exported
+    `part.stl` for a single part, or the merged `assembly.stl` for an assembly —
+    so a design record's DFM describes what SHIPS, not a generation-time build
+    with different (default) params."""
     spec = get_template(template_id)
     if spec is None:
         raise HTTPException(
@@ -220,6 +230,7 @@ def build_design(
         urls["stl"] = part_urls[0]["stl"]
         urls["threemf"] = part_urls[0]["threemf"]
         urls["view_stl"] = part_urls[0]["view_stl"]
+        shipped_stl = parts[0]["stl"]
     else:
         # Assembly: merge all parts into one mesh for the in-photo composite + a
         # combined ungated view-mesh fallback. (No flat top-level STEP/3MF — those
@@ -228,8 +239,80 @@ def build_design(
         urls["stl"] = _url(assembly)
         view_all = write_preview_mesh(assembly, out_name="assembly_preview.stl")
         urls["view_stl"] = _url(view_all) if view_all is not None else None
+        shipped_stl = assembly
 
-    return design_id, urls
+    # Re-gate + measure the FINAL shipped artifact (the exact bytes we hand off),
+    # not the per-part temp meshes. An assembly's merged STL legitimately has one
+    # connected body per part, so we expect exactly `len(parts)` bodies here — a
+    # different count means the merge/export diverged from the gated parts.
+    shipped_dfm = _measure_and_gate_shipped(
+        shipped_stl,
+        expected_bodies=len(parts),
+        template_id=template_id,
+        design_dir=design_dir,
+    )
+    return design_id, urls, shipped_dfm
+
+
+def _measure_and_gate_shipped(
+    stl_path: Path,
+    *,
+    expected_bodies: int,
+    template_id: str,
+    design_dir: Path,
+) -> dict[str, Any]:
+    """Measure the final shipped mesh and gate it: watertight, exactly
+    `expected_bodies` connected bodies (1 for a single part, one-per-part for an
+    assembly), and within the size ceiling. Returns the DFM report describing what
+    ACTUALLY ships. Fail closed (delete the export dir, raise 500) on divergence —
+    this catches a build whose user-params geometry split, grew past the ceiling,
+    or whose assembly merge produced an unexpected body count."""
+    import trimesh
+
+    mesh = trimesh.load(str(stl_path), force="mesh")
+    faces = getattr(mesh, "faces", [])
+    watertight = bool(getattr(mesh, "is_watertight", False)) and len(faces) > 0
+    bodies = mesh_body_count(str(stl_path))
+    bounds = getattr(mesh, "bounds", None)
+    extent = (
+        [float(bounds[1][i] - bounds[0][i]) for i in range(3)]
+        if bounds is not None
+        else [0.0, 0.0, 0.0]
+    )
+    max_extent = max(extent) if extent else 0.0
+    within = 0 < max_extent <= _MAX_BBOX_MM + 1e-6
+    connected = bodies == expected_bodies
+    dfm: dict[str, Any] = {
+        "manifold": watertight,
+        "connected": connected,
+        "body_count": bodies,
+        "expected_bodies": expected_bodies,
+        "part_count": expected_bodies,
+        "within_size": within,
+        "max_extent_mm": round(max_extent, 2),
+        "bbox_mm": [round(x, 2) for x in extent],
+        "size_ceiling_mm": _MAX_BBOX_MM,
+        "measured_on": "shipped_artifact",
+    }
+    if not (watertight and connected and within):
+        shutil.rmtree(design_dir, ignore_errors=True)
+        problems = []
+        if not watertight:
+            problems.append("not watertight/manifold")
+        if not connected:
+            problems.append(f"{bodies} bodies (expected {expected_bodies})")
+        if not within:
+            problems.append(
+                f"largest dim {dfm['max_extent_mm']}mm over {_MAX_BBOX_MM}mm"
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"shipped mesh for '{template_id}' failed the final printability gate "
+                f"({'; '.join(problems)}); design rejected."
+            ),
+        )
+    return dfm
 
 
 def _write_assembly_mesh(stl_paths: list[Path], design_dir: Path) -> Path:
@@ -247,7 +330,9 @@ def _write_assembly_mesh(stl_paths: list[Path], design_dir: Path) -> Path:
 
 @router.post("/designs", response_model=DesignResponse)
 def create_design(request: DesignRequest) -> DesignResponse:
-    design_id, urls = build_design(request.template_id, request.params)
+    # Track A (registry template) designs aren't recorded/reviewed, so the shipped
+    # DFM is only consumed as the printability gate inside build_design here.
+    design_id, urls, _dfm = build_design(request.template_id, request.params)
     return DesignResponse(
         design_id=design_id,
         template_id=request.template_id,

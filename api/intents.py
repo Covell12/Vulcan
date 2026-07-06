@@ -820,6 +820,7 @@ def _apply_freeform_outcome(
     intent["freeform_dfm"] = outcome.dfm
     # M10a generation-quality provenance (surfaced on the review page).
     intent["freeform_critique"] = outcome.critique
+    intent["freeform_critique_enabled"] = outcome.critique_enabled
     intent["freeform_dim_contract"] = outcome.dim_contract
     intent["freeform_score"] = outcome.score
     intent["freeform_candidates"] = outcome.candidates
@@ -1098,7 +1099,9 @@ def create_design_from_intent(
         )
 
     params, source_map, summary = _resolve_design_params(intent, spec)
-    design_id, files = build_design(template_id, params, source_map=source_map)
+    design_id, files, shipped_dfm = build_design(
+        template_id, params, source_map=source_map
+    )
 
     # In-photo ghost preview (only when a photo was stored at intent creation).
     composite_url = _render_ghost_composite(intent, spec, design_id)
@@ -1125,9 +1128,14 @@ def create_design_from_intent(
                 "code": getattr(spec, "code", ""),
                 "params": summary,
                 "assumptions": intent.get("freeform_assumptions", []),
-                "dfm": intent.get("freeform_dfm"),
+                # DFM of the ACTUAL shipped artifact (this design's user params),
+                # measured/gated in build_design — NOT the generation-time build
+                # with default params (kept separately for provenance).
+                "dfm": shipped_dfm,
+                "dfm_generation": intent.get("freeform_dfm"),
                 # M10a: generation-quality provenance for the review page.
                 "critique": intent.get("freeform_critique"),
+                "critique_enabled": intent.get("freeform_critique_enabled"),
                 "dim_contract": intent.get("freeform_dim_contract"),
                 "score": intent.get("freeform_score"),
                 "candidates": intent.get("freeform_candidates", []),

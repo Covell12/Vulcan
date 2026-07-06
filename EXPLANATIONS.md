@@ -99,7 +99,16 @@ non-expert can follow: what it does, why it exists, what talks to it).
   `rendering.mesh_is_watertight`; a non-watertight (unprintable) mesh is refused with a 500
   and its half-baked export directory is deleted, so no unbuildable STL/STEP can ever be
   downloaded. The per-template pytest suite proves watertightness for DEFAULT params; this
-  guards the live path where user-resolved (and, later, generated) params run.
+  guards the live path where user-resolved (and, later, generated) params run. **M9.1:** each
+  part is also gated to a SINGLE connected body (no floating pieces). **Audit fix (finding 1):**
+  after export, `_measure_and_gate_shipped` re-gates and MEASURES the exact final artifact that
+  ships — `part.stl` for a single part, or the merged `assembly.stl` for an assembly (which
+  legitimately has one body per part, so it's gated to expect exactly `len(parts)` bodies) —
+  and enforces the size ceiling on it. `build_design` now returns this `shipped_dfm` as a third
+  value so the design record's DFM describes what SHIPS (this design's user params), not the
+  generation-time build with default params. This closes a divergence where a record could say
+  bbox [60,90,34]/1-body while the shipped mesh was [60,140,78]/2-body — the user-params build
+  had split. The generation DFM is kept on the record as `dfm_generation` for provenance.
 - **api/raster.py** (M10b) — The shared software Z-BUFFER rasterizer both previews render
   through. Vectorized numpy, NO OpenGL/pyrender/GPU: `render_mesh` projects triangles, then
   fills each one over its pixel bounding box with barycentric weights and a PER-PIXEL z-test
@@ -496,7 +505,12 @@ sandbox; every freeform design requires founder review before its files can ship
   provenance (every candidate's code+scores, all critiques, the dimensional-contract detail).
   If geometry is valid but critique never clears the bar after all rounds, the best shippable
   candidate STILL ships (founder review is the backstop). Takes an optional `progress` callback
-  (used by the async job to report generating→critiquing).
+  (used by the async job to report generating→critiquing). **Audit fix (finding 2):** provenance
+  now records `critique_enabled` (top-level) and `critique_ran` (per candidate + on the winner),
+  so a 0.7-default critique score is unambiguous — you can tell "critique off" from "enabled but
+  skipped/errored" instead of inferring it from an identical 0.91 score. (The prior bridge runs
+  that showed identical 0.91s were the TEST suite with critique intentionally off, not a live
+  skip; a new test proves the async job path runs real critique when enabled.)
 - **api/embedding_provider.py** (M10a) — The text-embedding seam (same shape as the other
   provider seams; on the SDK-isolation allowlist because the OpenAI path imports `openai`).
   `embed()`/`embed_one()`; `EMBEDDING_PROVIDER` (openai|anthropic|local, default openai). openai
@@ -522,7 +536,9 @@ sandbox; every freeform design requires founder review before its files can ship
   note). Only freeform designs get a record; Track A designs don't (so they're never gated).
   This record set is also the templatization-mining corpus. **M10a:** records also carry the
   generation-quality provenance (visual `critique`, `dim_contract`, overall `score`, and the
-  best-of-N `candidates`) for the review page.
+  best-of-N `candidates`) for the review page. **Audit fix:** the record's `dfm` is now the
+  SHIPPED-artifact measurement (from `build_design`), with the generation-time build kept as
+  `dfm_generation`; and `critique_enabled` records whether critique was on for the run.
 - **api/review.py** (M-B) — The founder review queue + the download gate. `GET /review`
   lists records (pending by default), `POST /review/{id}` records an approve/reject verdict +
   note. `GET /exports/{id}/{file}` is the gated download route — registered BEFORE the static
@@ -674,10 +690,11 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   highlighted — only `<>&` are escaped, then token spans are added), with Approve/Reject
   buttons + a note field. Verdicts `POST /review/{id}` and drive the download gate. **M10a:**
   each card also shows the generation-quality provenance — the winner's visual-critique score +
-  defects (`critiqueLine`), the dimensional-contract summary (which length params were verified
-  to drive geometry, or dead ones flagged — `dimContractLine`), and an expandable best-of-N
-  table listing every candidate's stage/score/visual-match with the winner starred
-  (`candidatesBlock`). **M7
+  defects (`critiqueLine`, which now distinguishes a real score from "critique disabled" vs
+  "enabled but not scored" so a 0.7 default isn't mistaken for a genuine critique — audit fix),
+  the dimensional-contract summary (which length params were verified to drive geometry, or dead
+  ones flagged — `dimContractLine`), and an expandable best-of-N table listing every candidate's
+  stage/score/visual-match with the winner starred (`candidatesBlock`). **M7
   follow-up:** a founder-token field (localStorage-backed) is sent as `X-Review-Token` on
   approve/reject AND on downloads, and every design card shows Download STEP/3MF/STL buttons
   that fetch WITH the token (blob download, token kept out of the URL) — so the founder can
@@ -897,7 +914,11 @@ only the chrome around them and the network seam changed. See `web/README.md`.
   flagged + named; internal-hole changes credited via volume; an ignored-param design is
   rejected end-to-end), best-of-N (3 candidates evaluated, one winner, losers kept in
   provenance), and the visual-critique loop (a below-0.7 critique regenerates with the fixes
-  appended; critique disabled → skipped and still ships).
+  appended; critique disabled → skipped and still ships). **Audit fixes:** the shipped DFM
+  measures the FINAL artifact — the user-params build's bbox matches the file on disk and
+  differs from the generation-default build (finding 1); and the async JOB path runs REAL
+  critique when enabled — candidates get non-default scores and provenance records
+  `critique_enabled`/`critique_ran` (finding 2).
 - **tests/conftest.py** (M10a) — Autouse test defaults so the suite runs offline/deterministic:
   `VULCAN_CRITIQUE=off` (critique tests opt back in + mock the provider), `EMBEDDING_PROVIDER=local`
   (deterministic embeddings), and `VULCAN_JOBS_SYNC=1` (freeform jobs run inline so a provider

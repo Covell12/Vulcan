@@ -121,6 +121,7 @@ class GenerationResult:
     candidates: list[dict[str, Any]] = field(
         default_factory=list
     )  # all evaluated (review page)
+    critique_enabled: bool = False  # was visual critique turned on for this run
 
 
 @dataclass
@@ -142,6 +143,10 @@ class Candidate:
     dim_score: float = 0.0
     dim_detail: dict[str, Any] | None = None
     critique: dict[str, Any] | None = None  # {matches_request, defects, targeted_fixes}
+    # Did the visual critique step actually EXECUTE for this candidate (rendered +
+    # scored)? Distinguishes a real skip/error from a candidate that never reached
+    # the critique step (rejected at an earlier gate) or a run with critique off.
+    critique_ran: bool = False
     feedback: str | None = None  # self-repair feedback if not ideal
     score: float = 0.0
 
@@ -169,6 +174,7 @@ class Candidate:
             "score": round(self.score, 4),
             "dim_score": round(self.dim_score, 4),
             "critique": self.critique,
+            "critique_ran": self.critique_ran,
             "dfm": self.dfm,
             "error": self.error,
             "code": self.code,
@@ -821,6 +827,10 @@ def _evaluate_candidate(
         dim_detail=dim_detail,
         critique=critique,
     )
+    # Record whether critique actually executed for this (shippable) candidate:
+    # requested AND it produced a real score. False here with run_critique=True
+    # means it was attempted but skipped/errored (rendering or provider failure).
+    c.critique_ran = bool(run_critique and critique is not None)
     if critique is not None and not c.critique_ok:
         c.feedback = _critique_feedback(critique)
     return c
@@ -882,6 +892,7 @@ def _finalize(
     all_candidates: list[Candidate],
     critiques: list[dict[str, Any]],
     *,
+    critique_enabled: bool,
     low_critique: bool = False,
 ) -> GenerationResult:
     """Persist the winning candidate + full provenance (every evaluated candidate,
@@ -905,6 +916,11 @@ def _finalize(
             "dfm": winner.dfm,
             "attempts": attempts,
             "critique": winner.critique,
+            # Whether critique was ENABLED for this run, and whether it actually
+            # RAN for the winner — so a 0.7-default score isn't ambiguous (skipped
+            # vs. genuinely scored). See audit finding 2.
+            "critique_enabled": critique_enabled,
+            "critique_ran": winner.critique_ran,
             "dim_contract": winner.dim_detail,
             "score": round(winner.score, 4),
             "best_of_n": BEST_OF_N,
@@ -929,6 +945,7 @@ def _finalize(
         dim_contract=winner.dim_detail,
         score=round(winner.score, 4),
         candidates=provenance_candidates,
+        critique_enabled=critique_enabled,
     )
 
 
@@ -1018,7 +1035,14 @@ def generate_and_register(
                 best_shippable = c
 
         if winner.ok_hard and winner.critique_ok:
-            return _finalize(winner, request_text, attempts, all_candidates, critiques)
+            return _finalize(
+                winner,
+                request_text,
+                attempts,
+                all_candidates,
+                critiques,
+                critique_enabled=run_critique,
+            )
 
         feedback = (
             winner.feedback
@@ -1036,6 +1060,7 @@ def generate_and_register(
             attempts,
             all_candidates,
             critiques,
+            critique_enabled=run_critique,
             low_critique=True,
         )
 

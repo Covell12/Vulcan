@@ -190,17 +190,24 @@ function el(tag, props = {}, children = []) {
 }
 
 // One-line summary of the winning candidate's visual critique (M10a Feature 1).
-function critiqueLine(critique, score) {
+// Distinguishes a real score from "disabled" vs "enabled but skipped" so a 0.7-
+// default score isn't mistaken for a genuine critique (audit finding 2).
+function critiqueLine(record) {
+  const critique = record.critique;
   const bits = [];
   if (critique && critique.matches_request !== undefined && critique.matches_request !== null) {
     const pct = Math.round(Number(critique.matches_request) * 100);
     bits.push(`visual match ${pct}%`);
     const defects = (critique.defects || []).filter(Boolean);
     if (defects.length) bits.push(`defects: ${defects.join("; ")}`);
+  } else if (record.critique_enabled === false) {
+    bits.push("visual critique: disabled");
   } else {
-    bits.push("visual critique: not run");
+    bits.push("visual critique: enabled but not scored");
   }
-  if (score !== undefined && score !== null) bits.push(`overall score ${Number(score).toFixed(2)}`);
+  if (record.score !== undefined && record.score !== null) {
+    bits.push(`overall score ${Number(record.score).toFixed(2)}`);
+  }
   return bits.join(" · ");
 }
 
@@ -279,7 +286,7 @@ function renderCard(record) {
   card.append(
     el("p", { className: "review-critique" }, [
       el("strong", {}, "Quality: "),
-      critiqueLine(record.critique, record.score),
+      critiqueLine(record),
     ])
   );
   const dimLine = dimContractLine(record.dim_contract);

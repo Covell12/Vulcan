@@ -216,7 +216,7 @@ def test_multi_part_assembly_builds_separate_files(cleanup_generated):
     assert r.ok
     assert r.dfm["part_count"] == 2 and r.dfm["connected"] is True
 
-    design_id, urls = build_design(r.template_id, {"w_mm": 22})
+    design_id, urls, shipped_dfm = build_design(r.template_id, {"w_mm": 22})
     try:
         assert {p["name"] for p in urls["parts"]} == {"peg", "base"}
         # Each part has its own three files + an ungated view mesh.
@@ -227,6 +227,45 @@ def test_multi_part_assembly_builds_separate_files(cleanup_generated):
         assert urls["stl"].endswith("assembly.stl")
         assert (EXPORTS_DIR / design_id / "peg.step").exists()
         assert (EXPORTS_DIR / design_id / "base.step").exists()
+        # The shipped DFM measures the merged assembly.stl and expects one body
+        # per part (2), not a single connected body.
+        assert shipped_dfm["measured_on"] == "shipped_artifact"
+        assert shipped_dfm["part_count"] == 2
+        assert shipped_dfm["body_count"] == 2 and shipped_dfm["connected"] is True
+    finally:
+        _shutil.rmtree(EXPORTS_DIR / design_id, ignore_errors=True)
+
+
+def test_shipped_dfm_measures_final_artifact_not_generation(cleanup_generated):
+    """Regression (audit finding 1): the DFM recorded for a design must describe
+    the ACTUAL shipped mesh — built with the user's params — not the generation
+    build (default params). Here the user builds w_mm=22 while generation used the
+    default 40, so the shipped bbox differs from r.dfm and must match the file."""
+    import shutil as _shutil
+
+    import trimesh
+
+    from api.designs import EXPORTS_DIR, build_design
+    from api.rendering import mesh_body_count
+
+    with patch(
+        "api.freeform.codegen_provider.generate_template", return_value=dict(MULTI_GEN)
+    ):
+        r = ff.generate_and_register("a peg that fits a base", [])
+    if r.template_id:
+        cleanup_generated.append(r.template_id)
+
+    design_id, urls, shipped_dfm = build_design(r.template_id, {"w_mm": 22})
+    try:
+        shipped_path = EXPORTS_DIR / design_id / urls["stl"].split("/")[-1]
+        mesh = trimesh.load(str(shipped_path), force="mesh")
+        real_bbox = [round(float(x), 2) for x in (mesh.bounds[1] - mesh.bounds[0])]
+        # The recorded DFM matches the bytes on disk…
+        assert shipped_dfm["bbox_mm"] == real_bbox
+        assert shipped_dfm["body_count"] == mesh_body_count(str(shipped_path))
+        # …and reflects the user-params build (w_mm=22), NOT the generation build
+        # with the default w_mm=40 (whose overall extent is larger).
+        assert shipped_dfm["max_extent_mm"] != r.dfm["max_extent_mm"]
     finally:
         _shutil.rmtree(EXPORTS_DIR / design_id, ignore_errors=True)
 
@@ -426,11 +465,59 @@ def test_critique_below_threshold_regenerates_with_fixes(
 
 
 def test_critique_disabled_skips_and_still_succeeds(cleanup_generated):
-    """Default (critique off): no vision call, critique is None, design still ships."""
+    """Default (critique off): no vision call, critique is None, design still ships,
+    and provenance records that critique did NOT run (so a 0.7-default score isn't
+    mistaken for a real 0.7 — audit finding 2)."""
     with patch(
         "api.freeform.codegen_provider.generate_template", return_value=dict(GOOD_GEN)
     ), patch("api.freeform.vision_provider.critique_design") as cm:
         r = ff.generate_and_register("a block", [])
     cleanup_generated.append(r.template_id)
     assert r.ok and r.critique is None
+    assert r.critique_enabled is False
+    assert all(c["critique_ran"] is False for c in r.candidates)
     cm.assert_not_called()
+
+
+def test_job_path_runs_critique_when_enabled(cleanup_generated, monkeypatch):
+    """Audit finding 2: candidates evaluated in the async JOB path get REAL critique
+    scores when critique is enabled — not the 0.7 default that made every bridge
+    candidate score an identical 0.91 — and provenance records that it executed."""
+    import json as _json
+
+    from api import jobs
+
+    monkeypatch.setenv("VULCAN_CRITIQUE", "on")
+    monkeypatch.setattr(ff, "BEST_OF_N", 2)
+    critique = {"matches_request": 0.83, "defects": [], "targeted_fixes": []}
+    holder: dict = {}
+
+    def target(progress):
+        with patch(
+            "api.freeform.codegen_provider.generate_template",
+            return_value=dict(GOOD_GEN),
+        ), patch(
+            "api.freeform.vision_provider.critique_design", return_value=dict(critique)
+        ) as m:
+            r = ff.generate_and_register("a block via job", [], progress=progress)
+        holder["r"] = r
+        holder["calls"] = m.call_count
+        return {"ok": r.ok}
+
+    jobs.start("intent-crit", target)  # runs inline under VULCAN_JOBS_SYNC (conftest)
+    r = holder["r"]
+    cleanup_generated.append(r.template_id)
+
+    # Critique actually executed for each shippable candidate in the job path.
+    assert holder["calls"] == ff.BEST_OF_N == 2
+    assert r.critique_enabled is True and r.critique["matches_request"] == 0.83
+    assert all(c["critique_ran"] is True for c in r.candidates)
+    assert all(
+        (c["critique"] or {}).get("matches_request") == 0.83 for c in r.candidates
+    )
+    # Real critique lifts the score above the 0.91 no-critique default.
+    assert r.score is not None and r.score > 0.92
+    prov = _json.loads(
+        (ff.GENERATED_DIR / r.template_id / "provenance.json").read_text()
+    )
+    assert prov["critique_enabled"] is True and prov["critique_ran"] is True
